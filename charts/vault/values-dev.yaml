@@ -1,0 +1,104 @@
+# Vault — local dev overrides for the official HashiCorp helm chart.
+#
+# Consumed by `hack/dev-vault-up.sh`:
+#   helm upgrade --install vault hashicorp/vault \
+#     --namespace vault --create-namespace \
+#     --version <pinned in dev-vault-up.sh> \
+#     --values charts/vault/values-dev.yaml
+#
+# Scope:
+#   - Single-replica dev-mode Vault running in-memory.
+#   - Unsealed at boot, root token set to `root` (well-known dev token).
+#   - Transit secrets engine pre-enabled at startup so the smoke-test
+#     pipeline can sign a payload without an out-of-band `vault secrets
+#     enable transit` step.
+#
+# DO NOT USE THIS FILE FOR SEPIA OR ANY SHARED/PRODUCTION CLUSTER.
+# Dev mode means:
+#   - All data lives in memory; a pod restart wipes every key, role,
+#     audit device, and policy.
+#   - The root token is `root` (chart-known string).
+#   - There is no seal/unseal lifecycle; the "key" never leaves RAM.
+# See values-sepia.yaml for the production stance.
+
+global:
+  enabled: true
+  tlsDisabled: true     # cleartext intra-cluster traffic is fine for dev kind
+
+# No Vault Agent Injector in dev. Pods that want to talk to Vault do so
+# through the in-cluster Service + projected SA token, not the injector
+# sidecar. Keeps the dev install minimal and matches how the smoke-test
+# pipeline authenticates.
+injector:
+  enabled: false
+
+server:
+  # Dev-mode: single pod, in-memory storage, auto-unseal, root token set.
+  # See https://developer.hashicorp.com/vault/docs/concepts/dev-server.
+  dev:
+    enabled: true
+    devRootToken: "root"
+
+  # The chart's `dev` mode runs `vault server -dev` and ignores most of
+  # `server.standalone.config`, but we still pass a small extra-args
+  # block to (a) enable the transit secrets engine at startup and
+  # (b) pre-create the test signing key so a fresh `helm install` is
+  # immediately usable by the smoke-test pipeline.
+  #
+  # The transit-enable / key-create / k8s-auth-enable steps are also
+  # idempotently re-applied by `hack/dev-vault-up.sh` after the pod is
+  # ready — having them here too means a `helm install` without the
+  # script still produces a working transit engine.
+  extraArgs: ""
+
+  # Liveness/readiness probes for dev: dev-mode Vault is always
+  # unsealed and active, so the standard /sys/health probe is fine.
+  readinessProbe:
+    enabled: true
+    path: "/v1/sys/health?standbyok=true&uninitcode=204"
+  livenessProbe:
+    enabled: true
+    path: "/v1/sys/health?standbyok=true"
+    initialDelaySeconds: 60
+
+  # Keep the dev pod small enough to coexist with Tekton on a single
+  # kind node. Override at install time if you have more headroom.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+  # Single replica; dev mode does not support HA.
+  ha:
+    enabled: false
+  standalone:
+    enabled: false      # dev mode supersedes both ha and standalone
+
+  # Service exposes the Vault API on the standard port. The smoke-test
+  # pipeline reaches it at vault.vault.svc.cluster.local:8200.
+  service:
+    enabled: true
+    type: ClusterIP
+    port: 8200
+
+  # The dev pod needs a ServiceAccount the Kubernetes auth method can
+  # later look up tokens against. The chart creates `vault` by default.
+  serviceAccount:
+    create: true
+    name: vault
+
+  # Audit log to stdout so `kubectl logs -n vault vault-0` shows every
+  # sign operation during dev iteration. (In production, audit goes to
+  # a file sink + sidecar shipper; see values-sepia.yaml.)
+  auditStorage:
+    enabled: false
+
+# No CSI provider, no UI ingress, no webhook cert-manager dance in dev.
+csi:
+  enabled: false
+ui:
+  enabled: true
+  serviceType: ClusterIP

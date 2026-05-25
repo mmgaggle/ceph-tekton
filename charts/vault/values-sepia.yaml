@@ -1,0 +1,163 @@
+# Vault — Sepia (production) values stub for the official HashiCorp
+# helm chart.
+#
+# STATUS: STUB. Not deployed yet. Issue #5 only stands up Vault in the
+# local kind dev cluster. This file captures the production stance so
+# that when Sepia install lands (tracked separately), the diff against
+# values-dev.yaml makes the dev↔prod boundary obvious.
+#
+# Production requirements this file encodes:
+#   - 3-replica HA with integrated raft storage (no external Consul).
+#   - Pod anti-affinity so replicas land on different nodes.
+#   - TLS on the API listener (cert + CA supplied via Secret).
+#   - Auto-unseal via cloud KMS (the dev-mode "always unsealed" stance
+#     is unacceptable for a production deployment — see the docs link
+#     in the seal block below).
+#   - Audit log to a file sink (a sidecar shipper picks it up; not
+#     configured here because the shipper choice is environment-
+#     specific — see TODO at end of file).
+#   - Resource requests/limits sized for a real workload.
+#
+# What is intentionally *not* set here and must be supplied at install
+# time (in a sealed-secrets/SOPS overlay, NOT in plaintext git):
+#   - server.ha.raft.config seal stanza (cloud-KMS key ID, region, etc.)
+#   - TLS cert/key (or a cert-manager Certificate referenced by Secret)
+#   - Recovery-key PGP public keys (if using PGP-split recovery shares
+#     instead of cloud KMS auto-unseal)
+#
+# DO NOT enable `server.dev.enabled` here. Ever.
+
+global:
+  enabled: true
+  tlsDisabled: false    # require TLS on the API listener
+
+injector:
+  enabled: false        # pods authenticate directly via projected SA tokens
+
+server:
+  # No dev mode — explicit for safety. The HashiCorp chart's default is
+  # dev=false, but pinning it here makes a careless `--values values-dev.yaml`
+  # mix-up impossible.
+  dev:
+    enabled: false
+
+  # Three-replica HA with integrated raft storage.
+  # https://developer.hashicorp.com/vault/docs/configuration/storage/raft
+  ha:
+    enabled: true
+    replicas: 3
+    raft:
+      enabled: true
+      setNodeId: true
+      config: |
+        ui = true
+
+        listener "tcp" {
+          address     = "[::]:8200"
+          cluster_address = "[::]:8201"
+          tls_disable = 0
+          tls_cert_file = "/vault/userconfig/vault-tls/tls.crt"
+          tls_key_file  = "/vault/userconfig/vault-tls/tls.key"
+        }
+
+        storage "raft" {
+          path = "/vault/data"
+        }
+
+        # TODO(sepia): pick one of the seal stanzas below at install
+        # time. Do NOT commit the populated values; supply via a
+        # sealed Secret mounted at /vault/userconfig/vault-seal.
+        #
+        # seal "awskms" {
+        #   region     = "..."
+        #   kms_key_id = "..."
+        # }
+        # seal "gcpckms" {
+        #   project    = "..."
+        #   region     = "..."
+        #   key_ring   = "..."
+        #   crypto_key = "..."
+        # }
+        # seal "pkcs11" {
+        #   lib       = "/usr/lib/softhsm/libsofthsm2.so"
+        #   slot      = "0"
+        #   pin       = "..."
+        #   key_label = "vault-hsm-key"
+        # }
+
+        service_registration "kubernetes" {}
+
+  # Standalone is mutually exclusive with HA; explicit for safety.
+  standalone:
+    enabled: false
+
+  # Pod anti-affinity so the three replicas land on three different nodes.
+  affinity: |
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ template "vault.name" . }}
+              app.kubernetes.io/instance: "{{ .Release.Name }}"
+              component: server
+          topologyKey: kubernetes.io/hostname
+
+  # TLS cert + CA supplied via Secret. The Secret itself is created
+  # out-of-band (cert-manager + Sepia internal CA, or a sealed Secret).
+  extraVolumes:
+    - type: secret
+      name: vault-tls
+      path: /vault/userconfig
+    # - type: secret               # uncomment once auto-unseal is wired
+    #   name: vault-seal
+    #   path: /vault/userconfig
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+
+  # File audit sink mounted on a PV; a sidecar/forwarder ships to the
+  # Sepia log aggregator. Path matches what the seal-status runbook in
+  # docs/vault.md expects.
+  auditStorage:
+    enabled: true
+    size: 10Gi
+    mountPath: /vault/audit
+    accessMode: ReadWriteOnce
+
+  service:
+    enabled: true
+    type: ClusterIP
+    port: 8200
+
+  serviceAccount:
+    create: true
+    name: vault
+
+ui:
+  enabled: true
+  serviceType: ClusterIP
+  externalPort: 8200
+
+csi:
+  enabled: false
+
+# ----------------------------------------------------------------------
+# What is still missing before this stub is production-ready (tracked
+# separately, not part of issue #5):
+#   1. Choose seal mode (AWS KMS / GCP KMS / HSM / PGP-split recovery
+#      shares) and supply the seal stanza via a sealed Secret.
+#   2. Wire cert-manager (or the chosen TLS-cert source) to populate
+#      the vault-tls Secret referenced above.
+#   3. Configure the audit-log forwarder sidecar.
+#   4. Decide network exposure (Route/Ingress for the UI; the API
+#      should stay in-cluster).
+#   5. Backup strategy for raft snapshots — schedule, retention,
+#      restore drill cadence.
+#   6. Initial unseal procedure (PGP keys + threshold) and the
+#      operator handoff for recovery keys.
+# ----------------------------------------------------------------------
