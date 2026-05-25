@@ -1,0 +1,370 @@
+# reproducibility-check — bit-for-bit build-output diff harness.
+#
+# Builds the same source twice in two clean clones, with the
+# SOURCE_DATE_EPOCH + LC_ALL + TZ + umask + -ffile-prefix-map env hygiene
+# that makes most cmake/autotools/dpkg-buildpackage/rpmbuild builds
+# deterministic. Diffs the resulting artifacts with `diffoscope` and emits
+# Tekton Results (reproducible_bytes, total_bytes, pct_match, report_url)
+# plus an HTML + JSON report uploaded to S3.
+#
+# Designed to run against ANY cmake-driven (or shell-driven) build target —
+# not just ceph. This Task ships standalone today; once issue #16
+# (`build-package` Task) lands, the env-prep stanza documented in
+# `docs/reproducibility.md` is copied into that Task to give the real
+# package builds the same determinism floor.
+#
+# Failure semantics (per issue #48): the Task is INFORMATIONAL on first
+# adoption — a non-reproducible build emits the diff report + a low
+# pct_match Result but the TaskRun still succeeds (exit 0). The dashboard
+# and Tekton Results are how regressions are tracked. To make
+# reproducibility gating, set the `fail-on-diff` param to `"true"`.
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: reproducibility-check
+spec:
+  description: |
+    Build the same source twice with deterministic env hygiene, diff
+    the outputs with diffoscope, emit reproducibility Results + upload
+    HTML/JSON report to S3.
+  params:
+    - name: source-repo
+      type: string
+      description: |
+        Git URL to clone (https or git). Cloned twice into clean
+        workspaces; no shared state between the two builds.
+    - name: source-ref
+      type: string
+      default: HEAD
+      description: |
+        Ref or commit to build. SOURCE_DATE_EPOCH is derived from this
+        commit's committer timestamp (`git log -1 --pretty=%ct`).
+    - name: build-command
+      type: string
+      description: |
+        Shell command run inside the cloned source directory. Examples:
+          - `cmake -B build && cmake --build build`
+          - `dpkg-buildpackage -us -uc -b`
+          - `rpmbuild -bb foo.spec`
+          - `tar cf out.tar --mtime=@$SOURCE_DATE_EPOCH --sort=name --owner=0 --group=0 --numeric-owner /etc/os-release`
+        The env hygiene (SOURCE_DATE_EPOCH, LC_ALL, TZ, umask, CFLAGS
+        prefix-map) is exported BEFORE this command runs.
+    - name: output-glob
+      type: string
+      description: |
+        Shell glob (relative to the cloned source root) matching the
+        artifacts to compare. Examples: `build/**/*.so`, `*.deb`,
+        `~/rpmbuild/RPMS/**/*.rpm`, `out.tar`.
+    - name: builder-image
+      type: string
+      default: docker.io/library/debian:bookworm-slim
+      description: |
+        Image with the build toolchain + `git`, `tar`, `diffoscope`,
+        `aws` (or `mc`) preinstalled. The default debian image is
+        sufficient for the tar-of-system-file smoke test; real package
+        builds use a distro-specific builder image (#10).
+    - name: s3-bucket
+      type: string
+      default: ""
+      description: |
+        S3 bucket to upload the diffoscope HTML + JSON reports to.
+        Object key is `<branch>/<sha>/reproducibility/diffoscope.{html,json}`.
+        Empty string disables upload (reports remain inside the
+        workspace, useful for local kind iteration).
+    - name: s3-branch
+      type: string
+      default: dev
+      description: Branch component of the S3 object key prefix.
+    - name: s3-endpoint
+      type: string
+      default: ""
+      description: |
+        Optional S3 endpoint URL (for RGW or MinIO). Empty = AWS S3
+        default. Passed as `--endpoint-url`.
+    - name: fail-on-diff
+      type: string
+      default: "false"
+      description: |
+        If `"true"`, a non-empty diffoscope output fails the Task
+        (exit 1). Default `"false"` matches the issue's first-run
+        intent: informational only, regression tracked via the
+        emitted Results + Grafana dashboard.
+  results:
+    - name: reproducible_bytes
+      description: Bytes of artifact output that matched between the two builds.
+      type: string
+    - name: total_bytes
+      description: Total bytes of artifact output from build A.
+      type: string
+    - name: pct_match
+      description: Percent of artifact bytes reproducible (0.000-100.000).
+      type: string
+    - name: report_url
+      description: |
+        S3 URL of the uploaded diffoscope HTML report, or empty if
+        s3-bucket was not configured.
+      type: string
+    - name: source_date_epoch
+      description: SOURCE_DATE_EPOCH value derived from the commit timestamp.
+      type: string
+  workspaces:
+    - name: scratch
+      description: |
+        Shared scratch space for both build clones + staging dirs +
+        diffoscope output. Sized for 2× the source tree + 2× the build
+        outputs.
+    - name: s3-credentials
+      description: |
+        Optional. If mounted, expected to contain `AWS_ACCESS_KEY_ID`,
+        `AWS_SECRET_ACCESS_KEY`, optionally `AWS_SESSION_TOKEN` as
+        files. Wired through env-from-files for the upload step.
+        In Sepia this workspace is empty and AssumeRoleWithWebIdentity
+        provides creds via projected SA token (see docs/architecture.md
+        "Provenance & trust model"). In dev the calling Pipeline mounts
+        a Secret here with static creds.
+      optional: true
+  steps:
+    # ----------------------------------------------------------------
+    # Step 1: clone twice and resolve SOURCE_DATE_EPOCH.
+    # Two clean clones — no symlink/hardlink sharing — so we don't
+    # mask non-determinism caused by shared filesystem state.
+    # ----------------------------------------------------------------
+    - name: clone
+      image: $(params.builder-image)
+      workingDir: $(workspaces.scratch.path)
+      env:
+        - name: SRC_REPO
+          value: $(params.source-repo)
+        - name: SRC_REF
+          value: $(params.source-ref)
+      script: |
+        #!/bin/sh
+        set -eu
+        rm -rf a b staging-a staging-b report
+        mkdir -p a b staging-a staging-b report
+        git clone --no-local "${SRC_REPO}" a
+        ( cd a && git checkout "${SRC_REF}" )
+        # Second clone from the first so we don't hit the remote twice
+        # and risk a race against a force-push mid-Task.
+        git clone --no-local a b
+        ( cd b && git checkout "${SRC_REF}" )
+
+        SDE=$( cd a && git log -1 --pretty=%ct )
+        printf '%s' "${SDE}" > "$(results.source_date_epoch.path)"
+        echo "SOURCE_DATE_EPOCH=${SDE}"
+
+    # ----------------------------------------------------------------
+    # Step 2: build A.
+    # The env hygiene block here is the canonical stanza that
+    # `build-package` (#16) will copy verbatim — see
+    # docs/reproducibility.md "Wiring into build-package".
+    # ----------------------------------------------------------------
+    - name: build-a
+      image: $(params.builder-image)
+      workingDir: $(workspaces.scratch.path)/a
+      env:
+        - name: BUILD_CMD
+          value: $(params.build-command)
+        - name: OUTPUT_GLOB
+          value: $(params.output-glob)
+      script: |
+        #!/bin/bash
+        set -euo pipefail
+        # --- BEGIN reproducible-build env stanza ----------------------
+        # Copy this block into build-package (#16) verbatim.
+        export SOURCE_DATE_EPOCH="$(cat $(results.source_date_epoch.path))"
+        export LC_ALL=C
+        export TZ=UTC
+        umask 022
+        # Strip build-host paths from compiled binaries. ffile-prefix-map
+        # works on gcc >= 8 and clang >= 10; safe to set unconditionally.
+        export CFLAGS="${CFLAGS:-} -ffile-prefix-map=$PWD=."
+        export CXXFLAGS="${CXXFLAGS:-} -ffile-prefix-map=$PWD=."
+        # tar / ar / gzip respect SOURCE_DATE_EPOCH for mtimes; dpkg-
+        # buildpackage and rpmbuild both honour it for changelog/build
+        # date stamping.
+        # --- END reproducible-build env stanza ------------------------
+        echo "[build-a] SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}"
+        echo "[build-a] running: ${BUILD_CMD}"
+        bash -c "${BUILD_CMD}"
+
+        # Stage outputs into ../staging-a/ preserving relative paths.
+        cd "$(workspaces.scratch.path)/a"
+        mkdir -p "$(workspaces.scratch.path)/staging-a"
+        shopt -s globstar nullglob
+        # shellcheck disable=SC2086
+        for f in ${OUTPUT_GLOB}; do
+          [ -f "$f" ] || continue
+          dst="$(workspaces.scratch.path)/staging-a/$(dirname "$f")"
+          mkdir -p "$dst"
+          cp -p "$f" "$dst/"
+        done
+        echo "[build-a] staged $(find "$(workspaces.scratch.path)/staging-a" -type f | wc -l) file(s)"
+
+    # ----------------------------------------------------------------
+    # Step 3: build B. Same env stanza, different clone.
+    # ----------------------------------------------------------------
+    - name: build-b
+      image: $(params.builder-image)
+      workingDir: $(workspaces.scratch.path)/b
+      env:
+        - name: BUILD_CMD
+          value: $(params.build-command)
+        - name: OUTPUT_GLOB
+          value: $(params.output-glob)
+      script: |
+        #!/bin/bash
+        set -euo pipefail
+        export SOURCE_DATE_EPOCH="$(cat $(results.source_date_epoch.path))"
+        export LC_ALL=C
+        export TZ=UTC
+        umask 022
+        export CFLAGS="${CFLAGS:-} -ffile-prefix-map=$PWD=."
+        export CXXFLAGS="${CXXFLAGS:-} -ffile-prefix-map=$PWD=."
+        echo "[build-b] SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}"
+        echo "[build-b] running: ${BUILD_CMD}"
+        bash -c "${BUILD_CMD}"
+
+        cd "$(workspaces.scratch.path)/b"
+        mkdir -p "$(workspaces.scratch.path)/staging-b"
+        shopt -s globstar nullglob
+        # shellcheck disable=SC2086
+        for f in ${OUTPUT_GLOB}; do
+          [ -f "$f" ] || continue
+          dst="$(workspaces.scratch.path)/staging-b/$(dirname "$f")"
+          mkdir -p "$dst"
+          cp -p "$f" "$dst/"
+        done
+        echo "[build-b] staged $(find "$(workspaces.scratch.path)/staging-b" -type f | wc -l) file(s)"
+
+    # ----------------------------------------------------------------
+    # Step 4: diff with diffoscope, compute reproducibility %.
+    # diffoscope returns 0 = identical, 1 = differences. We always
+    # generate the HTML+JSON reports; whether differences fail the
+    # Task is gated on `fail-on-diff`.
+    # ----------------------------------------------------------------
+    - name: diff
+      image: $(params.builder-image)
+      workingDir: $(workspaces.scratch.path)
+      env:
+        - name: FAIL_ON_DIFF
+          value: $(params.fail-on-diff)
+      script: |
+        #!/bin/bash
+        set -uo pipefail
+        mkdir -p report/html
+
+        # Reproducibility %: per-file SHA256 match weighted by file size.
+        # Files present in A but missing from B count as 0 reproducible
+        # bytes against their full size. Files present in B but not A
+        # are not counted (we measure "did build A reproduce?").
+        total=0
+        matched=0
+        while IFS= read -r -d '' rel; do
+          a="staging-a/$rel"
+          b="staging-b/$rel"
+          sz=$(stat -c%s "$a")
+          total=$(( total + sz ))
+          if [ -f "$b" ]; then
+            ha=$(sha256sum "$a" | awk '{print $1}')
+            hb=$(sha256sum "$b" | awk '{print $1}')
+            if [ "$ha" = "$hb" ]; then
+              matched=$(( matched + sz ))
+            fi
+          fi
+        done < <(cd staging-a && find . -type f -print0 | sed -z 's|^\./||')
+
+        if [ "$total" -eq 0 ]; then
+          pct="0.000"
+        else
+          # bash arithmetic is integer-only; awk for the percent.
+          pct=$(awk -v m="$matched" -v t="$total" 'BEGIN { printf "%.3f", (m*100.0)/t }')
+        fi
+        printf '%s' "$matched" > "$(results.reproducible_bytes.path)"
+        printf '%s' "$total"   > "$(results.total_bytes.path)"
+        printf '%s' "$pct"     > "$(results.pct_match.path)"
+        echo "[diff] reproducible_bytes=${matched} total_bytes=${total} pct_match=${pct}"
+
+        # diffoscope generates HTML + JSON reports regardless of match%.
+        # Soft-fail: if diffoscope itself is missing in this builder
+        # image, fall back to a trivial diff so the Task still emits
+        # useful Results (with a flagged report).
+        if command -v diffoscope >/dev/null 2>&1; then
+          diffoscope --html-dir report/html/ --json report/diffoscope.json \
+                     staging-a/ staging-b/ || true
+        else
+          echo "WARNING: diffoscope not installed in builder image; emitting basic diff" >&2
+          {
+            echo "diffoscope unavailable in $(params.builder-image)"
+            echo "---"
+            diff -ruN staging-a/ staging-b/ || true
+          } > report/html/index.html
+          echo '{"diffoscope": "unavailable", "fallback": "diff -ruN"}' \
+            > report/diffoscope.json
+        fi
+
+        # fail-on-diff gating (default false — informational mode per #48).
+        if [ "${FAIL_ON_DIFF}" = "true" ] && [ "${matched}" != "${total}" ]; then
+          echo "[diff] FAIL: fail-on-diff=true and pct_match=${pct} < 100" >&2
+          exit 1
+        fi
+
+    # ----------------------------------------------------------------
+    # Step 5: upload HTML + JSON reports to S3.
+    # Dev path: static creds from the s3-credentials workspace.
+    # Sepia path: AssumeRoleWithWebIdentity via projected SA token —
+    # the calling Pipeline wires that in and the workspace is empty.
+    # See docs/reproducibility.md "Promoting to OIDC for production".
+    # ----------------------------------------------------------------
+    - name: upload
+      image: $(params.builder-image)
+      workingDir: $(workspaces.scratch.path)
+      env:
+        - name: S3_BUCKET
+          value: $(params.s3-bucket)
+        - name: S3_BRANCH
+          value: $(params.s3-branch)
+        - name: S3_ENDPOINT
+          value: $(params.s3-endpoint)
+      script: |
+        #!/bin/bash
+        set -euo pipefail
+
+        if [ -z "${S3_BUCKET}" ]; then
+          echo "[upload] s3-bucket empty; skipping upload (reports remain in workspace)"
+          printf '%s' "" > "$(results.report_url.path)"
+          exit 0
+        fi
+
+        # Load static creds from workspace if present (dev path).
+        CRED_DIR="$(workspaces.s3-credentials.path)"
+        if [ -d "${CRED_DIR}" ]; then
+          for k in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN; do
+            if [ -f "${CRED_DIR}/${k}" ]; then
+              export "${k}=$(cat ${CRED_DIR}/${k})"
+            fi
+          done
+        fi
+
+        if ! command -v aws >/dev/null 2>&1; then
+          echo "WARNING: aws CLI not in builder image; skipping upload" >&2
+          printf '%s' "" > "$(results.report_url.path)"
+          exit 0
+        fi
+
+        SHA="$(cd a && git rev-parse HEAD)"
+        KEY_PREFIX="${S3_BRANCH}/${SHA}/reproducibility"
+        ENDPOINT_ARG=""
+        [ -n "${S3_ENDPOINT}" ] && ENDPOINT_ARG="--endpoint-url ${S3_ENDPOINT}"
+
+        # shellcheck disable=SC2086
+        aws s3 cp report/diffoscope.json \
+          "s3://${S3_BUCKET}/${KEY_PREFIX}/diffoscope.json" ${ENDPOINT_ARG}
+        # shellcheck disable=SC2086
+        aws s3 cp report/html/ \
+          "s3://${S3_BUCKET}/${KEY_PREFIX}/" --recursive ${ENDPOINT_ARG}
+
+        HTML_URL="s3://${S3_BUCKET}/${KEY_PREFIX}/index.html"
+        printf '%s' "${HTML_URL}" > "$(results.report_url.path)"
+        echo "[upload] report_url=${HTML_URL}"

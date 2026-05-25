@@ -1,0 +1,137 @@
+# Reproducibility-check smoke test pipeline.
+#
+# Wires `reproducibility-check` Task against the cheapest possible "build"
+# that still proves the harness mechanism: produce a deterministic tar of
+# a system file. tar honours SOURCE_DATE_EPOCH for mtime when `--mtime=@N`
+# is passed, and `--sort=name --owner=0 --group=0 --numeric-owner` removes
+# the other classic sources of tar non-determinism (FS iteration order,
+# host uid/gid lookup). If THIS pipeline doesn't go 100% reproducible,
+# the harness itself is broken — not the build it's measuring.
+#
+# Why not a cmake hello-world for the smoke test:
+#   - Adds gcc/cmake to the builder image (or pulls a heavier base) for
+#     no extra harness coverage; the cmake-driven path is what the real
+#     `build-package` Task (#16) will exercise once it lands.
+#   - tar is the primitive that backs deb / rpm / oci layers — proving
+#     deterministic tar IS proving the most-likely-to-bite layer of the
+#     real build artefacts.
+#   - <1s per run, fits the dev-loop iteration budget.
+#
+# Real cmake / dpkg-buildpackage / rpmbuild targets get wired by passing
+# different `source-repo`, `build-command`, and `output-glob` params
+# from the calling PipelineRun. See `docs/reproducibility.md` for the
+# wiring patterns.
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: reproducibility-check
+spec:
+  description: |
+    Demo wiring of the reproducibility-check Task. Builds the cheapest
+    possible deterministic artefact (tar of a system file) twice and
+    diffs the outputs to prove the harness mechanism works end-to-end.
+  params:
+    - name: source-repo
+      type: string
+      default: https://github.com/mmgaggle/ceph-tekton.git
+      description: |
+        Any git URL. The default points at this repo so the smoke
+        test is self-contained; the build command doesn't actually
+        use the source tree, just runs `tar` against /etc/os-release.
+    - name: source-ref
+      type: string
+      default: HEAD
+    - name: build-command
+      type: string
+      default: |
+        tar cf out.tar \
+          --mtime=@${SOURCE_DATE_EPOCH} \
+          --sort=name \
+          --owner=0 \
+          --group=0 \
+          --numeric-owner \
+          /etc/os-release
+      description: |
+        Deterministic tar primitive. The same flags that make this
+        smoke test go 100% reproducible are the flags every package
+        builder ultimately wraps.
+    - name: output-glob
+      type: string
+      default: out.tar
+    - name: builder-image
+      type: string
+      default: docker.io/library/debian:bookworm-slim
+      description: |
+        Debian bookworm-slim has GNU tar + git + coreutils. Add
+        `diffoscope` and `awscli` via apt for the full harness path
+        in non-dev environments; the Task soft-falls-back to `diff`
+        + skipped-upload when those are absent (dev iteration).
+    - name: s3-bucket
+      type: string
+      default: ""
+      description: |
+        Empty for kind dev — skips upload, report stays in workspace.
+        Sepia overlay sets this to `ceph-artifacts-dev` and mounts
+        STS creds via the `s3-credentials` workspace.
+    - name: s3-branch
+      type: string
+      default: dev
+    - name: s3-endpoint
+      type: string
+      default: ""
+    - name: fail-on-diff
+      type: string
+      default: "false"
+      description: |
+        Per issue #48, first-run posture is INFORMATIONAL — diffs
+        don't fail the PipelineRun. Flip to "true" once a target is
+        known-reproducible and you want regressions to gate.
+  workspaces:
+    - name: scratch
+      description: Shared scratch for the two build clones + reports.
+    - name: s3-credentials
+      description: |
+        Optional. Mount an emptyDir for dev (no upload) or a Secret
+        with AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY files for static-
+        creds upload. Production overlay leaves this empty and uses
+        AssumeRoleWithWebIdentity via projected SA token.
+      optional: true
+  tasks:
+    - name: check
+      taskRef:
+        name: reproducibility-check
+      params:
+        - name: source-repo
+          value: $(params.source-repo)
+        - name: source-ref
+          value: $(params.source-ref)
+        - name: build-command
+          value: $(params.build-command)
+        - name: output-glob
+          value: $(params.output-glob)
+        - name: builder-image
+          value: $(params.builder-image)
+        - name: s3-bucket
+          value: $(params.s3-bucket)
+        - name: s3-branch
+          value: $(params.s3-branch)
+        - name: s3-endpoint
+          value: $(params.s3-endpoint)
+        - name: fail-on-diff
+          value: $(params.fail-on-diff)
+      workspaces:
+        - name: scratch
+          workspace: scratch
+        - name: s3-credentials
+          workspace: s3-credentials
+  results:
+    - name: pct_match
+      description: Percent of artifact bytes reproducible across the two builds.
+      value: $(tasks.check.results.pct_match)
+    - name: report_url
+      description: S3 URL of the diffoscope HTML report (empty if upload skipped).
+      value: $(tasks.check.results.report_url)
+    - name: source_date_epoch
+      description: SOURCE_DATE_EPOCH derived from the commit timestamp.
+      value: $(tasks.check.results.source_date_epoch)
