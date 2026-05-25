@@ -1,0 +1,39 @@
+# Smoke-test pipeline. Proves the dev cluster's Tekton install is functional
+# end-to-end (Pipeline → PipelineRun → TaskRun → Pod → completion). Used by
+# `make dev-test` and by the contributor onboarding guide.
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: hello
+spec:
+  description: Echo a greeting.
+  params:
+    - name: who
+      type: string
+      default: world
+      description: Who to greet.
+  steps:
+    - name: say-hello
+      image: docker.io/library/busybox:1.36
+      script: |
+        #!/bin/sh
+        echo "hello, $(params.who) — from ceph-tekton"
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: hello-world
+spec:
+  description: Smoke-test pipeline; greets via the hello Task.
+  params:
+    - name: who
+      type: string
+      default: world
+  tasks:
+    - name: greet
+      taskRef:
+        name: hello
+      params:
+        - name: who
+          value: $(params.who)

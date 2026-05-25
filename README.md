@@ -343,18 +343,17 @@ cutover order.
 > **Status:** scaffolding underway. See the [issue backlog](https://github.com/mmgaggle/ceph-tekton/issues)
 > for what's grabbable.
 
-Once issue #1 ("Hello-world Tekton on local k3s/kind") lands:
+Spin up a local kind cluster + Tekton Pipelines and run the smoke-test
+pipeline:
 
 ```sh
-# Bootstrap a local dev cluster
-make dev-up
-
-# Point your fork's PaC at the local cluster
-# (see docs/contributing-locally.md)
-
-# Iterate on a Task
-tkn task start make-check ...
+make dev-up        # create kind cluster, install Tekton Pipelines
+make dev-test      # apply + run the hello-world pipeline, stream logs
+make dev-down      # tear it all down
 ```
+
+Prerequisites and the full dev-loop walkthrough live in
+[`docs/contributing-locally.md`](docs/contributing-locally.md).
 
 For Sepia operators, see `docs/runbook.md` once #37 lands.
 

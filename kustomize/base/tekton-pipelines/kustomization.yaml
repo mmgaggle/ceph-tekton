@@ -1,0 +1,8 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Tekton Pipelines, pinned to a release. Bump in concert with the
+# TEKTON_PIPELINES_VERSION variable in the top-level Makefile so that
+# `make dev-up`'s wait condition matches the manifests we apply here.
+resources:
+  - https://storage.googleapis.com/tekton-releases/pipeline/previous/v0.62.0/release.yaml

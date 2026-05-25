@@ -1,0 +1,68 @@
+# ceph-tekton — top-level developer targets.
+#
+# Phase 1: `make dev-up` for a local kind+Tekton dev cluster.
+# Future phases (helm/terraform/deploy) will add targets here.
+
+.SHELLFLAGS := -eu -o pipefail -c
+SHELL := bash
+
+# ---- versions (bump in PRs after testing) ----
+TEKTON_PIPELINES_VERSION ?= v0.62.0
+
+# ---- dev cluster ----
+KIND_CLUSTER_NAME ?= ceph-tekton-dev
+
+# ---- container runtime detection ----
+# Prefer docker, fall back to podman. Exported so hack/ scripts see the choice.
+CONTAINER_RUNTIME := $(shell command -v docker 2>/dev/null || command -v podman 2>/dev/null)
+ifeq ($(CONTAINER_RUNTIME),)
+  $(error No container runtime found. Install docker or podman.)
+endif
+ifneq (,$(findstring podman,$(CONTAINER_RUNTIME)))
+  export KIND_EXPERIMENTAL_PROVIDER := podman
+endif
+
+export KIND_CLUSTER_NAME
+export TEKTON_PIPELINES_VERSION
+
+.DEFAULT_GOAL := help
+
+.PHONY: help
+help: ## Show this help.
+	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z][a-zA-Z0-9_-]*:.*?## / { printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+
+# ---- dev cluster lifecycle ----
+
+.PHONY: dev-up
+dev-up: ## Create local kind cluster + install Tekton Pipelines.
+	@./hack/dev-up.sh
+
+.PHONY: dev-down
+dev-down: ## Tear down the local dev cluster.
+	kind delete cluster --name $(KIND_CLUSTER_NAME)
+
+.PHONY: dev-status
+dev-status: ## Show cluster + Tekton install status.
+	@kubectl --context kind-$(KIND_CLUSTER_NAME) get nodes
+	@echo
+	@kubectl --context kind-$(KIND_CLUSTER_NAME) -n tekton-pipelines get pods
+
+.PHONY: dev-test
+dev-test: ## Run the hello-world pipeline and stream its logs.
+	@./hack/dev-test.sh
+
+# ---- validation (no cluster needed) ----
+
+.PHONY: kustomize-validate
+kustomize-validate: ## Render every kustomize overlay (no apply).
+	@for o in kustomize/overlays/*/; do \
+	  echo "=== $$o ==="; \
+	  kubectl kustomize "$$o" > /dev/null && echo "OK"; \
+	done
+
+.PHONY: pipelines-validate
+pipelines-validate: ## Server-side dry-run apply of pipeline manifests against the dev cluster.
+	@for f in pipelines/*.yaml; do \
+	  echo "=== $$f ==="; \
+	  kubectl --context kind-$(KIND_CLUSTER_NAME) apply --dry-run=server -f "$$f"; \
+	done

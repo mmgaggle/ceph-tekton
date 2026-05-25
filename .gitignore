@@ -1,0 +1,21 @@
+# local terraform state + plan files
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+.terraform.lock.hcl
+
+# editor cruft
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# kubectl/helm caches
+.kube/
+.helm/
+
+# rendered/generated manifests
+rendered/
+dist/
