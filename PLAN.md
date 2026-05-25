@@ -274,10 +274,24 @@ where possible.
 
 ## Open / phase-2 items
 
+### Platform / deployment
 - Helm-based operator wrapping the stack (`CephCIPlatform` CRD via operator-sdk helm mode)
 - Crossplane providers for out-of-cluster state
 - Argo CD reconciliation
 - ESO sync of all long-lived secrets
+- Move PaC files from `ceph-tekton/pipelines/` to `ceph/ceph/.tekton/`
+
+### Build scope
 - Make check sharding (per-component or ctest label)
 - Adjacent jenkins jobs: ceph-csi, dashboard, docs, teuthology infra
-- Move PaC files from `ceph-tekton/pipelines/` to `ceph/ceph/.tekton/`
+
+### Supply-chain compliance (W15)
+Tracked as labeled issues — see [`phase-2` label](https://github.com/mmgaggle/ceph-tekton/issues?q=label%3Aphase-2). Layers onto the phase-1 Chains + Rekor + cosign foundation without disturbing it.
+
+- **SBOM generation** — Tekton Chains SPDX output (#46), per-build SBOM via Syft (#50)
+- **Vulnerability scanning** — Grype step (#51), severity threshold policy (#52, HITL)
+- **Deploy-time verification** — Kyverno cluster policy refusing unsigned `quay.io/ceph/*` images (#47)
+- **Reproducible builds** — `SOURCE_DATE_EPOCH` + diffoscope harness (#48), iterate to drive diff to empty (#53)
+- **Upstream dependency verification** — install-deps.sh hardening (#49, HITL — depends on upstream signing coverage)
+
+See README's "Supply-chain compliance posture" section for the regime-by-regime mapping (SLSA L3, NIST SSDF, EO 14028, EU CRA, CIS, OpenSSF Scorecard).
