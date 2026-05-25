@@ -3,7 +3,6 @@
   src="https://github.com/mmgaggle/ceph-tekton/blob/main/ceph-tekton.png">
 </p>
 
-# ![Ceph Tekton](./ceph-tekton.png)
 A Tekton-based replacement for the Ceph upstream build infrastructure
 (`jenkins` + `chacra` + `shaman`), with SLSA provenance via Tekton Chains.
 
