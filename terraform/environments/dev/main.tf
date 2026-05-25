@@ -9,9 +9,9 @@
 # ---------------------------------------------------------------------------
 
 provider "aws" {
-  region                      = var.minio_region
-  access_key                  = var.minio_access_key
-  secret_key                  = var.minio_secret_key
+  region     = var.minio_region
+  access_key = var.minio_access_key
+  secret_key = var.minio_secret_key
 
   # MinIO-friendly knobs.
   skip_credentials_validation = true # MinIO has no STS GetCallerIdentity
@@ -47,6 +47,14 @@ module "artifacts" {
   # MinIO doesn't implement these AWS-only sub-APIs.
   enable_public_access_block       = false
   enable_bucket_ownership_controls = false
+
+  # Mirror semantics on, same as Sepia. The verify script confirms
+  # anonymous curl against MinIO works once the public bucket policy
+  # lands. MinIO supports public bucket policies natively — no
+  # public-access-block plumbing needed.
+  dev_public_read     = true
+  branch_public_read  = true
+  release_public_read = true
 
   tags = {
     project = "ceph-tekton"

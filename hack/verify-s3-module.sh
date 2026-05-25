@@ -422,6 +422,69 @@ fi
 rm -f "${tmpfile}"
 
 # --------------------------------------------------------------------------
+# Public-read mirror semantics
+#   For each public_read bucket: PUT a test object as the authenticated
+#   admin, then GET it via plain anonymous curl (no auth headers). That
+#   round-trip is exactly what `apt-get install` and `dnf install` do
+#   against a chacra mirror — so passing here is the strongest signal
+#   that the bucket policy is wired correctly. We also confirm anon
+#   ListBucket fails (we only granted GetObject), and clean up.
+# --------------------------------------------------------------------------
+
+step "Verifying public-read mirror semantics on dev/branch/release"
+
+mirror_payload="public-read smoke $(date -u +%s)"
+mirror_tmp="$(mktemp)"
+printf '%s\n' "${mirror_payload}" > "${mirror_tmp}"
+mirror_key="public-read-test-$(date -u +%s).txt"
+
+# Use a short retain-until so the release-bucket object is reapable
+# after the verification (object-lock GOVERNANCE means we'll need
+# bypass to delete it during teardown, but terraform destroy uses the
+# admin creds which can bypass).
+mirror_retain="$(date -u -v+1d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || \
+                 date -u -d '+1 day' +%Y-%m-%dT%H:%M:%SZ)"
+
+for b in "${BUCKET_DEV}" "${BUCKET_BRANCH}" "${BUCKET_RELEASE}"; do
+  step "  bucket ${b}"
+
+  # PUT as authenticated admin. The release bucket needs per-object
+  # retention because the verify cycle is faster than the bucket's
+  # default retention window.
+  put_args=(--bucket "${b}" --key "${mirror_key}" --body "${mirror_tmp}")
+  if [[ "${b}" == "${BUCKET_RELEASE}" ]]; then
+    put_args+=(--object-lock-mode GOVERNANCE --object-lock-retain-until-date "${mirror_retain}")
+  fi
+  if ! aws "${AWS_ARGS[@]}" s3api put-object "${put_args[@]}" >/dev/null 2>&1; then
+    fail "could not PUT smoke object into ${b}"
+    continue
+  fi
+  ok "PUT (authenticated)"
+
+  # GET anonymously via curl. No AWS auth headers. Plain HTTP 200 with
+  # the expected body is the success criterion.
+  url="${ENDPOINT}/${b}/${mirror_key}"
+  body="$(curl -fsS --max-time 10 "${url}" 2>/dev/null || echo '__FETCH_FAILED__')"
+  if [[ "${body}" == "${mirror_payload}" ]]; then
+    ok "GET (anonymous) returned the object — public-read works"
+  else
+    fail "anonymous GET of ${url} did not return the object (got: ${body:0:80})"
+  fi
+
+  # LIST should NOT be public — we only grant GetObject. Use curl on
+  # the bucket root; expect a 403 (or some failure that isn't a 200
+  # with a valid XML listing).
+  list_status="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "${ENDPOINT}/${b}/" || echo 000)"
+  if [[ "${list_status}" == "200" ]]; then
+    fail "anonymous LIST of ${b} returned 200 — policy should grant GetObject only"
+  else
+    ok "anonymous LIST blocked (HTTP ${list_status})"
+  fi
+done
+
+rm -f "${mirror_tmp}"
+
+# --------------------------------------------------------------------------
 # Result
 # --------------------------------------------------------------------------
 

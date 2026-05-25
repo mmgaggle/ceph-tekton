@@ -14,9 +14,9 @@
 # ---------------------------------------------------------------------------
 
 provider "aws" {
-  region                      = var.rgw_region
-  access_key                  = var.rgw_access_key
-  secret_key                  = var.rgw_secret_key
+  region     = var.rgw_region
+  access_key = var.rgw_access_key
+  secret_key = var.rgw_secret_key
 
   skip_credentials_validation = true # RGW STS surface differs from AWS
   skip_metadata_api_check     = true
@@ -47,9 +47,25 @@ module "artifacts" {
   # Ceph community pulls from.
   force_destroy = false
 
-  # Confirm RGW version implements these before flipping to true.
-  enable_public_access_block       = false
-  enable_bucket_ownership_controls = false
+  # Ceph RGW Squid+ implements both. Verify against the live Sepia RGW
+  # version before applying; older RGW returns NotImplemented and
+  # `terraform apply` will fail at the corresponding resource.
+  enable_public_access_block       = true
+  enable_bucket_ownership_controls = true
+
+  # All three buckets are public-readable. Ceph users + teuthology fetch
+  # via plain HTTP from `artifacts.ceph.com/<bucket>/...`. Authenticated
+  # writes still gate on the STS roles (#7, #8). Object-lock on the
+  # release bucket is orthogonal — read open, write/delete restricted.
+  dev_public_read     = true
+  branch_public_read  = true
+  release_public_read = true
+
+  # Default `["*"]` exposes the entire bucket. Override here to keep
+  # any internal `staging/` prefix private during publish-repo atomic
+  # swap (#21). Add prefixes once the layout under each bucket is
+  # finalized.
+  # public_read_prefixes = ["repodata/*", "packages/*", "dists/*", "pubkey.gpg"]
 
   tags = {
     project = "ceph-tekton"

@@ -3,7 +3,7 @@ terraform {
 
   required_providers {
     aws = {
-      source  = "hashicorp/aws"
+      source = "hashicorp/aws"
       # 5.30+ has stable `aws_s3_bucket_lifecycle_configuration`,
       # `aws_s3_bucket_versioning`, and `aws_s3_bucket_object_lock_configuration`
       # as separate resources. Pin to 5.x for now — 6.x added a

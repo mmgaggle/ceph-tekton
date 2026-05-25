@@ -183,8 +183,81 @@ resource "aws_s3_bucket_public_access_block" "this" {
 
   bucket = each.value
 
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
+  # ACL-style public access is always blocked. Object ACLs are not the
+  # mechanism we use for public mirror semantics — that's the public
+  # bucket policy (see `aws_s3_bucket_policy.public_read` below).
+  block_public_acls  = true
+  ignore_public_acls = true
+
+  # Bucket-policy-based public access: blocked by default, permitted
+  # for buckets that opted into mirror semantics via `*_public_read`.
+  block_public_policy     = !lookup(local.bucket_public_read, each.key, false)
+  restrict_public_buckets = !lookup(local.bucket_public_read, each.key, false)
+}
+
+# ===========================================================================
+# Public-mirror bucket policies
+#
+# Buckets with `*_public_read = true` get a policy granting anonymous
+# s3:GetObject (and s3:GetObjectVersion for versioned buckets) on the
+# configured prefixes. This is the read side of the chacra mirror —
+# every `dnf install ceph`, `apt-get install ceph-common`, and
+# `podman pull quay.io/ceph/ceph` traverses this path.
+#
+# Writes remain restricted to authenticated principals (via the
+# upstream STS roles), and object-lock on the release bucket is
+# orthogonal: it controls whether objects can be deleted/overwritten,
+# not whether they can be read.
+# ===========================================================================
+
+locals {
+  bucket_public_read = {
+    dev     = var.dev_public_read
+    branch  = var.branch_public_read
+    release = var.release_public_read
+  }
+  buckets_with_public_read = {
+    for k, v in local.bucket_public_read : k => local.bucket_ids[k] if v
+  }
+}
+
+data "aws_iam_policy_document" "public_read" {
+  for_each = local.buckets_with_public_read
+
+  statement {
+    sid     = "AllowAnonymousReadOnPrefixes"
+    effect  = "Allow"
+    actions = ["s3:GetObject", "s3:GetObjectVersion"]
+
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+
+    # public_read_prefixes uses S3-style globs (e.g. "repodata/*"). The
+    # default "*" yields the full bucket. ARN format is the same on
+    # AWS, RGW, and MinIO — bucket-policy ARN strings are not validated
+    # against a backend-specific partition.
+    resources = [
+      for prefix in var.public_read_prefixes :
+      "arn:aws:s3:::${each.value}/${prefix}"
+    ]
+  }
+}
+
+resource "aws_s3_bucket_policy" "public_read" {
+  for_each = local.buckets_with_public_read
+
+  bucket = each.value
+  policy = data.aws_iam_policy_document.public_read[each.key].json
+
+  # public-access-block must be configured (permissively) BEFORE the
+  # public policy is applied, otherwise AWS rejects the policy as a
+  # would-be public statement against a blocked bucket. depends_on is
+  # safe even when the public-access-block resource has 0 instances
+  # (e.g. against MinIO with enable_public_access_block = false).
+  depends_on = [
+    aws_s3_bucket_ownership_controls.this,
+    aws_s3_bucket_public_access_block.this,
+  ]
 }

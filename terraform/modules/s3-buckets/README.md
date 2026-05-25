@@ -108,6 +108,43 @@ versions don't ship them either. The `enable_public_access_block`
 and `enable_bucket_ownership_controls` variables let the Sepia env
 opt in once RGW support is confirmed, without breaking the dev env.
 
+## Public-mirror semantics
+
+Ceph artifact buckets need anonymous public read so that `apt-get`,
+`dnf`, `podman pull`, and `curl` work against the canonical URLs (this
+is what `download.ceph.com` / `chacra.ceph.com` do today). Per-bucket
+`*_public_read` variables flip this on:
+
+```hcl
+module "artifacts" {
+  source = "../../modules/s3-buckets"
+
+  dev_public_read     = true
+  branch_public_read  = true
+  release_public_read = true
+
+  # Default `["*"]` exposes the entire bucket. Narrow this when the
+  # publish-repo task introduces an internal `staging/` prefix.
+  # public_read_prefixes = ["repodata/*", "packages/*", "dists/*"]
+}
+```
+
+The implementation grants `s3:GetObject` + `s3:GetObjectVersion` to
+`Principal: "*"` via an `aws_s3_bucket_policy` — *not* via object
+ACLs. Object ACLs stay blocked everywhere the operator has enabled
+`enable_public_access_block` (which is also flipped permissive on
+`block_public_policy` / `restrict_public_buckets` for public buckets,
+so the bucket policy can take effect).
+
+`ListBucket` is **not** granted publicly — only object reads. Anyone
+who knows the key can fetch it (which is the chacra model); browsing
+the bucket contents requires authentication.
+
+Object-lock on the release bucket is orthogonal: it controls whether
+objects can be deleted or overwritten, not whether they can be read.
+A release object is simultaneously world-readable AND undeletable
+until its retention expires.
+
 ## Inputs
 
 See [`variables.tf`](variables.tf) for the full list. Most callers
@@ -135,3 +172,6 @@ module "artifacts" {
 - `buckets` — map keyed by class (`dev` / `branch` / `release`).
 - `release_object_lock` — effective `{mode, years}` on the release
   bucket, so the calling env can echo it in its outputs.
+- `public_read` — `{buckets, prefixes}` where `buckets` is the
+  per-class bool of the `*_public_read` inputs and `prefixes` is the
+  effective `public_read_prefixes` list.

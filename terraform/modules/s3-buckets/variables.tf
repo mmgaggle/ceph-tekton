@@ -146,7 +146,63 @@ variable "enable_public_access_block" {
     Apply `aws_s3_bucket_public_access_block`. AWS-only feature; MinIO
     and most RGW versions return NotImplemented. Default off; set true
     for AWS.
+
+    When set true AND a bucket has `*_public_read = true`, the
+    public-access-block for that bucket is configured *permissively*
+    (block_public_policy=false, restrict_public_buckets=false) so the
+    public bucket policy can take effect — ACLs remain blocked.
   EOT
   type        = bool
   default     = false
+}
+
+# ---------------------------------------------------------------------------
+# Public-mirror semantics
+#
+# Ceph artifact buckets need anonymous public read so that `apt-get`,
+# `dnf`, `podman pull`, and `curl` work against the canonical URLs (this
+# is what `download.ceph.com` / `chacra.ceph.com` do today). The module
+# expresses this via a per-bucket flag + an optional prefix scope.
+#
+# The implementation uses a bucket policy granting s3:GetObject to
+# Principal "*" — *not* object ACLs. Object ACLs are blocked everywhere
+# the operator has enabled public-access-block.
+# ---------------------------------------------------------------------------
+
+variable "dev_public_read" {
+  description = "Allow anonymous GetObject on the dev bucket (mirror semantics)."
+  type        = bool
+  default     = false
+}
+
+variable "branch_public_read" {
+  description = "Allow anonymous GetObject on the branch bucket (mirror semantics)."
+  type        = bool
+  default     = false
+}
+
+variable "release_public_read" {
+  description = "Allow anonymous GetObject on the release bucket (mirror semantics)."
+  type        = bool
+  default     = false
+}
+
+variable "public_read_prefixes" {
+  description = <<-EOT
+    Object key prefixes (S3-style globs, *not* regex) granted anonymous
+    read when a bucket has `*_public_read = true`. Default `["*"]` exposes
+    the entire bucket — which is the right call for a yum/apt mirror that
+    pulls repodata, packages, and signing-key downloads all under the
+    same root.
+
+    To keep an internal `staging/` prefix private during a build, set
+    explicit prefixes like `["repodata/*", "packages/*", "dists/*"]`.
+  EOT
+  type        = list(string)
+  default     = ["*"]
+
+  validation {
+    condition     = length(var.public_read_prefixes) > 0
+    error_message = "public_read_prefixes must contain at least one entry."
+  }
 }

@@ -29,3 +29,11 @@ output "release_object_lock" {
     years = var.release_object_lock_years
   }
 }
+
+output "public_read" {
+  description = "Per-bucket public-read flag and the prefix scope applied to buckets where it's true."
+  value = {
+    buckets  = local.bucket_public_read
+    prefixes = var.public_read_prefixes
+  }
+}
