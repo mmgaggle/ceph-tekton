@@ -6,7 +6,7 @@
 set -euo pipefail
 
 CLUSTER="${KIND_CLUSTER_NAME:-ceph-tekton-dev}"
-TEKTON_VERSION="${TEKTON_PIPELINES_VERSION:-v0.62.0}"
+TEKTON_VERSION="${TEKTON_PIPELINES_VERSION:-v1.6.0}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 

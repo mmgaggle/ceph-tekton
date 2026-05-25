@@ -3,16 +3,17 @@ kind: Kustomization
 
 # Tekton Chains, pinned to a release.
 #
-# Compat matrix note: keep this aligned with the Tekton Pipelines version
-# in `kustomize/base/tekton-pipelines/kustomization.yaml`. Chains v0.22.x
-# pairs with Pipelines v0.62.x. Bump together after testing.
+# Compat matrix: Chains v0.26.0 pairs with Pipelines v1.6.x. Bump
+# in concert with `kustomize/base/tekton-pipelines/kustomization.yaml`.
+# Both moved from gcr.io/tekton-releases to ghcr.io/tektoncd in the
+# v1.x line; the old gcr.io paths 403 from current containerd.
 #
 # The release.yaml ships a `chains-config` ConfigMap with no `data:`
 # field; `chains-config.patch.yaml` layers our phase-1 dev defaults on
 # top via strategic merge. (configMapGenerator with `behavior: merge`
 # does not reliably populate an empty `data:` field, so we use a patch.)
 resources:
-  - https://storage.googleapis.com/tekton-releases/chains/previous/v0.22.0/release.yaml
+  - https://storage.googleapis.com/tekton-releases/chains/previous/v0.26.0/release.yaml
 
 patches:
   - path: chains-config.patch.yaml

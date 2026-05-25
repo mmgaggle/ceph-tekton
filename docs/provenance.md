@@ -152,7 +152,7 @@ container pipelines plug into the same convention as they land (#23,
 
 ### How it lands in the attestation
 
-Chains 0.22 has no separate "enable SBOM" knob. It looks at every
+Chains 0.26 has no separate "enable SBOM" knob. It looks at every
 TaskRun's Results for the type-hint grammar:
 
 | Result name | What it means |
@@ -191,7 +191,7 @@ without it Chains only sees what the Pipeline itself re-exposes.
 
 ### Why SPDX (not CycloneDX)
 
-Chains 0.22 is format-agnostic — it copies whatever `SBOM_MEDIATYPE`
+Chains 0.26 is format-agnostic — it copies whatever `SBOM_MEDIATYPE`
 the Task emits into the descriptor verbatim. We pin **SPDX-JSON
 (`application/spdx+json`, spec version 2.3)** because:
 

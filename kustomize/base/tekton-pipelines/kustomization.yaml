@@ -4,5 +4,18 @@ kind: Kustomization
 # Tekton Pipelines, pinned to a release. Bump in concert with the
 # TEKTON_PIPELINES_VERSION variable in the top-level Makefile so that
 # `make dev-up`'s wait condition matches the manifests we apply here.
+#
+# Why v1.6.0 (not the newer v1.x line on GitHub):
+# storage.googleapis.com/tekton-releases/pipeline/previous/ only carries
+# v1.6.0 patch series at the moment. Newer tags (v1.6.2, v1.12.0) are
+# published only as GitHub release assets. The bucket path is what
+# resolves cleanly from a kustomize remote `resources:` reference and
+# is the URL pattern the Tekton install docs use.
+#
+# Why not v0.62.0 (our previous pin):
+# That release pointed images at gcr.io/tekton-releases/... which 403s
+# from current containerd in k3s 1.35 — the multi-segment registry
+# path collides with containerd's pull-scope parsing. Caught by
+# end-to-end testing on a real k3s cluster, May 2026.
 resources:
-  - https://storage.googleapis.com/tekton-releases/pipeline/previous/v0.62.0/release.yaml
+  - https://storage.googleapis.com/tekton-releases/pipeline/previous/v1.6.0/release.yaml

@@ -9,7 +9,7 @@
 #   2. `chains-smoke-sbom`  — runs `syft` against a real, small public
 #      image (alpine), writes an SPDX-JSON SBOM into a shared workspace,
 #      and emits the type-hinted SBOM_URL + SBOM_DIGEST + SBOM_MEDIATYPE
-#      Results. Chains 0.22.x picks those up via its Result type-hint
+#      Results. Chains 0.26.x picks those up via its Result type-hint
 #      convention and records an SPDX descriptor under
 #      predicate.buildDefinition.resolvedDependencies in the slsa/v2alpha4
 #      attestation it then signs and logs to Rekor.
@@ -73,7 +73,7 @@ spec:
   description: |
     Generates an SPDX-JSON SBOM for a small public image using syft,
     writes the SBOM bytes into the shared `sbom` workspace, and emits
-    the type-hinted Results Chains 0.22.x recognises:
+    the type-hinted Results Chains 0.26.x recognises:
 
       * IMAGE_URL / IMAGE_DIGEST   — the subject (also acts as the
                                      SBOM's target package).

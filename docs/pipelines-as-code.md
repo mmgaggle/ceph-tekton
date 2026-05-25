@@ -33,7 +33,7 @@ specific release manifest:
 | Component                  | Version                                 |
 |----------------------------|-----------------------------------------|
 | Pipelines-as-Code          | `v0.27.0` (vanilla-k8s `release.k8s.yaml`) |
-| Compatible Tekton Pipelines| `v0.62.0` (the version pinned by `kustomize/base/tekton-pipelines/`) |
+| Compatible Tekton Pipelines| `v1.6.0` (the version pinned by `kustomize/base/tekton-pipelines/`) |
 
 PaC publishes two release manifests per tag:
 

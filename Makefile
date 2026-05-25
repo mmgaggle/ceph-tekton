@@ -7,7 +7,7 @@
 SHELL := bash
 
 # ---- versions (bump in PRs after testing) ----
-TEKTON_PIPELINES_VERSION ?= v0.62.0
+TEKTON_PIPELINES_VERSION ?= v1.6.0
 
 # ---- dev cluster ----
 KIND_CLUSTER_NAME ?= ceph-tekton-dev
