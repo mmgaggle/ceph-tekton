@@ -1,18 +1,33 @@
 # Tekton Chains smoke test.
 #
-# A trivial Task that emits IMAGE_URL + IMAGE_DIGEST Results. Tekton Chains
-# observes the completed TaskRun, generates a SLSA Provenance v1 attestation
-# describing the (claimed) artifact, signs it with the cosign x509 key in
-# the `signing-secrets` Secret, and uploads the signature to Sigstore Rekor.
+# Two Tasks pipelined together:
 #
-# The attestation lands as a TaskRun annotation (per `chains-config`'s
-# `artifacts.taskrun.storage: tekton` in the dev overlay) and can be
-# extracted with `tkn taskrun describe` or `kubectl get taskrun ... -o json`.
+#   1. `chains-smoke-build` — emits IMAGE_URL + IMAGE_DIGEST Results
+#      claiming a (fake, in dev) container image. This is the existing
+#      attestation-subject path.
 #
-# This is *intentionally* a fake build — we want to validate the Chains
-# plumbing without paying for a real container build in dev. Real builds
-# come in workstream-3 (#10) and workstream-7 (#23). Same Chains config
-# observes both.
+#   2. `chains-smoke-sbom`  — runs `syft` against a real, small public
+#      image (alpine), writes an SPDX-JSON SBOM into a shared workspace,
+#      and emits the type-hinted SBOM_URL + SBOM_DIGEST + SBOM_MEDIATYPE
+#      Results. Chains 0.22.x picks those up via its Result type-hint
+#      convention and records an SPDX descriptor under
+#      predicate.buildDefinition.resolvedDependencies in the slsa/v2alpha4
+#      attestation it then signs and logs to Rekor.
+#
+# In dev (storage=tekton) the attestation lands as a TaskRun annotation
+# and the raw SBOM bytes live in the pipeline's `sbom` workspace.
+# `docs/provenance.md` walks through extracting both, verifying the
+# cosign signature, and re-parsing the SBOM with `syft scan`.
+#
+# In Sepia (storage=oci, deferred) the SBOM is pushed as an OCI
+# referrer alongside the image and the SBOM_URL becomes a registry
+# reference rather than a workspace path; the rest of the type-hint
+# wiring is unchanged.
+#
+# This is *intentionally* a synthetic build. Real per-package SBOMs
+# generated against `dpkg-buildpackage`/`rpmbuild` outputs land in #50;
+# real container attestations in #23. Same Chains config observes
+# both.
 ---
 apiVersion: tekton.dev/v1
 kind: Task
@@ -51,14 +66,164 @@ spec:
         echo "smoke-test build claims image $(params.image-url)@$(params.image-digest)"
 ---
 apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: chains-smoke-sbom
+spec:
+  description: |
+    Generates an SPDX-JSON SBOM for a small public image using syft,
+    writes the SBOM bytes into the shared `sbom` workspace, and emits
+    the type-hinted Results Chains 0.22.x recognises:
+
+      * IMAGE_URL / IMAGE_DIGEST   — the subject (also acts as the
+                                     SBOM's target package).
+      * SBOM_URL                   — workspace-relative pointer the
+                                     verifier uses to fetch the bytes.
+                                     In Sepia/OCI mode this becomes a
+                                     registry referrer URL.
+      * SBOM_DIGEST                — sha256 of the SBOM file. Chains
+                                     records this in the attestation so
+                                     a verifier can confirm integrity
+                                     before parsing.
+      * SBOM_MEDIATYPE             — application/spdx+json. Chains
+                                     copies this verbatim into the
+                                     resolvedDependencies entry so
+                                     downstream tooling can tell SPDX
+                                     from CycloneDX without sniffing.
+
+    The Chains type-hint convention is the unified-name pair
+    `<NAME>_IMAGE_URL` + `<NAME>_IMAGE_DIGEST` (+ optional
+    `<NAME>_SBOM_*`); using bare `IMAGE_*` / `SBOM_*` here means
+    Chains treats them as one subject with one attached SBOM. See
+    tektoncd/chains/docs/slsa-provenance.md for the full grammar.
+  params:
+    - name: sbom-target-image
+      type: string
+      description: |
+        Image to scan with syft. Defaults to a small, stable public
+        alpine tag so the smoke test runs offline-friendly and produces
+        a deterministic SPDX shape.
+      default: docker.io/library/alpine:3.19
+    - name: syft-image
+      type: string
+      description: |
+        Pinned syft image. Bumping this is a deliberate supply-chain
+        decision — the same way we pin builder images. v1.18.0 is the
+        current stable line that emits SPDX 2.3 cleanly.
+      default: docker.io/anchore/syft:v1.18.0
+  results:
+    - name: IMAGE_URL
+      type: string
+      description: Image syft scanned (also the SBOM's subject).
+    - name: IMAGE_DIGEST
+      type: string
+      description: Resolved digest of the scanned image (sha256:...).
+    - name: SBOM_URL
+      type: string
+      description: |
+        Workspace-relative URL for the SPDX-JSON SBOM. Verifier reads
+        the file from the same `sbom` workspace; in Sepia (OCI mode)
+        this becomes an OCI referrer reference.
+    - name: SBOM_DIGEST
+      type: string
+      description: sha256:... digest of the SBOM file. Chains records this.
+    - name: SBOM_MEDIATYPE
+      type: string
+      description: application/spdx+json — the SBOM format identifier.
+  workspaces:
+    - name: sbom
+      description: |
+        Shared workspace where the SBOM file is written. The verifier
+        reads it back from the same workspace.
+      mountPath: /workspace/sbom
+  steps:
+    # ---------------------------------------------------------------
+    # The anchore/syft image is distroless (gcr.io/distroless/static):
+    # only the syft binary, no shell, no coreutils. So `scan` invokes
+    # syft directly via `command:` + `args:` (which doesn't need a
+    # shell) and writes BOTH the SPDX-JSON SBOM and the syft-native
+    # JSON output. `emit-results` is a follow-up step on a busybox
+    # image that parses the syft-native JSON for the resolved digest,
+    # computes the SBOM file digest, and emits all five Tekton Results.
+    # ---------------------------------------------------------------
+    - name: scan
+      image: $(params.syft-image)
+      env:
+        # Quiet syft's telemetry / update check inside the build pod.
+        - name: SYFT_CHECK_FOR_APP_UPDATE
+          value: "false"
+      # `command:` runs the syft binary directly — no shell involved.
+      command: ["/syft"]
+      args:
+        - scan
+        - "registry:$(params.sbom-target-image)"
+        - "--output"
+        - "spdx-json=$(workspaces.sbom.path)/sbom.spdx.json"
+        - "--output"
+        # syft-json carries the resolved digest under
+        # `.source.metadata.manifestDigest` (sha256-only on registry
+        # sources); we parse it in the emit-results step.
+        - "json=$(workspaces.sbom.path)/syft-result.json"
+        - "--quiet"
+    - name: emit-results
+      # busybox gives us /bin/sh, sha256sum, sed, head, printf, wc.
+      # Pinned to a major.minor for build determinism.
+      image: docker.io/library/busybox:1.36
+      script: |
+        #!/bin/sh
+        set -eu
+
+        TARGET='$(params.sbom-target-image)'
+        OUTDIR="$(workspaces.sbom.path)"
+        OUTFILE="${OUTDIR}/sbom.spdx.json"
+        META="${OUTDIR}/syft-result.json"
+
+        # Resolved digest lives in syft's native JSON. We try the
+        # documented `.source.metadata.manifestDigest` path first,
+        # then fall back to scraping any sha256:... that appears in
+        # the metadata block. The SPDX file's checksum is the SBOM's
+        # own hash, not the source image's, so we don't read that.
+        IMAGE_DIGEST=$(
+          sed -n 's/.*"manifestDigest": *"\(sha256:[0-9a-f]\{64\}\)".*/\1/p' "${META}" | head -n1
+        )
+        if [ -z "${IMAGE_DIGEST}" ]; then
+          IMAGE_DIGEST=$(
+            sed -n 's/.*"\(sha256:[0-9a-f]\{64\}\)".*/\1/p' "${META}" | head -n1
+          )
+        fi
+        if [ -z "${IMAGE_DIGEST}" ]; then
+          echo "could not resolve image digest from syft output" >&2
+          exit 1
+        fi
+
+        SBOM_DIGEST="sha256:$(sha256sum "${OUTFILE}" | awk '{print $1}')"
+        SBOM_URL="workspace://sbom/sbom.spdx.json"
+
+        printf '%s' "${TARGET}"               > "$(results.IMAGE_URL.path)"
+        printf '%s' "${IMAGE_DIGEST}"         > "$(results.IMAGE_DIGEST.path)"
+        printf '%s' "${SBOM_URL}"             > "$(results.SBOM_URL.path)"
+        printf '%s' "${SBOM_DIGEST}"          > "$(results.SBOM_DIGEST.path)"
+        printf '%s' "application/spdx+json"   > "$(results.SBOM_MEDIATYPE.path)"
+
+        echo
+        echo "SBOM:        ${OUTFILE} ($(wc -c < "${OUTFILE}") bytes)"
+        echo "SBOM_DIGEST: ${SBOM_DIGEST}"
+        echo "IMAGE:       ${TARGET}@${IMAGE_DIGEST}"
+---
+apiVersion: tekton.dev/v1
 kind: Pipeline
 metadata:
   name: chains-smoke-test
 spec:
   description: |
-    Single-Task pipeline that emits IMAGE_URL + IMAGE_DIGEST so Chains
-    has something to attest about. See `docs/provenance.md` for the
-    end-to-end walkthrough including key generation and verification.
+    Two-Task pipeline:
+      - `build` claims an image (fake digest, dev) — gives Chains a
+        synthetic subject.
+      - `sbom`  runs syft against a real small image, writes SPDX-JSON,
+        and emits SBOM_* type-hinted Results so Chains attaches an
+        SPDX descriptor to the slsa/v2alpha4 attestation's
+        resolvedDependencies.
+    See `docs/provenance.md` ("SBOM") for the verification walkthrough.
   params:
     - name: image-url
       type: string
@@ -66,6 +231,19 @@ spec:
     - name: image-digest
       type: string
       default: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    - name: sbom-target-image
+      type: string
+      description: |
+        Image the `sbom` task scans. Kept separate from the build task's
+        (fake) image so the smoke test exercises a real SPDX shape
+        against a stable, tiny public base.
+      default: docker.io/library/alpine:3.19
+  workspaces:
+    - name: sbom
+      description: |
+        Shared workspace where the SBOM lives between tasks and is
+        read back during verification. emptyDir is fine for the smoke
+        test; real builds bind a PVC.
   tasks:
     - name: build
       taskRef:
@@ -75,3 +253,12 @@ spec:
           value: $(params.image-url)
         - name: image-digest
           value: $(params.image-digest)
+    - name: sbom
+      taskRef:
+        name: chains-smoke-sbom
+      params:
+        - name: sbom-target-image
+          value: $(params.sbom-target-image)
+      workspaces:
+        - name: sbom
+          workspace: sbom

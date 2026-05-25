@@ -12,10 +12,24 @@ metadata:
   namespace: tekton-chains
 data:
   # ---- attestation format ----
+  # slsa/v2alpha4 is the only format in Chains 0.22.x that emits the
+  # in-toto predicate shape with `buildDefinition.resolvedDependencies`
+  # — the slot SPDX SBOM descriptors land in (see "SBOM" section in
+  # docs/provenance.md and tektoncd/chains#1110 for the v2alpha4
+  # predicate spec).
   artifacts.taskrun.format: slsa/v2alpha4
   artifacts.taskrun.storage: tekton
   artifacts.pipelinerun.format: slsa/v2alpha4
   artifacts.pipelinerun.storage: tekton
+
+  # Tell the PipelineRun reconciler to walk into child TaskRuns when
+  # collecting type-hinted results (IMAGE_*, SBOM_*, …). Without this,
+  # the PipelineRun attestation only sees results the Pipeline itself
+  # re-exposed; with it, every child TaskRun's SBOM descriptor rolls
+  # up into the PipelineRun-level resolvedDependencies list.
+  # Key: `artifacts.pipelinerun.enable-deep-inspection`
+  # Upstream: github.com/tektoncd/chains config/config.go (Chains 0.18+)
+  artifacts.pipelinerun.enable-deep-inspection: "true"
 
   # OCI image attestations stay storage=tekton on dev (no writable
   # registry needed). Sepia overlay flips these to `oci`.
