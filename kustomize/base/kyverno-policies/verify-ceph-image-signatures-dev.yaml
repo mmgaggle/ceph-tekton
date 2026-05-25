@@ -1,0 +1,146 @@
+# ClusterPolicy: verify-ceph-image-signatures-dev
+#
+# Cosign x509 signature verification for the local kind dev cluster.
+#
+# Matches Pods whose containers (init, regular, or ephemeral) reference
+# an image under `quay.io/ceph/*` (the published Ceph daemon registry)
+# and requires every such image to be cosign-signed by the public key
+# in `tekton-chains/signing-secrets`. That Secret is created by
+# `hack/dev-chains-setup.sh` and re-used as the verification key here,
+# which closes the dev signing/verification loop end-to-end:
+#
+#   Chains signs with cosign.key ───►  Pod admitted iff cosign.pub matches
+#
+# IMPORTANT — this policy is *dev-only*. It targets the kind cluster
+# the contributor brought up with `make dev-up`. The matching Sepia
+# policy (verify-ceph-image-signatures-sepia.yaml) uses Fulcio keyless
+# verification and a different cluster identity. They are written to
+# be mutually exclusive via a namespaceSelector on each policy's
+# `match` block — see "Mutual exclusion model" below.
+#
+# Mutual exclusion model (dev side):
+#   The match block matches namespaces whose label
+#   `ceph-tekton.io/cluster` is anything OTHER than `sepia`. On a fresh
+#   kind cluster, no namespace carries that label, so the policy
+#   enforces on every (non-system) namespace. On a Sepia install,
+#   namespaces carrying `ceph-tekton.io/cluster=sepia` skip this
+#   policy and instead match the keyless sepia policy. The Sepia
+#   policy's namespaceSelector is the exact inverse (label =
+#   `sepia`), so the two never enforce on the same admission call.
+#
+# Tunable scope:
+#   - `match.any[].resources.kinds` covers Pod creation. Tekton TaskRuns
+#     are ultimately Pods, so the policy catches them. Add `Deployment`,
+#     `StatefulSet`, etc. if you want to fail earlier at the workload
+#     level instead of at Pod create — but Kyverno's `verifyImages`
+#     auto-traverses pod-template-bearing kinds in 1.10+, so the Pod
+#     match is enough.
+#
+# What this policy does NOT do (intentionally):
+#   - SBOM presence check (see #50 — Chains will sign SBOMs once SPDX
+#     emission lands).
+#   - Vulnerability-scan status (see #51).
+#   - Any check on builder-image or sidecar-image registries other
+#     than quay.io/ceph/*. Skipping verification for non-Ceph images
+#     keeps the dev cluster usable for general workloads.
+
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-ceph-image-signatures-dev
+  annotations:
+    policies.kyverno.io/title: Verify Ceph image signatures (dev / cosign key)
+    policies.kyverno.io/category: Supply Chain Security
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Requires that every Pod referencing a quay.io/ceph/* image carry
+      a valid cosign signature verifiable by the dev cluster's
+      Tekton Chains signing key (tekton-chains/signing-secrets,
+      field cosign.pub). The signing side of this loop is configured
+      by hack/dev-chains-setup.sh.
+    ceph-tekton.io/scope: dev-cluster
+    ceph-tekton.io/signing-mode: cosign-key
+spec:
+  # admission-time enforcement
+  validationFailureAction: Enforce
+
+  # Background scan would re-check existing Pods against the policy on
+  # a cycle. For dev that just generates noisy PolicyReports against
+  # pre-existing kube-system pods etc. — keep off; the smoke test
+  # exercises admission directly.
+  background: false
+
+  webhookConfiguration:
+    failurePolicy: Fail
+
+  rules:
+    - name: verify-ceph-images-cosign-key
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              # namespaceSelector inspects the *namespace's* labels
+              # (not the Pod's). The dev policy fires on namespaces
+              # WITHOUT the sepia cluster label — i.e. every namespace
+              # on the kind cluster, since none of them carry that
+              # label. NotIn with a single value means "the label is
+              # absent OR the label is set to something other than the
+              # listed value", which is the polarity we want.
+              namespaceSelector:
+                matchExpressions:
+                  - key: ceph-tekton.io/cluster
+                    operator: NotIn
+                    values:
+                      - sepia
+      # Skip the namespaces the ceph-tekton stack itself runs in.
+      # Kyverno's chart-level webhook exclusion already drops these
+      # before the policy sees them; this is a defense-in-depth
+      # repeat so the policy reads correctly in isolation.
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kube-public
+                - kube-node-lease
+                - kyverno
+                - tekton-pipelines
+                - tekton-chains
+                - vault
+                - pipelines-as-code
+      verifyImages:
+        - imageReferences:
+            - "quay.io/ceph/*"
+          # `required: true` makes the absence of a signature itself a
+          # rejection reason (otherwise an unsigned image matching the
+          # glob would pass — defeating the policy). Combined with the
+          # spec-level `validationFailureAction: Enforce`, this is the
+          # belt-and-braces fail-closed posture.
+          required: true
+          # `mutateDigest` would rewrite the tag to a digest pin. For
+          # dev iteration we leave the image reference as the user
+          # wrote it so logs are readable.
+          mutateDigest: false
+          verifyDigest: false
+          # Required: at least one attestor entry must verify.
+          attestors:
+            - entries:
+                - keys:
+                    # Kyverno resolves the key from the named Secret's
+                    # `cosign.pub` field by convention. This matches the
+                    # Secret hack/dev-chains-setup.sh creates and is the
+                    # same key Tekton Chains signs with.
+                    secret:
+                      name: signing-secrets
+                      namespace: tekton-chains
+                    # Public-good Rekor lookup is fine here — Chains is
+                    # configured to log every signature to it. If
+                    # transparency was disabled during chains setup
+                    # (offline dev), set rekor.url to "" to skip.
+                    rekor:
+                      url: https://rekor.sigstore.dev
+                    # ctlog left at default (enabled). For Sigstore key
+                    # signing, ctlog isn't strictly required, but having
+                    # it on gives us a second transparency anchor.

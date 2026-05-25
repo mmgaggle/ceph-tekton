@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Kyverno ClusterPolicies for ceph-image signature verification.
+#
+# Both policies are applied to every cluster that consumes this base.
+# Each policy uses a `preconditions` block keyed on the
+# `ceph-tekton.io/cluster` label so that only the one whose label
+# matches actually enforces. See the policy file headers for the
+# mutual-exclusion model.
+#
+# Compat matrix: ClusterPolicy is kyverno.io/v1, stable since Kyverno
+# 1.6. The verifyImages.attestors API (keys.secret + keyless) is stable
+# since Kyverno 1.10 / chart 3.0. Pinned chart in this repo is 3.3.7
+# (Kyverno v1.13.4) — see charts/kyverno/README.md.
+resources:
+  - verify-ceph-image-signatures-dev.yaml
+  - verify-ceph-image-signatures-sepia.yaml

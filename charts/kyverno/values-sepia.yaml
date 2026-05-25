@@ -1,0 +1,182 @@
+# Kyverno — Sepia (production) values stub for the official
+# kyverno/kyverno helm chart.
+#
+# STATUS: STUB. Not deployed yet. Issue #47 only stands up Kyverno in
+# the local kind dev cluster. This file captures the production stance
+# so that when the Sepia install lands (tracked separately), the diff
+# against values-dev.yaml makes the dev->prod boundary obvious.
+#
+# Production requirements this file encodes:
+#   - 3-replica HA for every long-running controller (admission,
+#     background, cleanup, reports) with anti-affinity across nodes.
+#   - failurePolicy: Fail on the admission webhooks so a Kyverno outage
+#     fails closed for image-verification — degraded mode prefers
+#     blocking new pods over admitting unverified images.
+#   - PodDisruptionBudgets so a rolling node-drain can't take all
+#     replicas down at once.
+#   - Production-sized resource requests/limits.
+#   - Metrics scraped by the in-cluster Prometheus (PodMonitor).
+#   - Verifies images via Sigstore Fulcio keyless — see the matching
+#     ClusterPolicy in kustomize/base/kyverno-policies/verify-ceph-image-signatures-sepia.yaml.
+#
+# What is intentionally *not* set here and must be supplied at install
+# time (in a sealed-secrets/SOPS overlay, NOT in plaintext git):
+#   - TLS cert/key for the admission webhook (cert-manager Certificate
+#     resource or a chart-managed self-signed cert; Sepia convention is
+#     cert-manager).
+#   - Any private cosign signing key references — none expected; sepia
+#     uses Fulcio keyless and the Sigstore TUF root is reached over
+#     egress, not loaded from a Secret.
+
+crds:
+  install: true
+
+admissionController:
+  replicas: 3
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+  # Fail closed on Sepia. A wedged Kyverno blocks new Pod creates rather
+  # than letting unverified images slip through. Worth re-reading:
+  # https://kyverno.io/docs/installation/customization/#failurepolicy
+  failurePolicy: Fail
+  webhookTimeoutSeconds: 30
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 2
+  # Spread across nodes — production must survive a node drain.
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: DoNotSchedule
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/component: admission-controller
+  serviceMonitor:
+    enabled: true
+    namespace: openshift-monitoring
+
+backgroundController:
+  replicas: 3
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  serviceMonitor:
+    enabled: true
+    namespace: openshift-monitoring
+
+cleanupController:
+  replicas: 3
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  serviceMonitor:
+    enabled: true
+    namespace: openshift-monitoring
+
+reportsController:
+  replicas: 3
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  serviceMonitor:
+    enabled: true
+    namespace: openshift-monitoring
+
+# ---- namespace exclusions ----
+#
+# Match dev's exclusions plus the namespaces the production Tekton
+# stack actually runs in. Crucial: do NOT exclude the namespace
+# (sepia-pipelines) whose Pods we want signature-verified.
+config:
+  excludeKyvernoNamespace: true
+  webhooks:
+    - namespaceSelector:
+        matchExpressions:
+          - key: kubernetes.io/metadata.name
+            operator: NotIn
+            values:
+              - kube-system
+              - kube-public
+              - kube-node-lease
+              - kyverno
+              - openshift-apiserver
+              - openshift-apiserver-operator
+              - openshift-authentication
+              - openshift-authentication-operator
+              - openshift-cloud-controller-manager
+              - openshift-cluster-machine-approver
+              - openshift-cluster-node-tuning-operator
+              - openshift-cluster-samples-operator
+              - openshift-cluster-storage-operator
+              - openshift-cluster-version
+              - openshift-config
+              - openshift-config-operator
+              - openshift-controller-manager
+              - openshift-controller-manager-operator
+              - openshift-dns
+              - openshift-dns-operator
+              - openshift-etcd
+              - openshift-etcd-operator
+              - openshift-image-registry
+              - openshift-ingress
+              - openshift-ingress-operator
+              - openshift-kube-apiserver
+              - openshift-kube-apiserver-operator
+              - openshift-kube-controller-manager
+              - openshift-kube-controller-manager-operator
+              - openshift-kube-scheduler
+              - openshift-kube-scheduler-operator
+              - openshift-machine-api
+              - openshift-machine-config-operator
+              - openshift-monitoring
+              - openshift-multus
+              - openshift-network-operator
+              - openshift-oauth-apiserver
+              - openshift-operator-lifecycle-manager
+              - openshift-service-ca
+              - openshift-service-ca-operator
+
+# ----------------------------------------------------------------------
+# What is still missing before this stub is production-ready (tracked
+# separately, not part of issue #47):
+#   1. Wire cert-manager (or the chosen TLS-cert source) for the
+#      admission webhook serving cert.
+#   2. Confirm Sepia OpenShift's SA-token issuer URL — the verify
+#      policy's certificate-identity regex hard-codes the *shape* of
+#      that URL but the literal value is set when Chains lands its
+#      Fulcio overlay.
+#   3. Provision a Sigstore TUF mirror inside Sepia if egress to
+#      sigstore.dev is blocked, and point Kyverno's verifyImages
+#      `roots:` at it.
+#   4. Decide whether the verify policy runs in `audit` mode for one
+#      release cycle before flipping to `enforce` (recommended) — see
+#      docs/deploy-verification.md.
+#   5. PolicyReports integration with the Sepia incident-response
+#      workflow (alerts on a failed verification).
+# ----------------------------------------------------------------------

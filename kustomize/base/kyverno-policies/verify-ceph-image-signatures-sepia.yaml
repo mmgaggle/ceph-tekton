@@ -1,0 +1,165 @@
+# ClusterPolicy: verify-ceph-image-signatures-sepia
+#
+# Fulcio keyless signature verification for the Sepia production
+# OpenShift cluster. STUB — sees no enforcement on the kind dev
+# cluster, where the dev-targeted ClusterPolicy fires instead.
+#
+# STATUS: STUB. The certificate-identity regex below uses a *shape*
+# of the expected Sepia SA-token issuer URL. The literal hostname is
+# pinned at Sepia install time once the OpenShift cluster's OIDC
+# discovery doc URL is known and Tekton Chains' Fulcio overlay has
+# landed. See the TODO at the bottom of charts/kyverno/values-sepia.yaml.
+#
+# How this differs from the dev policy:
+#
+#   | Concern             | dev (kind)                          | sepia (OpenShift)                  |
+#   |---------------------|-------------------------------------|------------------------------------|
+#   | Attestor type       | keys (cosign public key)            | keyless (Fulcio cert)              |
+#   | Identity            | "holder of the cosign.pub"          | SA ceph-pipeline-sa in             |
+#   |                     |                                     | namespace sepia-pipelines          |
+#   | OIDC issuer         | n/a                                 | https://<sepia-issuer>/...         |
+#   | Rekor               | public-good sigstore.dev            | public-good sigstore.dev           |
+#   | Namespace match     | label != sepia (default kind)       | label == sepia (Sepia install)     |
+#
+# Mutual-exclusion model: this policy and verify-ceph-image-signatures-dev
+# live in the same kustomize base and are applied together. Each uses a
+# `namespaceSelector` on the match block, keyed on the
+# `ceph-tekton.io/cluster` label of the *namespace* (NOT the Pod). The
+# kind dev cluster's namespaces do not carry that label, so this sepia
+# policy's `In: [sepia]` selector never matches → the policy is a
+# no-op on dev. The Sepia install will label its workload namespaces
+# `ceph-tekton.io/cluster=sepia` to flip the polarity.
+
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-ceph-image-signatures-sepia
+  annotations:
+    policies.kyverno.io/title: Verify Ceph image signatures (sepia / fulcio keyless)
+    policies.kyverno.io/category: Supply Chain Security
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Requires that every Pod referencing a quay.io/ceph/* image carry
+      a valid cosign signature whose Fulcio-issued certificate identity
+      maps to the ceph-pipeline-sa ServiceAccount in the sepia-pipelines
+      namespace of the Sepia OpenShift cluster. This binds artefact
+      provenance to the workload identity that built it.
+    ceph-tekton.io/scope: sepia-cluster
+    ceph-tekton.io/signing-mode: fulcio-keyless
+    ceph-tekton.io/status: stub-pending-sepia-issuer
+spec:
+  # Production stance: enforce, not audit. To phase in safely on Sepia,
+  # the overlay can flip this back to Audit for one release cycle,
+  # watch PolicyReports, then flip to Enforce. See
+  # docs/deploy-verification.md ("Rolling out safely").
+  validationFailureAction: Enforce
+
+  background: false
+
+  webhookConfiguration:
+    failurePolicy: Fail
+
+  rules:
+    - name: verify-ceph-images-fulcio-keyless
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              # Sepia-only: only match namespaces that explicitly
+              # carry the ceph-tekton.io/cluster=sepia label. On a
+              # dev/kind cluster (no such label anywhere) this rule
+              # never fires.
+              namespaceSelector:
+                matchExpressions:
+                  - key: ceph-tekton.io/cluster
+                    operator: In
+                    values:
+                      - sepia
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kube-public
+                - kube-node-lease
+                - kyverno
+                - openshift-apiserver
+                - openshift-apiserver-operator
+                - openshift-authentication
+                - openshift-authentication-operator
+                - openshift-cloud-controller-manager
+                - openshift-cluster-machine-approver
+                - openshift-cluster-node-tuning-operator
+                - openshift-cluster-samples-operator
+                - openshift-cluster-storage-operator
+                - openshift-cluster-version
+                - openshift-config
+                - openshift-config-operator
+                - openshift-controller-manager
+                - openshift-controller-manager-operator
+                - openshift-dns
+                - openshift-dns-operator
+                - openshift-etcd
+                - openshift-etcd-operator
+                - openshift-image-registry
+                - openshift-ingress
+                - openshift-ingress-operator
+                - openshift-kube-apiserver
+                - openshift-kube-apiserver-operator
+                - openshift-kube-controller-manager
+                - openshift-kube-controller-manager-operator
+                - openshift-kube-scheduler
+                - openshift-kube-scheduler-operator
+                - openshift-machine-api
+                - openshift-machine-config-operator
+                - openshift-monitoring
+                - openshift-multus
+                - openshift-network-operator
+                - openshift-oauth-apiserver
+                - openshift-operator-lifecycle-manager
+                - openshift-service-ca
+                - openshift-service-ca-operator
+                - tekton-pipelines
+                - tekton-chains
+                - vault
+                - pipelines-as-code
+      verifyImages:
+        - imageReferences:
+            - "quay.io/ceph/*"
+          # `required: true` makes the absence of a signature itself a
+          # rejection reason (otherwise an unsigned image matching the
+          # glob would pass — defeating the policy). Combined with the
+          # spec-level `validationFailureAction: Enforce`, this is the
+          # belt-and-braces fail-closed posture.
+          required: true
+          mutateDigest: false
+          verifyDigest: false
+          attestors:
+            - entries:
+                - keyless:
+                    # subject regex: any SA-token-issued OIDC identity
+                    # ending in /serviceaccount/ceph-pipeline-sa. The
+                    # issuer field below is what actually pins *who* is
+                    # allowed to sign — without an issuer constraint
+                    # an attacker could mint their own OIDC provider
+                    # that claims that SA name.
+                    subjectRegExp: "https://kubernetes\\.default\\.svc.*/serviceaccount/ceph-pipeline-sa$"
+                    # TODO(sepia): replace this regex with the
+                    # literal Sepia OpenShift SA-token issuer URL
+                    # before flipping the policy from Audit to
+                    # Enforce. The placeholder below tolerates both
+                    # the in-cluster issuer (kubernetes.default.svc)
+                    # AND any *.sepia.ceph.io host — pick whichever
+                    # one Sepia's apiserver advertises in its
+                    # /.well-known/openid-configuration once the
+                    # cluster is up.
+                    issuerRegExp: "https://(kubernetes\\.default\\.svc|.*\\.sepia\\.ceph\\.io).*"
+                    # Sigstore TUF roots default to the public-good
+                    # set. If Sepia deploys a private Sigstore stack
+                    # in phase 3, point `roots:` at the TUF mirror.
+                    rekor:
+                      url: https://rekor.sigstore.dev
+                    ctlog:
+                      url: https://ctfe.sigstore.dev/2022

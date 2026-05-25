@@ -59,6 +59,10 @@ dev-chains-up: ## Install Tekton Chains + bootstrap cosign signing keys.
 dev-vault-up: ## Install Vault (helm) + enable transit + k8s auth.
 	@./hack/dev-vault-up.sh
 
+.PHONY: dev-kyverno-up
+dev-kyverno-up: ## Install Kyverno (helm) + apply ceph-image-signature ClusterPolicy.
+	@./hack/dev-kyverno-up.sh
+
 # ---- validation (no cluster needed) ----
 
 .PHONY: kustomize-validate

@@ -1,0 +1,127 @@
+# Kyverno — local dev overrides for the official kyverno/kyverno helm chart.
+#
+# Consumed by `hack/dev-kyverno-up.sh`:
+#   helm upgrade --install kyverno kyverno/kyverno \
+#     --namespace kyverno --create-namespace \
+#     --version <pinned in dev-kyverno-up.sh> \
+#     --values charts/kyverno/values-dev.yaml
+#
+# Scope:
+#   - Single-replica everything (admission, background, cleanup, reports).
+#   - Shrunk resource requests/limits to coexist with Tekton + Vault +
+#     Chains on a single kind node.
+#   - Image-verification cache kept in-memory (default behaviour) — no
+#     external Redis or persistent store in dev.
+#   - Pod Security restrictedness left at chart defaults (Kyverno's own
+#     pods already pass restricted PSA).
+#
+# DO NOT USE THIS FILE FOR SEPIA OR ANY SHARED/PRODUCTION CLUSTER.
+# Single-replica admission controllers are a SPOF — every webhook call
+# will fail (and, depending on failurePolicy, every pod create will
+# fail) while the one pod restarts. See values-sepia.yaml for the
+# production stance.
+
+# ---- top-level chart toggles ----
+
+# CRDs ship inside the chart itself in 3.x. Leave installation on so
+# `helm upgrade --install` is a single command.
+crds:
+  install: true
+
+# Kyverno's admission webhook is what enforces the verifyImages rule.
+# Run a single replica in dev; HA pairs of three live in the sepia stub.
+admissionController:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 384Mi
+  # Fail-open on dev so a Kyverno crash doesn't brick `kubectl apply`
+  # against the cluster. The sepia stub flips this to Fail.
+  failurePolicy: Ignore
+  # Lower the default 30s webhook timeout so a wedged Kyverno pod doesn't
+  # stall every admission call for half a minute on a laptop.
+  webhookTimeoutSeconds: 10
+
+# Background controller mutates existing resources to bring them into
+# policy compliance. Not strictly needed for verifyImages (which is an
+# admission-time check), but the chart wires it on by default — keep it
+# minimal in dev.
+backgroundController:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+# Cleanup controller garbage-collects expired generated resources and
+# admission report ttls.
+cleanupController:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+# Reports controller aggregates per-resource PolicyReport objects. Useful
+# locally so `kubectl get policyreport -A` shows the verifyImages outcome
+# alongside every Pod create.
+reportsController:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+# ---- namespace exclusions ----
+#
+# Kyverno's webhook MUST NOT see its own pods (chicken-and-egg on
+# install) and should skip the kube-system control plane. The chart's
+# defaults already exclude kube-system + kyverno; we add the namespaces
+# that host the rest of the ceph-tekton dev stack so a policy outage
+# can't take them down.
+config:
+  excludeKyvernoNamespace: true
+  webhooks:
+    - namespaceSelector:
+        matchExpressions:
+          - key: kubernetes.io/metadata.name
+            operator: NotIn
+            values:
+              - kube-system
+              - kube-public
+              - kube-node-lease
+              - kyverno
+              - tekton-pipelines
+              - tekton-chains
+              - vault
+              - pipelines-as-code
+
+# ---- image-verification specifics ----
+#
+# verifyImages rules need to mount the cosign public key from
+# `tekton-chains/signing-secrets`. Kyverno reads the key via the
+# `keys.secret` reference in the ClusterPolicy itself; no chart-level
+# config is required for that. We do, however, need to grant the
+# admission controller permission to read that Secret across namespaces.
+#
+# The chart's default ClusterRole already covers `secrets/get` cluster-
+# wide. If you tighten that in your fork, re-grant it here via
+# admissionController.rbac.clusterRole.extraResources.
+
+# Default policy reporting / metrics endpoint is exposed on the admission
+# controller's service. Leave at defaults; `kubectl get policyreport` and
+# `kubectl describe clusterpolicy verify-ceph-image-signatures-dev` is
+# the dev iteration loop.
