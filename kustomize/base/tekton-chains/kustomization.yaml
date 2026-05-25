@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Tekton Chains, pinned to a release.
+#
+# Compat matrix note: keep this aligned with the Tekton Pipelines version
+# in `kustomize/base/tekton-pipelines/kustomization.yaml`. Chains v0.22.x
+# pairs with Pipelines v0.62.x. Bump together after testing.
+#
+# The release.yaml ships a `chains-config` ConfigMap with no `data:`
+# field; `chains-config.patch.yaml` layers our phase-1 dev defaults on
+# top via strategic merge. (configMapGenerator with `behavior: merge`
+# does not reliably populate an empty `data:` field, so we use a patch.)
+resources:
+  - https://storage.googleapis.com/tekton-releases/chains/previous/v0.22.0/release.yaml
+
+patches:
+  - path: chains-config.patch.yaml
+    target:
+      kind: ConfigMap
+      name: chains-config
+      namespace: tekton-chains

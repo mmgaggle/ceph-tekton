@@ -51,6 +51,10 @@ dev-status: ## Show cluster + Tekton install status.
 dev-test: ## Run the hello-world pipeline and stream its logs.
 	@./hack/dev-test.sh
 
+.PHONY: dev-chains-up
+dev-chains-up: ## Install Tekton Chains + bootstrap cosign signing keys.
+	@./hack/dev-chains-setup.sh
+
 .PHONY: dev-vault-up
 dev-vault-up: ## Install Vault (helm) + enable transit + k8s auth.
 	@./hack/dev-vault-up.sh

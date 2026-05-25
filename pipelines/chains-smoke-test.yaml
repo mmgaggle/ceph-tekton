@@ -1,0 +1,77 @@
+# Tekton Chains smoke test.
+#
+# A trivial Task that emits IMAGE_URL + IMAGE_DIGEST Results. Tekton Chains
+# observes the completed TaskRun, generates a SLSA Provenance v1 attestation
+# describing the (claimed) artifact, signs it with the cosign x509 key in
+# the `signing-secrets` Secret, and uploads the signature to Sigstore Rekor.
+#
+# The attestation lands as a TaskRun annotation (per `chains-config`'s
+# `artifacts.taskrun.storage: tekton` in the dev overlay) and can be
+# extracted with `tkn taskrun describe` or `kubectl get taskrun ... -o json`.
+#
+# This is *intentionally* a fake build — we want to validate the Chains
+# plumbing without paying for a real container build in dev. Real builds
+# come in workstream-3 (#10) and workstream-7 (#23). Same Chains config
+# observes both.
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: chains-smoke-build
+spec:
+  description: |
+    Emits IMAGE_URL + IMAGE_DIGEST as Tekton Results so Chains has
+    something to attest about. The image referenced does not need to
+    actually exist for storage=tekton; for storage=oci (sepia) the
+    referrer push happens against the real registry digest.
+  params:
+    - name: image-url
+      type: string
+      default: ghcr.io/ceph/smoke-test:dev
+    - name: image-digest
+      type: string
+      default: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  results:
+    - name: IMAGE_URL
+      type: string
+      description: Fully-qualified image reference.
+    - name: IMAGE_DIGEST
+      type: string
+      description: Digest of the (claimed) image, sha256:....
+  steps:
+    - name: emit-results
+      image: docker.io/library/busybox:1.36
+      script: |
+        #!/bin/sh
+        set -e
+        printf '%s' "$(params.image-url)"    | tee "$(results.IMAGE_URL.path)"
+        echo
+        printf '%s' "$(params.image-digest)" | tee "$(results.IMAGE_DIGEST.path)"
+        echo
+        echo "smoke-test build claims image $(params.image-url)@$(params.image-digest)"
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: chains-smoke-test
+spec:
+  description: |
+    Single-Task pipeline that emits IMAGE_URL + IMAGE_DIGEST so Chains
+    has something to attest about. See `docs/provenance.md` for the
+    end-to-end walkthrough including key generation and verification.
+  params:
+    - name: image-url
+      type: string
+      default: ghcr.io/ceph/smoke-test:dev
+    - name: image-digest
+      type: string
+      default: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  tasks:
+    - name: build
+      taskRef:
+        name: chains-smoke-build
+      params:
+        - name: image-url
+          value: $(params.image-url)
+        - name: image-digest
+          value: $(params.image-digest)

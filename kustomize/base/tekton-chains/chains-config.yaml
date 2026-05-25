@@ -1,0 +1,46 @@
+# Tekton Chains base configuration.
+#
+# Phase-1 dev defaults: SLSA Provenance v1.0 attestations, attestation stored
+# as a TaskRun/PipelineRun annotation (no registry needed), signed with a
+# locally-generated cosign x509 key (Secret `signing-secrets` in the
+# tekton-chains namespace), transparency-logged to the public Sigstore Rekor.
+#
+# The Fulcio-keyless path that PLAN.md specifies for production lives in the
+# `overlays/sepia/` chains patch (deferred until that overlay is built out).
+# Keyless requires Fulcio to reach the cluster's OIDC discovery endpoint,
+# which a NAT'd kind cluster cannot satisfy — so dev signs with a local key
+# and only Sepia signs keyless. The attestation format + Rekor flow stay
+# identical so smoke-tests here exercise the same code paths Sepia will.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chains-config
+  namespace: tekton-pipelines
+data:
+  # ---- attestation format ----
+  artifacts.taskrun.format: slsa/v2alpha4
+  artifacts.taskrun.storage: tekton
+  artifacts.pipelinerun.format: slsa/v2alpha4
+  artifacts.pipelinerun.storage: tekton
+
+  # OCI image attestations stay enabled — Chains emits them when a TaskRun
+  # exposes IMAGE_URL + IMAGE_DIGEST Results. Dev uses storage=tekton too
+  # so we don't need a writable registry; sepia overlay will flip these to
+  # `oci` to push referrer artifacts to the destination registry.
+  artifacts.oci.format: simplesigning
+  artifacts.oci.storage: tekton
+
+  # ---- signing ----
+  # x509 cosign-key signing for dev. Generate the key once with:
+  #   cosign generate-key-pair k8s://tekton-pipelines/signing-secrets
+  # This creates a `signing-secrets` Secret with cosign.key + cosign.pub +
+  # cosign.password. Chains looks for it by convention; no further config
+  # needed beyond making sure fulcio is disabled (default).
+  signers.x509.fulcio.enabled: "false"
+
+  # ---- transparency ----
+  # Sign-and-log every attestation to the public Sigstore Rekor. Third
+  # parties can verify provenance with no Sepia-side trust required.
+  transparency.enabled: "true"
+  transparency.url: https://rekor.sigstore.dev

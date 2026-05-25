@@ -1,0 +1,34 @@
+# Strategic merge patch for the upstream `chains-config` ConfigMap.
+# The release.yaml ships it with an empty data: field; we layer our
+# phase-1 dev defaults on top.
+#
+# Sepia overlay will further patch this with `signers.x509.fulcio.enabled:
+# "true"` + the cluster's OIDC issuer URL, and flip `artifacts.*.storage`
+# from `tekton` to `oci`.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chains-config
+  namespace: tekton-chains
+data:
+  # ---- attestation format ----
+  artifacts.taskrun.format: slsa/v2alpha4
+  artifacts.taskrun.storage: tekton
+  artifacts.pipelinerun.format: slsa/v2alpha4
+  artifacts.pipelinerun.storage: tekton
+
+  # OCI image attestations stay storage=tekton on dev (no writable
+  # registry needed). Sepia overlay flips these to `oci`.
+  artifacts.oci.format: simplesigning
+  artifacts.oci.storage: tekton
+
+  # ---- signing ----
+  # x509 cosign-key signing for dev. `hack/dev-chains-setup.sh` runs
+  # `cosign generate-key-pair k8s://tekton-chains/signing-secrets` once
+  # to populate the Secret Chains looks for by convention.
+  signers.x509.fulcio.enabled: "false"
+
+  # ---- transparency ----
+  # Sign-and-log every attestation to public Sigstore Rekor.
+  transparency.enabled: "true"
+  transparency.url: https://rekor.sigstore.dev
