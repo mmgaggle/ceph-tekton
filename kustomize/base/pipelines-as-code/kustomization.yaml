@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Pipelines-as-Code (PaC), pinned to a release. PaC publishes two release
+# manifests per tag:
+#   * release.yaml      — OpenShift (uses Routes, SCCs)
+#   * release.k8s.yaml  — vanilla Kubernetes (uses an Ingress-less Service
+#                         for the controller; webhook ingress is the
+#                         deployer's responsibility)
+#
+# We pin release.k8s.yaml because the canonical install target in phase 1
+# is a kind cluster (see docs/contributing-locally.md). The Sepia overlay
+# can swap to release.yaml in a future overlay when needed.
+#
+# Version compatibility: PaC v0.27.0 ships against Tekton Pipelines v0.62
+# (matches the version pinned in kustomize/base/tekton-pipelines/). Bump
+# both in lockstep — see docs/pipelines-as-code.md for the bump procedure.
+resources:
+  - https://raw.githubusercontent.com/openshift-pipelines/pipelines-as-code/release-v0.27.0/release.k8s.yaml

@@ -1,0 +1,107 @@
+# Noop PipelineRun template for Pipelines-as-Code (PaC).
+#
+# Purpose: prove the GitHub → smee → PaC controller → PipelineRun flow end
+# to end on the local dev cluster. The Task does nothing but echo the PR
+# number, source/target branch, and head SHA, so a successful run in the
+# Tekton Dashboard or `tkn pipelinerun logs -L` proves PaC received the webhook,
+# matched this template's annotations, instantiated a PipelineRun in the
+# target namespace, and posted a GitHub Check back on the PR.
+#
+# How PaC consumes this file:
+#   * In phase 1 this template lives in ceph-tekton/pipelines/. PaC is
+#     pointed at it via the "Remote Resolution" pattern from the test
+#     repo's .tekton/ directory (the test repo only needs a tiny stub
+#     referencing this file by URL). The walkthrough is in
+#     docs/pipelines-as-code.md.
+#   * In phase 2 this file moves to ceph/ceph/.tekton/ unchanged, so CI
+#     edits flow through code review with the code that needs them
+#     (PLAN.md "Open / phase-2 items").
+#
+# Annotations:
+#   pipelinesascode.tekton.dev/on-event         — which GitHub event(s)
+#     this template responds to. We restrict to pull_request — push and
+#     tag events get their own templates in later issues.
+#   pipelinesascode.tekton.dev/on-target-branch — branch glob(s) of the
+#     PR's *base* branch. "**" matches everything; production templates
+#     in later issues will narrow this to main / release-* / wip-*.
+#   pipelinesascode.tekton.dev/max-keep-runs    — PaC garbage-collects
+#     completed PipelineRuns above this count per (repo, template).
+#     Keeps the dev cluster tidy without hiding recent failures.
+---
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  # generateName so PaC can stamp a unique suffix per webhook delivery.
+  generateName: noop-pull-request-
+  annotations:
+    pipelinesascode.tekton.dev/on-event: "[pull_request]"
+    pipelinesascode.tekton.dev/on-target-branch: "[**]"
+    pipelinesascode.tekton.dev/max-keep-runs: "5"
+spec:
+  params:
+    # PaC substitutes these dynamic variables from the GitHub event
+    # payload at PipelineRun-instantiation time. See:
+    # https://pipelinesascode.com/docs/guide/authoringprs/#dynamic-variables
+    - name: repo_url
+      value: "{{ repo_url }}"
+    - name: revision
+      value: "{{ revision }}"
+    - name: pull_request_number
+      value: "{{ pull_request_number }}"
+    - name: source_branch
+      value: "{{ source_branch }}"
+    - name: target_branch
+      value: "{{ target_branch }}"
+  pipelineSpec:
+    params:
+      - name: repo_url
+        type: string
+      - name: revision
+        type: string
+      - name: pull_request_number
+        type: string
+      - name: source_branch
+        type: string
+      - name: target_branch
+        type: string
+    tasks:
+      - name: noop
+        params:
+          - name: repo_url
+            value: $(params.repo_url)
+          - name: revision
+            value: $(params.revision)
+          - name: pull_request_number
+            value: $(params.pull_request_number)
+          - name: source_branch
+            value: $(params.source_branch)
+          - name: target_branch
+            value: $(params.target_branch)
+        taskSpec:
+          params:
+            - name: repo_url
+              type: string
+            - name: revision
+              type: string
+            - name: pull_request_number
+              type: string
+            - name: source_branch
+              type: string
+            - name: target_branch
+              type: string
+          steps:
+            - name: echo-event
+              image: docker.io/library/busybox:1.36
+              script: |
+                #!/bin/sh
+                set -eu
+                echo "ceph-tekton PaC noop pipeline"
+                echo "----------------------------"
+                echo "repo:        $(params.repo_url)"
+                echo "PR #:        $(params.pull_request_number)"
+                echo "source:      $(params.source_branch)"
+                echo "target:      $(params.target_branch)"
+                echo "head SHA:    $(params.revision)"
+                echo
+                echo "If you can see this in a GitHub Check on the PR,"
+                echo "the webhook -> smee -> PaC -> Tekton flow works."
