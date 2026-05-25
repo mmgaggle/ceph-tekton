@@ -50,6 +50,73 @@ phase-1 surface.
 
 ---
 
+## Artifact lifecycle and retention
+
+Built artifacts live in three RGW S3 buckets, each with policy tuned to
+its consumer's needs and to the compliance properties named above. The
+buckets are terraform-managed (see [`terraform/modules/s3-buckets/`](terraform/modules/s3-buckets/));
+the choice of three buckets — rather than one bucket with prefix-scoped
+lifecycle — is deliberate because **object-lock is a bucket-level S3
+property** and can't be tightened per prefix.
+
+| Bucket | Holds | Lifecycle | Object-lock | Public read |
+|---|---|---|---|---|
+| `ceph-artifacts-dev` | `wip-*` branch builds, fork-PR builds | 30-day object expiry | none | yes (mirror) |
+| `ceph-artifacts-branch` | `main` + release-branch builds | keep latest 20 per `(branch, distro, arch)` + 180-day hard ceiling | none, versioning enabled | yes (mirror) |
+| `ceph-artifacts-release` | tag builds (`vX.Y.Z`) | none — kept indefinitely under object-lock | **GOVERNANCE, 7-year retention** | yes (mirror) |
+
+### Why each tier looks the way it does
+
+**Dev bucket — recycled aggressively.** Every `wip-*` push and fork-PR
+build lands here. 30 days is long enough for the longest interactive
+review cycle but short enough that abandoned wip-* branches reap
+automatically. No versioning, no object-lock — these artifacts are
+disposable by design.
+
+**Branch bucket — keep what teuthology cares about, then prune.** Active
+release branches need history (last good build per matrix cell, plus a
+few previous for bisection), but unbounded retention turns the bucket
+into landfill. The "keep latest N per `(branch, distro, arch)`" rule
+isn't an S3 lifecycle primitive — it's enforced by the publish-repo
+task with a 7-day noncurrent-version-expiration safety net. The
+180-day ceiling is the catch-all.
+
+**Release bucket — auditable evidence we shipped this bit.** Object-lock
+in GOVERNANCE mode + 7-year retention means a release artifact cannot
+be overwritten or deleted within the retention window, even by the
+bucket owner — only by an explicit `s3:BypassGovernanceRetention`
+privilege held by an audited break-glass role. This is what gives Ceph
+the SOX/HIPAA-style "show me the bit-identical artifact you said you
+shipped on day X" property compliance frameworks ask for. **Reads stay
+public** so consumers can still `dnf install ceph-X.Y.Z` years later;
+**writes are immutable**.
+
+### Mirror semantics
+
+All three buckets grant `s3:GetObject` (and `s3:GetObjectVersion`) to
+`Principal: "*"` via bucket policy — no anonymous listing, just object
+fetches by key. This is exactly what `download.ceph.com` /
+`chacra.ceph.com` do today. The URL convention is the discovery
+mechanism, mirroring chacra's pattern:
+
+```
+https://artifacts.ceph.com/<bucket>/<branch>/<sha>/<distro>/<arch>/
+                                                  └─ <pkgs+repodata+sboms+attestations>
+```
+
+The `<branch>/latest/manifest.json` pointer is updated atomically per
+successful publish, so consumers can pin to either a specific sha
+(immutable, reproducible) or the moving branch tip (auto-updating).
+
+Object-lock on the release bucket is **orthogonal to public read** —
+release artifacts are simultaneously world-readable AND undeletable
+until retention expires.
+
+See [`docs/architecture.md`](docs/architecture.md) §"Artifact storage"
+for the full diagram and the rejected alternatives in the Decision Log.
+
+---
+
 ## Architecture overview
 
 GitHub events (PR, branch push, tag) are turned into PipelineRuns by
