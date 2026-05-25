@@ -1,4 +1,4 @@
-# [Ceph Tekton](./ceph-tekton.png)
+# ![Ceph Tekton](./ceph-tekton.png)
 A Tekton-based replacement for the Ceph upstream build infrastructure
 (`jenkins` + `chacra` + `shaman`), with SLSA provenance via Tekton Chains.
 
