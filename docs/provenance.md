@@ -70,15 +70,14 @@ The `chains-smoke-test` pipeline runs two Tasks:
    (claiming a fake dev image). Gives Chains a subject to sign.
 2. **`sbom`** — runs `syft` against a real, small public image
    (`alpine:3.19` by default), writes an SPDX-JSON SBOM into the shared
-   `sbom` workspace, and emits the type-hinted Results
-   `IMAGE_URL` / `IMAGE_DIGEST` / `SBOM_URL` / `SBOM_DIGEST` /
-   `SBOM_MEDIATYPE`. Chains picks those up and attaches an SPDX
-   descriptor to the attestation it then signs.
+   `sbom` workspace, and emits the Chains-recognized Results
+   `IMAGE_URL` + `IMAGE_DIGEST` (the alpine subject) plus a
+   `sbom-ARTIFACT_OUTPUTS` object Result (the SBOM byproduct).
 
 Chains observes the completed TaskRuns, generates an in-toto SLSA
 Provenance attestation (format `slsa/v2alpha4`) describing the subject
-plus the SBOM as a resolved dependency, signs it with the cosign key,
-and posts the entry to public Rekor.
+plus the SBOM byproduct under `predicate.runDetails.byproducts[]`,
+signs it with the cosign key, and posts the entry to public Rekor.
 
 The build image reference is intentionally fake — we want to validate
 the Chains plumbing, not pay for a real container build in dev. The
@@ -152,37 +151,52 @@ container pipelines plug into the same convention as they land (#23,
 
 ### How it lands in the attestation
 
-Chains 0.26 has no separate "enable SBOM" knob. It looks at every
-TaskRun's Results for the type-hint grammar:
+Chains 0.26 recognizes a small set of [output type-hint Result
+patterns](https://github.com/tektoncd/chains/blob/v0.26.0/docs/slsa-provenance.md#output-artifacts) —
+**there is no dedicated SBOM convention**:
 
-| Result name | What it means |
+| Result name pattern | Role in the attestation |
 | --- | --- |
-| `IMAGE_URL` (or `<NAME>_IMAGE_URL`) | Subject — what was built / scanned. |
-| `IMAGE_DIGEST` (or `<NAME>_IMAGE_DIGEST`) | Subject digest, `sha256:...`. |
-| `SBOM_URL` (or `<NAME>_SBOM_URL`) | Where the SBOM file lives. |
-| `SBOM_DIGEST` (or `<NAME>_SBOM_DIGEST`) | `sha256:...` of the SBOM bytes. |
-| `SBOM_MEDIATYPE` (or `<NAME>_SBOM_MEDIATYPE`) | `application/spdx+json` for SPDX. |
+| `*IMAGE_URL` + `*IMAGE_DIGEST` | Subject — what was built / scanned. |
+| `IMAGES` | Multi-subject (newline- or comma-separated `uri@digest`). |
+| `*ARTIFACT_URI` + `*ARTIFACT_DIGEST` | Subject when paired; byproduct otherwise. |
+| `*ARTIFACT_OUTPUTS` | Object `{uri, digest, isBuildArtifact}`. Subject when `isBuildArtifact: "true"`; byproduct otherwise. |
 
-When these are present together, Chains adds an entry under
-`predicate.buildDefinition.resolvedDependencies` in the
-`slsa/v2alpha4` predicate:
+Result names not matching one of these patterns are ignored by Chains.
+SBOMs land via `*ARTIFACT_OUTPUTS` with `isBuildArtifact: "false"`,
+which Chains records at `predicate.runDetails.byproducts[]` of the
+slsa/v2alpha4 attestation (note: lowercase `byproducts` under
+`runDetails`, distinct from the SLSA spec's top-level
+`predicate.byProducts`). The Result's JSON value is
+**base64-encoded** into the `content` field:
 
 ```json
 {
   "predicate": {
-    "buildDefinition": {
-      "resolvedDependencies": [
+    "runDetails": {
+      "byproducts": [
         {
-          "uri": "workspace://sbom/sbom.spdx.json",
-          "digest": { "sha256": "9e1c…" },
-          "name": "SBOM",
-          "mediaType": "application/spdx+json"
+          "name": "taskRunResults/<taskrun-name>/sbom-ARTIFACT_OUTPUTS",
+          "mediaType": "application/json",
+          "content": "<base64 of {uri, digest, isBuildArtifact}>"
         }
       ]
     }
   }
 }
 ```
+
+The `mediaType: application/json` on the `byproducts[]` entry
+describes the **Result wrapper**, not the SBOM itself — the SBOM's
+own mediaType (`application/spdx+json`) is not recorded anywhere in
+the attestation. Verifiers either trust the URI suffix
+(`.spdx.json`) or fetch the file and content-sniff.
+
+**For a fully-typed SBOM attachment** (mediaType in the attestation,
+discoverable from the image's OCI referrer index, independently
+verifiable with `cosign verify-attestation --type spdx`), the
+canonical path is **`cosign attach sbom`** after the build — tracked
+as a follow-up to #46 alongside the e2e harness in #54.
 
 The `enable-deep-inspection` flag on the `chains-config` ConfigMap
 (`artifacts.pipelinerun.enable-deep-inspection: "true"`) is what makes
@@ -209,30 +223,51 @@ needs it.
 ### Extract and verify the SBOM
 
 Once the smoke-test PipelineRun finishes, the per-TaskRun attestation
-annotations carry the SBOM descriptor and the workspace carries the
-SBOM bytes:
+annotations carry the SBOM byproduct entry and the workspace carries
+the SBOM bytes:
 
 ```sh
-# 1. Find the sbom TaskRun.
-SBOM_TR=$(tkn taskrun list --output=name | grep -m1 chains-smoke-sbom)
+# 1. Find the sbom TaskRun (use the most recent if you've run several).
+SBOM_TR=$(kubectl get taskrun -l tekton.dev/pipelineTask=sbom \
+  --sort-by=.metadata.creationTimestamp \
+  -o jsonpath='{.items[-1].metadata.name}')
 
-# 2. Pull its attestation and inspect resolvedDependencies.
-kubectl get "$SBOM_TR" \
-  -o jsonpath='{.metadata.annotations.chains\.tekton\.dev/payload-taskrun-[a-z0-9-]+}' \
-  | base64 -d \
-  | jq -r '.payload | @base64d | fromjson
-           | .predicate.buildDefinition.resolvedDependencies'
+# 2. Find the chains payload annotation key (uid-suffixed) and decode.
+ANN_KEY=$(kubectl get taskrun "$SBOM_TR" -o json \
+  | jq -r '.metadata.annotations | keys[]' \
+  | grep '^chains.tekton.dev/payload-taskrun-')
 
-# 3. Read the SBOM_DIGEST + SBOM_URL Results directly.
-tkn taskrun describe "${SBOM_TR##*/}" -o json \
-  | jq -r '.status.results[] | select(.name|startswith("SBOM"))'
+# Chains storage=tekton stores the raw in-toto Statement directly
+# in the annotation (no DSSE wrapper) — single base64 decode gets
+# you the Statement JSON.
+kubectl get taskrun "$SBOM_TR" -o json \
+  | jq -r ".metadata.annotations.\"$ANN_KEY\"" \
+  | base64 -d > /tmp/att.json
+
+# 3. Inspect the SBOM byproduct — it lands at
+#    .predicate.runDetails.byproducts[] with name suffix
+#    `/sbom-ARTIFACT_OUTPUTS`. The `content` field is the
+#    base64-encoded Result value.
+jq '.predicate.runDetails.byproducts[]
+    | select(.name | endswith("/sbom-ARTIFACT_OUTPUTS"))' /tmp/att.json
+jq -r '.predicate.runDetails.byproducts[]
+       | select(.name | endswith("/sbom-ARTIFACT_OUTPUTS"))
+       | .content' /tmp/att.json \
+  | base64 -d | jq .
+# -> {"uri":"workspace://sbom/sbom.spdx.json","digest":"sha256:...","isBuildArtifact":"false"}
+
+# 4. The same uri + digest are also in the TaskRun's Results.
+kubectl get taskrun "$SBOM_TR" \
+  -o jsonpath='{.status.results}' \
+  | jq '.[] | select(.name == "sbom-ARTIFACT_OUTPUTS")'
 ```
 
-The descriptor `uri` is a `workspace://` URL while we're in dev (storage
+The byproduct `uri` is a `workspace://` URL while we're in dev (storage
 = tekton, no OCI registry). In Sepia (OCI mode, deferred) the SBOM is
 pushed as an [OCI referrer](https://github.com/opencontainers/distribution-spec/blob/main/spec.md#listing-referrers)
-alongside the image and the `uri` becomes a registry reference; the
-descriptor schema is unchanged.
+alongside the image via `cosign attach sbom` and the byproduct entry
+becomes a registry reference; the `content` shape (uri + digest) is
+unchanged.
 
 To pull the raw SBOM file out of the workspace (kind dev cluster, where
 the workspace is an emptyDir):
@@ -249,8 +284,8 @@ Verify the file matches the digest Chains attested:
 
 ```sh
 sha256sum /tmp/sbom.spdx.json
-# compare against the SBOM_DIGEST Result and against
-# predicate.buildDefinition.resolvedDependencies[].digest.sha256
+# compare against the .digest field of the
+# .predicate.runDetails.byproducts[] entry decoded above
 ```
 
 Then re-parse it with syft or `spdx-tools`:
@@ -285,6 +320,26 @@ syft scan spdx-json:/tmp/sbom.spdx.json -o table   # parses, exit 0
 That's the same `syft scan` invocation the Task runs.
 
 ## Per-build package SBOMs
+
+> **⚠️ KNOWN INCORRECT BELOW — see issue [#55](https://github.com/mmgaggle/ceph-tekton/issues/55) for the rewrite plan**
+>
+> The grammar described in this section (`ARTIFACT_OUTPUTS` with a
+> nested `sbom: {uri, digest, mediaType}` block, plus `SBOM_NAMES`,
+> `SBOM_COUNT`, `SBOM_MEDIATYPE` Result conventions) was a hallucinated
+> extension to Chains 0.26 — these Results are emitted by
+> `tasks/generate-sbom/task.yaml` but Chains silently ignores them.
+> The valid type-hint set for Chains 0.26 is only:
+> `*IMAGE_URL`/`*IMAGE_DIGEST`, `IMAGES`, `*ARTIFACT_URI`/`*ARTIFACT_DIGEST`,
+> `*ARTIFACT_OUTPUTS` (object with `uri`/`digest`/`isBuildArtifact`,
+> no `sbom` sub-block, no `mediaType`).
+>
+> The SBOM file is still generated correctly by syft and the smoke
+> pipeline passes — but the SBOM URI + digest do **not** appear in
+> the Chains attestation the way this section claims. The canonical
+> SBOM-to-attestation path is `cosign attach sbom` after the build;
+> issue #55 tracks the rewrite (generate-sbom Task + this docs
+> section) onto that path. E2E tests in #54 will keep this kind of
+> regression from shipping again.
 
 The `SBOM` section above covers the **container image** path: one image
 subject, one SPDX-JSON SBOM, attached via Chains' type-hint Result

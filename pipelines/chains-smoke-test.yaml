@@ -75,27 +75,27 @@ spec:
     writes the SBOM bytes into the shared `sbom` workspace, and emits
     the type-hinted Results Chains 0.26.x recognises:
 
-      * IMAGE_URL / IMAGE_DIGEST   — the subject (also acts as the
-                                     SBOM's target package).
-      * SBOM_URL                   — workspace-relative pointer the
-                                     verifier uses to fetch the bytes.
-                                     In Sepia/OCI mode this becomes a
-                                     registry referrer URL.
-      * SBOM_DIGEST                — sha256 of the SBOM file. Chains
-                                     records this in the attestation so
-                                     a verifier can confirm integrity
-                                     before parsing.
-      * SBOM_MEDIATYPE             — application/spdx+json. Chains
-                                     copies this verbatim into the
-                                     resolvedDependencies entry so
-                                     downstream tooling can tell SPDX
-                                     from CycloneDX without sniffing.
+      * IMAGE_URL / IMAGE_DIGEST    — the subject Chains attests to.
+                                      Subject digest in the in-toto
+                                      Statement matches IMAGE_DIGEST.
+      * sbom-ARTIFACT_OUTPUTS       — object {uri, digest,
+                                      isBuildArtifact}. With
+                                      `isBuildArtifact: "false"` the
+                                      SBOM lands in
+                                      `predicate.byProducts` of the
+                                      slsa/v2alpha4 attestation, not
+                                      in `subject`. Verifiers fetch
+                                      the URI to get the SBOM bytes.
 
-    The Chains type-hint convention is the unified-name pair
-    `<NAME>_IMAGE_URL` + `<NAME>_IMAGE_DIGEST` (+ optional
-    `<NAME>_SBOM_*`); using bare `IMAGE_*` / `SBOM_*` here means
-    Chains treats them as one subject with one attached SBOM. See
-    tektoncd/chains/docs/slsa-provenance.md for the full grammar.
+    NOTE: Chains 0.26 has NO dedicated SBOM type-hint convention. The
+    `*ARTIFACT_OUTPUTS` form is the closest equivalent: it carries a
+    URI + content digest but NOT a media type, so consumers need to
+    sniff (or trust the URI extension) to know it's SPDX vs
+    CycloneDX. The canonical way to attach a fully-typed SBOM to an
+    image is `cosign attach sbom` after the build, which stores the
+    SBOM as an OCI referrer alongside the image with the right media
+    type. See #54 (e2e tests) for the assertion harness and the
+    follow-up issue covering the canonical cosign-attach pattern.
   params:
     - name: sbom-target-image
       type: string
@@ -114,22 +114,22 @@ spec:
   results:
     - name: IMAGE_URL
       type: string
-      description: Image syft scanned (also the SBOM's subject).
+      description: Image syft scanned (the attestation subject).
     - name: IMAGE_DIGEST
       type: string
       description: Resolved digest of the scanned image (sha256:...).
-    - name: SBOM_URL
-      type: string
+    - name: sbom-ARTIFACT_OUTPUTS
+      type: object
       description: |
-        Workspace-relative URL for the SPDX-JSON SBOM. Verifier reads
-        the file from the same `sbom` workspace; in Sepia (OCI mode)
-        this becomes an OCI referrer reference.
-    - name: SBOM_DIGEST
-      type: string
-      description: sha256:... digest of the SBOM file. Chains records this.
-    - name: SBOM_MEDIATYPE
-      type: string
-      description: application/spdx+json — the SBOM format identifier.
+        SBOM artifact as a Chains type-hinted ARTIFACT_OUTPUTS object.
+        Chains records this under `predicate.byProducts` (not subject,
+        because isBuildArtifact is false). Carries uri + digest only —
+        ARTIFACT_OUTPUTS has no mediaType field, so the SPDX format
+        is conveyed by convention (URI ends `.spdx.json`).
+      properties:
+        uri: {}
+        digest: {}
+        isBuildArtifact: {}
   workspaces:
     - name: sbom
       description: |
@@ -199,11 +199,15 @@ spec:
         SBOM_DIGEST="sha256:$(sha256sum "${OUTFILE}" | awk '{print $1}')"
         SBOM_URL="workspace://sbom/sbom.spdx.json"
 
-        printf '%s' "${TARGET}"               > "$(results.IMAGE_URL.path)"
-        printf '%s' "${IMAGE_DIGEST}"         > "$(results.IMAGE_DIGEST.path)"
-        printf '%s' "${SBOM_URL}"             > "$(results.SBOM_URL.path)"
-        printf '%s' "${SBOM_DIGEST}"          > "$(results.SBOM_DIGEST.path)"
-        printf '%s' "application/spdx+json"   > "$(results.SBOM_MEDIATYPE.path)"
+        printf '%s' "${TARGET}"       > "$(results.IMAGE_URL.path)"
+        printf '%s' "${IMAGE_DIGEST}" > "$(results.IMAGE_DIGEST.path)"
+
+        # ARTIFACT_OUTPUTS object Result — Chains 0.26 reads this and
+        # places it under predicate.byProducts (isBuildArtifact: "false"
+        # = it's a byproduct, not a build subject).
+        printf '{"uri":"%s","digest":"%s","isBuildArtifact":"false"}' \
+          "${SBOM_URL}" "${SBOM_DIGEST}" \
+          > "$(results.sbom-ARTIFACT_OUTPUTS.path)"
 
         echo
         echo "SBOM:        ${OUTFILE} ($(wc -c < "${OUTFILE}") bytes)"
