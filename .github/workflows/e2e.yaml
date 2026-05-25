@@ -1,0 +1,297 @@
+# End-to-end CI for ceph-tekton.
+#
+# Brings up a kind cluster on the GH Actions runner, applies every
+# phase-1 / phase-2 component this repo ships manifests for
+# (Pipelines, Chains, Vault, Kyverno), runs each smoke pipeline, and
+# asserts on real outputs — attestation shape, cosign signature,
+# Rekor log entry, Kyverno admission rejection wording, reproducibility
+# %, parseable CycloneDX SBOM.
+#
+# Local equivalent (developer laptop):
+#   make dev-up && make dev-chains-up && make dev-vault-up && make dev-kyverno-up
+#   bash hack/e2e/run-all.sh
+# The `hack/e2e/` scripts share the same env-var contract as the
+# `Run e2e` step below — see docs/e2e.md.
+#
+# Skip hatch: add `[skip e2e]` (case-insensitive) to the PR title to
+# bypass this workflow on a PR that touches only docs / unrelated files.
+# Pushes to main are NEVER skipped.
+
+name: e2e
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+
+# Cancel in-flight runs on a PR when a new commit lands. main pushes
+# always run to completion (the deploy-on-merge story benefits from
+# the historical record).
+concurrency:
+  group: e2e-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Read-only token. We don't push images, comment on PRs, or write
+# anything else from this workflow.
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: kind + smoke pipelines
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # Pinned versions — bump in PRs after testing the new release
+    # against the smoke pipelines locally first. The comment column
+    # records "why this version" — usually a Tekton/Chains compat
+    # constraint or a known-good last-tested-on tag.
+    env:
+      # Tekton stack pins live in:
+      #   - kustomize/base/tekton-pipelines/kustomization.yaml  (v1.6.0 release.yaml URL)
+      #   - kustomize/base/tekton-chains/kustomization.yaml     (v0.26.0 release.yaml URL)
+      # CLIs need to land on compatible client versions.
+      TEKTON_PIPELINES_VERSION: v1.6.0
+      TEKTON_CHAINS_VERSION:    v0.26.0
+      # kind: 0.24.x is the line that ships node images for k8s 1.30/1.31;
+      # 0.25+ added a stricter cgroup driver check that breaks on the
+      # GHA runner's default systemd-cgroup config. Hold at 0.24 until
+      # we explicitly migrate.
+      KIND_VERSION:             v0.24.0
+      # Kubernetes node image — pinned to a kind-published tag so the
+      # bring-up is reproducible. 1.31.0 is the most recent k8s line
+      # that Tekton Pipelines v1.6.0 is tested against.
+      KIND_NODE_IMAGE:          kindest/node:v1.31.0
+      # kubectl: minor-version skew of ±1 from kube-apiserver is the
+      # supported window. 1.31.x matches the node image above.
+      KUBECTL_VERSION:          v1.31.0
+      # helm: 3.15.x is the current stable. Used to install Vault and
+      # Kyverno from their official charts.
+      HELM_VERSION:             v3.15.4
+      # tkn (Tekton CLI). 0.39 is the last release with the
+      # `pipeline start --output=name` flag in the shape lib.sh uses;
+      # 0.40+ renamed it to `--print-name` (we'd have to plumb both).
+      TKN_VERSION:              0.39.1
+      # cosign 2.x is required for `--insecure-ignore-tlog`; 2.4.x is
+      # the latest stable line.
+      COSIGN_VERSION:           v2.4.1
+      # rekor-cli matches the public Rekor service version. 1.3.x is
+      # the current stable line on rekor.sigstore.dev.
+      REKOR_CLI_VERSION:        v1.3.6
+      # syft — pinned to the same line the smoke pipelines use
+      # (chains-smoke-test.yaml + sbom-pkg-smoke-test.yaml both pin
+      # docker.io/anchore/syft:v1.18.0). Keeping the CI host syft
+      # within the same minor avoids round-trip-format drift.
+      SYFT_VERSION:             v1.18.0
+      # Helm chart versions — duplicated from the dev bootstrap
+      # scripts so a chart bump in those scripts is also enforced
+      # here (and vice versa).
+      VAULT_CHART_VERSION:      0.28.1
+      KYVERNO_CHART_VERSION:    3.3.7
+
+      # Names the e2e harness expects.
+      KIND_CLUSTER_NAME:        e2e
+      E2E_KIND_CLUSTER:         e2e
+      E2E_KUBE_CONTEXT:         kind-e2e
+      E2E_PIPELINERUN_TIMEOUT:  600s
+
+    # Honour `[skip e2e]` in the PR title (push-to-main always runs).
+    if: >-
+      github.event_name != 'pull_request' ||
+      !contains(github.event.pull_request.title, '[skip e2e]')
+
+    steps:
+      # ---------------------------------------------------------------
+      # 1. Source + tool setup.
+      # ---------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl ${{ env.KUBECTL_VERSION }}
+        run: |
+          set -euo pipefail
+          curl -fsSLo /usr/local/bin/kubectl \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x /usr/local/bin/kubectl
+          kubectl version --client
+
+      - name: Set up helm ${{ env.HELM_VERSION }}
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
+            | tar -xz -C /tmp
+          install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm
+          helm version
+
+      - name: Set up tkn ${{ env.TKN_VERSION }}
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            "https://github.com/tektoncd/cli/releases/download/v${TKN_VERSION}/tkn_${TKN_VERSION}_Linux_x86_64.tar.gz" \
+            | tar -xz -C /tmp tkn
+          install -m 0755 /tmp/tkn /usr/local/bin/tkn
+          tkn version
+
+      - name: Set up cosign ${{ env.COSIGN_VERSION }}
+        uses: sigstore/cosign-installer@v3.6.0
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
+      - name: Set up rekor-cli ${{ env.REKOR_CLI_VERSION }}
+        run: |
+          set -euo pipefail
+          curl -fsSLo /usr/local/bin/rekor-cli \
+            "https://github.com/sigstore/rekor/releases/download/${REKOR_CLI_VERSION}/rekor-cli-linux-amd64"
+          chmod +x /usr/local/bin/rekor-cli
+          rekor-cli version || rekor-cli --version || true
+
+      - name: Set up syft ${{ env.SYFT_VERSION }}
+        run: |
+          set -euo pipefail
+          curl -fsSL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin "${SYFT_VERSION}"
+          syft version
+
+      - name: Set up kind ${{ env.KIND_VERSION }}
+        run: |
+          set -euo pipefail
+          curl -fsSLo /usr/local/bin/kind \
+            "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          chmod +x /usr/local/bin/kind
+          kind version
+
+      - name: Show jq version
+        run: jq --version
+
+      # ---------------------------------------------------------------
+      # 2. Bring up the cluster + apply our manifests.
+      # We deliberately do NOT call `make dev-up` because the Makefile
+      # wraps hack/dev-up.sh which requires --interactive podman
+      # detection and a docker/podman precedence check we don't need
+      # on the runner. The substantive `kubectl apply -k` step is
+      # identical.
+      # ---------------------------------------------------------------
+      - name: Create kind cluster (${{ env.KIND_CLUSTER_NAME }})
+        run: |
+          set -euo pipefail
+          kind create cluster \
+            --name "${KIND_CLUSTER_NAME}" \
+            --image "${KIND_NODE_IMAGE}" \
+            --config hack/e2e/kind-config.yaml \
+            --wait 120s
+          kubectl --context "${E2E_KUBE_CONTEXT}" get nodes
+
+      - name: Install Tekton Pipelines ${{ env.TEKTON_PIPELINES_VERSION }}
+        run: |
+          set -euo pipefail
+          kubectl --context "${E2E_KUBE_CONTEXT}" apply \
+            -k kustomize/overlays/dev-local
+          kubectl --context "${E2E_KUBE_CONTEXT}" \
+            -n tekton-pipelines wait --for=condition=ready pod \
+              -l app.kubernetes.io/part-of=tekton-pipelines \
+              --timeout=300s
+
+      - name: Install Tekton Chains ${{ env.TEKTON_CHAINS_VERSION }} + bootstrap cosign key
+        env:
+          KIND_CLUSTER_NAME: ${{ env.KIND_CLUSTER_NAME }}
+        run: |
+          set -euo pipefail
+          # hack/dev-chains-setup.sh is idempotent and does exactly
+          # what we want: apply the kustomize/base/tekton-chains base,
+          # cosign generate-key-pair into the signing-secrets Secret,
+          # restart the controller. It honours KIND_CLUSTER_NAME.
+          bash hack/dev-chains-setup.sh
+
+      - name: Install Vault (helm ${{ env.VAULT_CHART_VERSION }}) + configure transit
+        env:
+          KIND_CLUSTER_NAME:    ${{ env.KIND_CLUSTER_NAME }}
+          VAULT_CHART_VERSION:  ${{ env.VAULT_CHART_VERSION }}
+        run: |
+          set -euo pipefail
+          bash hack/dev-vault-up.sh
+
+      - name: Install Kyverno (helm ${{ env.KYVERNO_CHART_VERSION }}) + apply ClusterPolicies
+        env:
+          KIND_CLUSTER_NAME:      ${{ env.KIND_CLUSTER_NAME }}
+          KYVERNO_CHART_VERSION:  ${{ env.KYVERNO_CHART_VERSION }}
+        run: |
+          set -euo pipefail
+          bash hack/dev-kyverno-up.sh
+
+      # ---------------------------------------------------------------
+      # 3. The actual e2e harness. Every assertion under hack/e2e/
+      # runs against the cluster brought up above.
+      # ---------------------------------------------------------------
+      - name: Run e2e assertions
+        env:
+          E2E_KIND_CLUSTER:        ${{ env.KIND_CLUSTER_NAME }}
+          E2E_KUBE_CONTEXT:        ${{ env.E2E_KUBE_CONTEXT }}
+          E2E_ARTIFACTS:           ${{ github.workspace }}/e2e-artifacts
+          E2E_PIPELINERUN_TIMEOUT: ${{ env.E2E_PIPELINERUN_TIMEOUT }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${E2E_ARTIFACTS}"
+          bash hack/e2e/run-all.sh
+
+      # ---------------------------------------------------------------
+      # 4. Diagnostics on failure. We always run this step
+      # (`if: failure()`) and capture everything the assertion library
+      # didn't already capture: cluster-wide pod state, events, helm
+      # release status, chains controller logs.
+      # ---------------------------------------------------------------
+      - name: Capture cluster diagnostics
+        if: failure()
+        env:
+          E2E_KUBE_CONTEXT: ${{ env.E2E_KUBE_CONTEXT }}
+          E2E_ARTIFACTS:    ${{ github.workspace }}/e2e-artifacts
+        run: |
+          set -uo pipefail
+          mkdir -p "${E2E_ARTIFACTS}/cluster"
+          kubectl --context "${E2E_KUBE_CONTEXT}" get pods -A -o wide \
+            > "${E2E_ARTIFACTS}/cluster/pods.txt" 2>&1 || true
+          kubectl --context "${E2E_KUBE_CONTEXT}" get events -A \
+            --sort-by=.lastTimestamp \
+            > "${E2E_ARTIFACTS}/cluster/events.txt" 2>&1 || true
+          kubectl --context "${E2E_KUBE_CONTEXT}" -n tekton-chains logs \
+            -l app.kubernetes.io/part-of=tekton-chains --tail=500 \
+            > "${E2E_ARTIFACTS}/cluster/chains-controller.log" 2>&1 || true
+          kubectl --context "${E2E_KUBE_CONTEXT}" -n tekton-pipelines logs \
+            -l app.kubernetes.io/part-of=tekton-pipelines --tail=500 \
+            > "${E2E_ARTIFACTS}/cluster/pipelines-controller.log" 2>&1 || true
+          kubectl --context "${E2E_KUBE_CONTEXT}" -n kyverno logs \
+            -l app.kubernetes.io/component=admission-controller --tail=500 \
+            > "${E2E_ARTIFACTS}/cluster/kyverno-admission.log" 2>&1 || true
+          kubectl --context "${E2E_KUBE_CONTEXT}" -n vault logs vault-0 \
+            --tail=500 \
+            > "${E2E_ARTIFACTS}/cluster/vault-0.log" 2>&1 || true
+          helm --kube-context "${E2E_KUBE_CONTEXT}" list -A \
+            > "${E2E_ARTIFACTS}/cluster/helm-releases.txt" 2>&1 || true
+          # Describe every non-Running pod so the upload bundle
+          # explains "what pod was sad and why".
+          kubectl --context "${E2E_KUBE_CONTEXT}" get pods -A --no-headers \
+            -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,STATUS:.status.phase 2>/dev/null \
+            | awk '$3 != "Running" && $3 != "Succeeded" { print $1, $2 }' \
+            | while read -r ns name; do
+                kubectl --context "${E2E_KUBE_CONTEXT}" -n "$ns" describe pod "$name" \
+                  > "${E2E_ARTIFACTS}/cluster/describe-${ns}-${name}.txt" 2>&1 || true
+              done
+
+      - name: Upload e2e artefacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/e2e-artifacts
+          if-no-files-found: warn
+          retention-days: 14
+
+      # ---------------------------------------------------------------
+      # 5. Always tear down. kind on the GH Actions runner cleans up
+      # when the runner VM is destroyed, but explicit `kind delete`
+      # makes the local-rerun semantics identical to CI's.
+      # ---------------------------------------------------------------
+      - name: Tear down kind cluster
+        if: always()
+        run: |
+          kind delete cluster --name "${KIND_CLUSTER_NAME}" || true

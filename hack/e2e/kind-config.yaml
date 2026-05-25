@@ -1,0 +1,29 @@
+# kind cluster config for the ceph-tekton e2e workflow.
+#
+# Distinct from hack/kind-config.yaml (which is the dev-loop default a
+# contributor uses for `make dev-up`): this one bumps the apiServer
+# address+port + adds explicit `containerdConfigPatches` so that pulls
+# from quay.io/ghcr.io/docker.io don't hit Docker Hub rate limits
+# mid-run on shared GitHub Actions IPs. The runner has its own private
+# IP per job — limit is per-IP — but the registry-mirror config keeps
+# us aligned with what kind does in its own CI.
+#
+# Single node by design: Tekton Chains + Vault + Kyverno + Tekton
+# Pipelines all colocate on the control-plane in dev. The 2-CPU
+# ubuntu-latest runner cannot afford a worker node in addition.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    # Bind to localhost only — keeps the apiserver off the runner's
+    # public interface for the duration of the job.
+    extraPortMappings: []
+# Use the public mirror configurations kind recommends for CI. We
+# don't actually point at a pull-through cache (no infra for it) but
+# leaving the registry sections empty lets containerd fall back to
+# the upstream registry naturally; the key is that we declare the
+# config so future "add a mirror" diffs are one-line.
+containerdConfigPatches:
+  - |-
+    [plugins."io.containerd.grpc.v1.cri".registry]
+      config_path = "/etc/containerd/certs.d"
