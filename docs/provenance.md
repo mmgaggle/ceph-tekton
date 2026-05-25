@@ -284,6 +284,234 @@ syft scan spdx-json:/tmp/sbom.spdx.json -o table   # parses, exit 0
 
 That's the same `syft scan` invocation the Task runs.
 
+## Per-build package SBOMs
+
+The `SBOM` section above covers the **container image** path: one image
+subject, one SPDX-JSON SBOM, attached via Chains' type-hint Result
+convention. For **packages** (`.deb`, `.rpm`) the same Chains plumbing
+is reused but with three deliberate differences:
+
+1. **One SBOM per artifact** — a single `build-package` TaskRun (#16)
+   can emit a handful of `.deb`s and a handful of `.rpm`s. Each one
+   gets its own CycloneDX SBOM and its own subject in the attestation.
+2. **CycloneDX-JSON, not SPDX-JSON** — see "Why CycloneDX (for
+   packages)" below.
+3. **S3 storage, not OCI referrers** — packages don't live in a
+   registry, so the SBOM lives next to the `.deb` / `.rpm` in the
+   build-output S3 prefix (same lifecycle, same access controls).
+
+The `generate-sbom` Task (`tasks/generate-sbom/task.yaml`) is the
+mechanism. It ships standalone today and gets `runAfter`'d by the real
+package pipeline once #16 lands.
+
+### Why CycloneDX (for packages)
+
+Same operating principle as SPDX-for-images (#46): Chains is
+format-agnostic and copies `SBOM_MEDIATYPE` verbatim into the
+attestation's `resolvedDependencies[].mediaType`. Format choice is a
+**consumer-fit** decision, not a Chains constraint. We picked the split
+because:
+
+| | SPDX 2.3 JSON | CycloneDX 1.6 JSON |
+|---|---|---|
+| Best for | Compliance / license inventories | Dependency graphs + vuln correlation |
+| Native dependency edges | flat `relationships[]` | first-class `dependencies[]` tree |
+| Ecosystem fit | M-22-18/M-23-16 federal asks, ISO/IEC 5962 | OWASP Dependency-Track, GitHub Dependency Graph, Snyk, Grype |
+| Per-package SBOM ergonomics | works; verbose | tighter — components + deps grouped per pkg |
+| What ceph consumers actually run | image-pull verifiers, fed-procurement audits | `grype <sbom.cdx.json>` against the vuln DB (#51) |
+
+For container images the consumer is "fed procurement / cosign verify"
+→ SPDX wins. For packages the consumer is "Grype + Dependency-Track
+correlating CVEs against the deb / rpm payload" → CycloneDX wins. Both
+are signed-into the same SLSA attestation; downstream tooling reads
+`SBOM_MEDIATYPE` and dispatches.
+
+### The multi-subject Chains type-hint grammar
+
+Container SBOM uses the **bare-name** form
+(`IMAGE_URL` + `IMAGE_DIGEST` + `SBOM_URL` + `SBOM_DIGEST` +
+`SBOM_MEDIATYPE` — one subject per TaskRun). Packages can't use that
+form because there are N subjects per TaskRun and Tekton's
+declared-results rule
+([tektoncd/pipeline#7140](https://github.com/tektoncd/pipeline/issues/7140))
+means we can't surface `<NAME>_*` Results whose `<NAME>` is only known
+at scan time.
+
+[`tektoncd/chains/docs/slsa-provenance.md`](https://github.com/tektoncd/chains/blob/main/docs/slsa-provenance.md)
+documents two declared plural Results that handle multi-subject
+TaskRuns cleanly, and `generate-sbom` emits BOTH:
+
+| Result name | Shape | What Chains does with it |
+| --- | --- | --- |
+| `IMAGES` | newline-separated `<url>@sha256:<digest>` pairs | Promotes each pair to a separate subject in the SLSA attestation. Works on every Chains version since 0.13. |
+| `ARTIFACT_OUTPUTS` | JSON array of `{name, uri, digest, sbom:{uri,digest,mediaType}}` | Reads the nested `sbom` block (Chains 0.20+) and populates one `predicate.buildDefinition.resolvedDependencies[]` entry per artifact with the CycloneDX descriptor. |
+
+The Task also exposes three contract-level Results that aren't part of
+the Chains grammar but are useful for verifier tooling, dashboards,
+and the smoke test:
+
+- **`SBOM_NAMES`** — newline-separated list of slug names (one per
+  artifact, derived from the basename: uppercase, non-alnum replaced
+  with `_`, prefixed `PKG_`). Lets a human grep TaskRun output without
+  having to JSON-parse `ARTIFACT_OUTPUTS`. Example:
+
+  ```
+  fake-pkg-a_1.0.tar                   -> PKG_FAKE_PKG_A_1_0_TAR
+  ceph-mds_19.2.0_arm64.deb            -> PKG_CEPH_MDS_19_2_0_ARM64_DEB
+  ceph-common-19.2.0-1.el10.x86_64.rpm -> PKG_CEPH_COMMON_19_2_0_1_EL10_X86_64_RPM
+  ```
+
+- **`SBOM_COUNT`** — decimal count of (artifact, SBOM) pairs. Zero is
+  a fatal misconfiguration; the Task fails before emitting in that
+  case (the smoke test asserts this).
+- **`SBOM_MEDIATYPE`** — `application/vnd.cyclonedx+json`, the per-Task
+  CycloneDX commitment.
+
+Chains' deep-inspection (the same
+`artifacts.pipelinerun.enable-deep-inspection: "true"` ConfigMap flag
+that the container path needs) walks the PipelineRun's child TaskRuns,
+pulls the `IMAGES` + `ARTIFACT_OUTPUTS` Results, and rolls up one
+attestation with **N subjects + N SBOM descriptors** for an N-package
+build.
+
+### Extracting a specific package's SBOM from an attestation
+
+The attestation lives on the PipelineRun (deep-inspection rolls up
+child TaskRun Results). Pull it the same way as the container path,
+then filter `resolvedDependencies` by `mediaType` and `name`:
+
+```sh
+# 1. Pull the PipelineRun-level attestation.
+PR=$(tkn pipelinerun list --output=name | grep -m1 sbom-pkg-smoke-test)
+kubectl get "$PR" \
+  -o jsonpath='{.metadata.annotations.chains\.tekton\.dev/payload-pipelinerun-[a-z0-9-]+}' \
+  | base64 -d \
+  | jq -r '.payload | @base64d | fromjson' > /tmp/att.json
+
+# 2. List every CycloneDX SBOM descriptor in the attestation.
+jq '.predicate.buildDefinition.resolvedDependencies[]
+    | select(.mediaType == "application/vnd.cyclonedx+json")' \
+  /tmp/att.json
+
+# 3. Find the SBOM_URL for a specific package by its basename.
+BN=ceph-mds_19.2.0_arm64.deb
+tkn pipelinerun describe "${PR##*/}" -o json \
+  | jq -r ".status.childReferences[].name" \
+  | while read -r tr; do
+      tkn taskrun describe "$tr" -o json \
+        | jq -r --arg n "$BN" '
+            (.status.results[]? | select(.name == "ARTIFACT_OUTPUTS")).value
+            | fromjson
+            | .[] | select(.name == $n) | .sbom.uri'
+    done
+
+# 4. Fetch the SBOM and re-parse it. The S3 layout is
+#    s3://<bucket>/<branch>/<sha>/<distro>/<arch>/sboms/<basename>.cdx.json
+aws s3 cp \
+  s3://ceph-artifacts-branch/main/<sha>/centos10/x86_64/sboms/ceph-mds_19.2.0_arm64.deb.cdx.json \
+  /tmp/
+syft scan cyclonedx-json:/tmp/ceph-mds_19.2.0_arm64.deb.cdx.json -o table
+```
+
+The downstream `SBOM_DIGEST` you saw in step 2 should match `sha256sum
+/tmp/ceph-mds_19.2.0_arm64.deb.cdx.json` exactly — same Chains-attested
+integrity guarantee as the container path.
+
+### OIDC S3 upload path
+
+The `generate-sbom` Task's `upload` step has three credentials modes
+(matches `reproducibility-check`, in priority order):
+
+1. **`s3-credentials` workspace mounted** with `AWS_ACCESS_KEY_ID` /
+   `AWS_SECRET_ACCESS_KEY` / optional `AWS_SESSION_TOKEN` files. Dev
+   path — same shape contributors use for the reproducibility smoke.
+2. **Projected SA token + `AWS_ROLE_ARN` env var** — production /
+   Sepia path. The step runs
+   `aws sts assume-role-with-web-identity --role-arn $AWS_ROLE_ARN
+   --web-identity-token $(cat /var/run/secrets/openshift/serviceaccount/token)`
+   to mint creds with TTL ≤ 1h, scoped by the RGW-side role to the
+   correct bucket + prefix. No long-lived S3 keys touch the pod —
+   matches the architecture decision in
+   [`docs/architecture.md`](architecture.md) "S3 credentials: STS
+   OIDC via SA-token".
+3. **`s3-bucket` empty** — short-circuit: SBOMs stay in the `sboms`
+   workspace and `SBOM_URL` Results point at `workspace://...`. Smoke
+   tests, kind dev, and the `sbom-pkg-smoke-test` pipeline run in
+   this mode.
+
+Production S3 layout (mirrors the package upload prefix from
+`PLAN.md` "Artifact storage"):
+
+```
+s3://ceph-artifacts-<class>/<branch>/<sha>/<distro>/<arch>/
+├── ceph-mds_19.2.0_arm64.deb        <- build-package (#16)
+├── ceph-common_19.2.0_arm64.deb     <- build-package (#16)
+├── ...
+└── sboms/
+    ├── ceph-mds_19.2.0_arm64.deb.cdx.json     <- generate-sbom
+    └── ceph-common_19.2.0_arm64.deb.cdx.json  <- generate-sbom
+```
+
+The SBOMs live in a `sboms/` sibling of the artifacts so consumers
+that walk the prefix can list packages and SBOMs separately, and so
+that the lifecycle/object-lock policies governing the `.deb` / `.rpm`
+files apply identically to their SBOMs (same `<branch>/<sha>` parent
+prefix, no separate retention story).
+
+### Wiring into build-package (#16)
+
+When [#16](https://github.com/mmgaggle/ceph-tekton/issues/16) lands,
+the package-build pipeline appends `generate-sbom` after
+`build-package` with shared workspaces:
+
+```yaml
+tasks:
+  - name: build-package
+    taskRef: { name: build-package }
+    workspaces:
+      - { name: source,        workspace: source }
+      - { name: build-output,  workspace: build-output }
+  - name: generate-sbom
+    runAfter: [build-package]
+    taskRef: { name: generate-sbom }
+    params:
+      - { name: artifact-glob, value: "*.deb" }   # or "*.rpm" per distro
+      - { name: s3-bucket,     value: "$(params.s3-bucket)" }
+      - { name: s3-branch,     value: "$(params.branch)" }
+      - { name: s3-sha,        value: "$(params.sha)" }
+      - { name: s3-distro,     value: "$(params.distro)" }
+      - { name: s3-arch,       value: "$(params.arch)" }
+      - { name: subject-prefix, value: "https://artifacts.ceph.com/$(params.s3-bucket)/$(params.branch)/$(params.sha)/$(params.distro)/$(params.arch)/" }
+    workspaces:
+      - { name: artifacts,        workspace: build-output }
+      - { name: sboms,            workspace: build-output }
+      - { name: s3-credentials,   workspace: s3-credentials }
+```
+
+No changes to `tasks/generate-sbom/task.yaml` are needed for the
+real-build path; only the `artifact-glob`, `subject-prefix`, and S3
+params switch from smoke defaults to real values.
+
+### Smoke test
+
+```sh
+kubectl apply -f tasks/generate-sbom/task.yaml
+kubectl apply -f pipelines/sbom-pkg-smoke-test.yaml
+tkn pipeline start sbom-pkg-smoke-test \
+  --workspace name=artifacts,emptyDir="" \
+  --workspace name=sboms,emptyDir="" \
+  --showlog
+```
+
+The pipeline:
+- seeds two deterministic `.tar` files into the artifacts workspace,
+- runs `generate-sbom` to produce one CycloneDX SBOM per artifact,
+- runs `assert-results` to verify `SBOM_COUNT=2`, the right
+  `SBOM_MEDIATYPE`, and that `SBOM_NAMES` contains both per-artifact
+  prefixes (`FAKE_PKG_A` + `FAKE_PKG_B`).
+
+PipelineRun success = the Chains type-hint contract is intact.
+
 ## Promoting to Fulcio keyless (Sepia)
 
 When the `overlays/sepia/` chains patch lands (deferred), it will:
