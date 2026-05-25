@@ -22,6 +22,34 @@ A Tekton-based replacement for the Ceph upstream build infrastructure
 
 ---
 
+## Supply-chain compliance posture
+
+The provenance pipeline (SLSA v1.0 attestations + Sigstore Fulcio
+keyless signing + public Rekor transparency log + Vault-resident
+repodata signing) is a foundation that helps satisfy a number of
+software-supply-chain regimes increasingly being asked of upstream
+projects and downstream consumers. What ceph-tekton *contributes*
+toward each — overclaim warning: signing is necessary, not sufficient,
+for any of these. Compliance also depends on the consumer's process,
+SBOM coverage, vulnerability handling, and policy enforcement.
+
+| Regime | What this satisfies | What still needs work |
+|---|---|---|
+| **[SLSA Build L3](https://slsa.dev/spec/v1.0/levels)** | Build platform (Tekton + Chains) generates provenance the producer cannot tamper with; signed by an independent identity (Fulcio); transparency-logged (Rekor); hardened build environment (RBAC #38, NetworkPolicy #39). | Reproducible builds (would need pinned timestamps + verification harness); isolated builds per matrix cell (already true). |
+| **[NIST SP 800-218 SSDF](https://csrc.nist.gov/Projects/ssdf)** | PS.1.1 (protect from tampering: RBAC, Vault transit, STS), PS.3.1 (verifiable provenance: SLSA + cosign verify), PW.4.1 (secured dev environment), PO.5.1 (archive + protect each release: object-lock release bucket). | RV.1.3 (vulnerability analysis: SBOM + scanning pipeline not in phase 1), PW.4.4 (verify third-party components: would need Rekor checks on pulled deps). |
+| **US EO 14028 + OMB [M-22-18](https://www.whitehouse.gov/wp-content/uploads/2022/09/M-22-18.pdf) / [M-23-16](https://www.whitehouse.gov/wp-content/uploads/2023/06/M-23-16-Update-to-M-22-18.pdf)** | Producer side: SLSA-aligned attestations + signed releases give federal procurement consumers (national labs, USGS, anyone running Ceph in fed contexts) what their SSDF self-attestation forms ask for. | SBOM in CycloneDX/SPDX form (Tekton Chains supports this with extra config; not enabled phase 1). |
+| **[EU Cyber Resilience Act](https://eur-lex.europa.eu/eli/reg/2024/2847/oj) (CRA)** | Annex I §1.2(f) integrity protection (signed artifacts), (h) tamper-evidence (Rekor), Article 13 documentation (provenance is third-party-verifiable). | Article 11 coordinated vulnerability disclosure + Annex II §2 vulnerability handling — orthogonal to signing, but consumed alongside it. |
+| **[CIS Software Supply Chain Security](https://www.cisecurity.org/insights/white-papers/cis-software-supply-chain-security-guide) Benchmark** | §2 (build pipeline hardening), §4.2 (artifact signing), §4.3 (attestation of build steps). | §3 (dependency management — SBOM + scanning), §4.4 (signature verification at deploy — Kyverno/OPA policy at pull time). |
+| **[OpenSSF Scorecard](https://github.com/ossf/scorecard) signed-releases** | "Signed-Releases" check passes when tags publish SLSA attestations + cosign signatures (we do). | Other Scorecard checks (Branch-Protection, Code-Review, etc.) are orthogonal repo-governance items. |
+
+The pieces explicitly *not* in phase 1 — SBOM generation, vulnerability
+scanning, deploy-time signature verification (Kyverno/OPA), reproducible
+builds — are tracked as phase-2 candidates and can layer onto the same
+Chains attestation + Rekor + cosign foundation without disturbing the
+phase-1 surface.
+
+---
+
 ## Architecture overview
 
 GitHub events (PR, branch push, tag) are turned into PipelineRuns by
