@@ -19,3 +19,8 @@
 # rendered/generated manifests
 rendered/
 dist/
+
+# reproducibility-check synthetic example build outputs
+tasks/reproducibility-check/examples/**/hello-broken
+tasks/reproducibility-check/examples/**/hello-fixed
+tasks/reproducibility-check/examples/**/*.dSYM/
