@@ -3,22 +3,88 @@
   src="https://github.com/mmgaggle/ceph-tekton/blob/main/ceph-tekton.png">
 </p>
 
-A Tekton-based replacement for the Ceph upstream build infrastructure
-(`jenkins` + `chacra` + `shaman`), with SLSA provenance via Tekton Chains.
+`ceph-tekton` is a modernization of the Ceph build environment. The
+build platform is **Tekton Pipelines + Tekton Chains** on Kubernetes,
+producing signed, provenance-attested packages and container images for
+the upstream [`ceph/ceph`](https://github.com/ceph/ceph) codebase — and
+for anything else that wants to inherit the same supply-chain posture.
+
+The driving concerns are operational, not pitch-y:
+
+- **Move the build platform onto infrastructure the project (and the
+  wider community) already knows how to operate** — Kubernetes plus a
+  bundled Tekton, instead of bespoke services owned by the build team.
+- **Make builds portable enough to debug locally.** A contributor
+  reproducing a release-branch failure on their laptop should run the
+  same Pipeline that made the artefact, against the same Chains
+  attestation shape — differences from prod are explicit overlay
+  deltas, not "well, dev uses a different system."
+- **Make the security posture of every build a first-class output,
+  not a follow-up project.** Signed artefacts, SLSA v1.0 provenance
+  to Rekor, SBOMs alongside every package, vuln-scan results
+  produced from a self-hosted Grype DB we sign ourselves.
+
+### Where it runs
+
+The same manifests run on any cluster shape worth caring about:
+
+- **OpenShift in the [Ceph Sepia lab](https://wiki.sepia.ceph.com/)** —
+  the production target. Co-located with the Ceph S3/RGW the artifact
+  buckets live on, on hardware the project already operates. SLSA
+  signing is keyless against the OpenShift workload-OIDC issuer →
+  Fulcio → Rekor.
+- **A managed OpenShift service** — Red Hat
+  [ROSA](https://www.redhat.com/en/technologies/cloud-computing/openshift/aws),
+  IBM [ROKS](https://www.ibm.com/cloud/openshift), or anything else
+  shipping OpenShift Pipelines. Same overlay layout as Sepia; the
+  delta is the storage class and the OIDC issuer URL.
+- **A `kind` or `k3s` cluster under a contributor's desk** — for
+  iterating on a Pipeline change without booking Sepia time. The
+  local overlay swaps Sepia-only bits (Fulcio keyless, RGW object-lock)
+  for dev-shaped equivalents (a static cosign key in a Secret, MinIO
+  or an in-cluster RGW), so the same Pipeline runs end-to-end with
+  the same attestation shape.
+
+### What every build produces
+
+- **A signed artefact** — `.deb` / `.rpm` / container image with a
+  cosign signature published alongside.
+- **A SLSA v1.0 provenance attestation** — emitted by Tekton Chains
+  from the actual PipelineRun, signed by an identity the build itself
+  can't forge, and logged to Rekor for third-party verification.
+- **A SBOM** — CycloneDX for packages, SPDX for container images, all
+  produced by syft against the build output and attached via cosign.
+- **A vulnerability findings JSON** — produced by grype against a
+  cosign-signed, self-hosted vulnerability DB
+  ([#56](https://github.com/mmgaggle/ceph-tekton/issues/56)), surfaced
+  as a Tekton Result and an attestation byproduct so a consumer can
+  audit findings without re-scanning.
+- **A reproducibility verdict** — a second build (different
+  `SOURCE_DATE_EPOCH`, same SHA) diffoscoped against the first;
+  non-deterministic byte ranges become tracked issues rather than
+  silent drift.
+
+That set of outputs helps with the supply-chain regimes upstream Ceph
+and its downstream consumers are increasingly asked to satisfy
+(SLSA Build L3, NIST SSDF, the EU Cyber Resilience Act, OpenSSF
+Scorecard, US EO 14028 / OMB M-22-18, the CIS Software Supply Chain
+Security Benchmark). See the posture table below for the
+itemised "what's shipped vs what's still in flight" breakdown — and
+the caveats about what signing does and does not satisfy on its own.
+
+### Compatibility with what's there today
+
+Compatibility is a build-out concern, not the motivation. Phase 1's
+deliverable is **dual-publish**: every package + container that
+`jenkins` + `chacra` + `shaman` produce today, the Tekton-based
+platform produces alongside, against the same canonical URLs, until
+consumers (teuthology, downstream packagers, `dnf install ceph`,
+`podman pull quay.io/ceph/ceph`) verify the new path matches.
+[`PLAN.md`](PLAN.md) §"Cutover" walks the shadow → dual-publish →
+flip handoff in detail.
 
 - **Phase 1 plan:** [`PLAN.md`](PLAN.md)
 - **Backlog:** [GitHub Issues](https://github.com/mmgaggle/ceph-tekton/issues)
-
-## Goals
-
-- **Replace** jenkins (build executor), chacra (artifact server), and shaman
-  (metadata/UI/lookup API) for the `ceph/ceph` repo.
-- **Provenance** for every package and container — SLSA v1.0 attestations,
-  Sigstore keyless signing (Fulcio + workload OIDC), Rekor transparency log.
-- **Portable** — the same Tekton manifests run on Sepia OpenShift *and* on a
-  contributor's local k3s/kind cluster.
-- **Parity from day one** with the existing trigger model, build matrix, and
-  teuthology consumption pattern.
 
 ---
 
@@ -36,10 +102,10 @@ SBOM coverage, vulnerability handling, and policy enforcement.
 | Regime | What this satisfies | What still needs work |
 |---|---|---|
 | **[SLSA Build L3](https://slsa.dev/spec/v1.0/levels)** | Build platform (Tekton + Chains) generates provenance the producer cannot tamper with; signed by an independent identity (Fulcio); transparency-logged (Rekor); reproducible-build verification harness shipped (#48). Hardened build environment tracked in #38 / #39. | Driving diffoscope output toward empty on real ceph builds (#53, practically blocks on #10 builder image). Per-Task RBAC + NetworkPolicy hardening (#38, #39). |
-| **[NIST SP 800-218 SSDF](https://csrc.nist.gov/Projects/ssdf)** | PS.1.1 (protect from tampering: RBAC, Vault transit, STS). PS.3.1 (verifiable provenance: SLSA + cosign verify). PW.4.1 (secured dev environment). PO.5.1 (archive + protect each release: object-lock release bucket). SBOM files produced by syft for containers (#46) and packages (#50). | RV.1.3 vuln analysis — Grype scanning Task in flight (#51); severity gating #52 HITL. PW.4.4 verify-third-party-components (#49 HITL — depends on upstream signing coverage). PW.7 continuous verification — e2e tests in CI (#54) in flight. |
+| **[NIST SP 800-218 SSDF](https://csrc.nist.gov/Projects/ssdf)** | PS.1.1 (protect from tampering: RBAC, Vault transit, STS). PS.3.1 (verifiable provenance: SLSA + cosign verify). PW.4.1 (secured dev environment). PO.5.1 (archive + protect each release: object-lock release bucket). SBOM files produced by syft for containers (#46) and packages (#50). RV.1.3 vuln analysis — self-hosted Grype DB + vuln-scan Task shipped (#56). | Severity gating #52 HITL. PW.4.4 verify-third-party-components (#49 HITL — depends on upstream signing coverage). PW.7 continuous verification — e2e tests in CI shipped (#54); the build-archive sink (#63) lands the analytics surface that closes the continuous-verification loop. |
 | **US EO 14028 + OMB [M-22-18](https://www.whitehouse.gov/wp-content/uploads/2022/09/M-22-18.pdf) / [M-23-16](https://www.whitehouse.gov/wp-content/uploads/2023/06/M-23-16-Update-to-M-22-18.pdf)** | Producer side: SLSA-aligned attestations + signed releases give federal procurement consumers (national labs, USGS, anyone running Ceph in fed contexts) what their SSDF self-attestation forms ask for. CycloneDX SBOMs produced per package (#50), SPDX SBOMs per container (#46). | Fully-typed SBOM **attachment** to the attestation (mediaType + OCI referrer). Today: SBOM URI + content digest land as `*ARTIFACT_OUTPUTS` byproducts at `predicate.runDetails.byproducts[]`; mediaType is conveyed by URI suffix, not in the attestation. Canonical `cosign attach sbom` rewrite tracked in #55. |
-| **[EU Cyber Resilience Act](https://eur-lex.europa.eu/eli/reg/2024/2847/oj) (CRA)** | Annex I §1.2(f) integrity protection (signed artifacts), (h) tamper-evidence (Rekor), Article 13 documentation (provenance is third-party-verifiable). | Article 11 coordinated vulnerability disclosure (repo-governance, out of scope for ceph-tekton). Annex II §2 vulnerability handling: scanning side lands with #51, response/disclosure process is upstream's. |
-| **[CIS Software Supply Chain Security](https://www.cisecurity.org/insights/white-papers/cis-software-supply-chain-security-guide) Benchmark** | §2 build pipeline hardening (RBAC + NetworkPolicy in flight: #38, #39). §4.2 artifact signing — Chains + cosign + Rekor (#4). §4.3 attestation of build steps — slsa/v2alpha4 with deep-inspection (#46). **§4.4 signature verification at deploy — Kyverno ClusterPolicy rejecting unsigned `quay.io/ceph/*` images, shipped (#47).** | §3 dependency management — SBOM file production shipped; scanning + dep-graph attestation tracked in #51 + #55. |
+| **[EU Cyber Resilience Act](https://eur-lex.europa.eu/eli/reg/2024/2847/oj) (CRA)** | Annex I §1.2(f) integrity protection (signed artifacts), (h) tamper-evidence (Rekor), Article 13 documentation (provenance is third-party-verifiable). Annex II §2 vulnerability handling: scanning side shipped (#56). | Article 11 coordinated vulnerability disclosure (repo-governance, out of scope for ceph-tekton). Response/disclosure process is upstream's. |
+| **[CIS Software Supply Chain Security](https://www.cisecurity.org/insights/white-papers/cis-software-supply-chain-security-guide) Benchmark** | §2 build pipeline hardening (RBAC + NetworkPolicy in flight: #38, #39). §4.2 artifact signing — Chains + cosign + Rekor (#4). §4.3 attestation of build steps — slsa/v2alpha4 with deep-inspection (#46). **§4.4 signature verification at deploy — Kyverno ClusterPolicy rejecting unsigned `quay.io/ceph/*` images, shipped (#47).** §3 dependency management — SBOM file production shipped (#46, #50); vuln scanning shipped (#56). | §3 dep-graph attestation tracked in #55 (canonical `cosign attach sbom` rewrite). |
 | **[OpenSSF Scorecard](https://github.com/ossf/scorecard) signed-releases** | "Signed-Releases" check passes when tags publish SLSA attestations + cosign signatures (we do). | Other Scorecard checks (Branch-Protection, Code-Review, Pinned-Dependencies) are orthogonal repo-governance items. |
 
 Each "shipped" claim above is meant to be testable end-to-end against a
@@ -47,15 +113,16 @@ real cluster via the e2e CI in [#54](https://github.com/mmgaggle/ceph-tekton/iss
 (in flight). Without that gate, this table drifts from reality — which
 is exactly how the SBOM-attachment hallucination in
 [#55](https://github.com/mmgaggle/ceph-tekton/issues/55) shipped. Treat
-any unverified-in-CI claim with appropriate skepticism until #54 is
-merged and gates further changes.
+any unverified-in-CI claim with appropriate skepticism until the e2e
+harness gates further changes.
 
-The phase-2 items still in flight or queued — Grype vuln scanning (#51),
-severity gating (#52 HITL), upstream-dep signature verification (#49
-HITL), per-Task RBAC + NetworkPolicy (#38, #39), canonical SBOM
-attachment via `cosign attach sbom` (#55), e2e CI itself (#54),
-reproducibility iteration (#53) — all layer onto the same Chains +
-Rekor + cosign foundation without disturbing the phase-1 surface.
+The phase-2 items still in flight or queued — severity gating (#52
+HITL), upstream-dep signature verification (#49 HITL), per-Task RBAC
++ NetworkPolicy (#38, #39), canonical SBOM attachment via
+`cosign attach sbom` (#55), reproducibility iteration (#53),
+TektonConfig pruner config (#60), and the CloudEvents → S3 archive
+sink (#63) — all layer onto the same Chains + Rekor + cosign
+foundation without disturbing the phase-1 surface.
 
 ---
 
