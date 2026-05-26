@@ -26,7 +26,13 @@ kind: Kustomization
 #     separate PR — per kustomize/base/tekton-chains/chains-config.patch.yaml.
 #
 # Resource ordering: Tekton first so its CRDs land before the
-# build-grype-db Role names them.
+# build-grype-db Role names them. The TektonConfig CR
+# (tektonconfig-pruner.yaml, issue #60) is reconciled by the
+# OpenShift Pipelines operator — it's only meaningful on Sepia
+# (the operator is not installed in the dev-{local,kind}
+# overlays, which run raw Tekton Pipelines from release.yaml), so
+# it lives in this overlay rather than the shared base.
 resources:
   - ../../base/tekton-pipelines
   - ../../base/build-grype-db
+  - tektonconfig-pruner.yaml
