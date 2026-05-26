@@ -53,6 +53,7 @@ ASSERTIONS=(
   generate-sbom-smoke
   zgw-posix-up
   vuln-scan-smoke
+  build-builder-image
 )
 
 SKIP="${E2E_SKIP:-}"

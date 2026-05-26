@@ -102,7 +102,7 @@ SBOM coverage, vulnerability handling, and policy enforcement.
 
 | Regime | What this satisfies | What still needs work |
 |---|---|---|
-| **[SLSA Build L3](https://slsa.dev/spec/v1.0/levels)** | Build platform (Tekton + Chains) generates provenance the producer cannot tamper with; signed by an independent identity (Fulcio); transparency-logged (Rekor); reproducible-build verification harness shipped (#48). Hardened build environment tracked in #38 / #39. | Driving diffoscope output toward empty on real ceph builds (#53, practically blocks on #10 builder image). Per-Task RBAC + NetworkPolicy hardening (#38, #39). |
+| **[SLSA Build L3](https://slsa.dev/spec/v1.0/levels)** | Build platform (Tekton + Chains) generates provenance the producer cannot tamper with; signed by an independent identity (Fulcio); transparency-logged (Rekor); reproducible-build verification harness shipped (#48); centos10-x86_64 starter builder image shipped (#10). Hardened build environment tracked in #38 / #39. | Matrix-expanding the builder images to centos9 / ubuntu / fedora-rawhide × x86_64, aarch64 (#11) + nightly rebuild trigger (#12). Driving diffoscope output toward empty on real ceph builds (#53). Per-Task RBAC + NetworkPolicy hardening (#38, #39). |
 | **[NIST SP 800-218 SSDF](https://csrc.nist.gov/Projects/ssdf)** | PS.1.1 (protect from tampering: RBAC, Vault transit, STS). PS.3.1 (verifiable provenance: SLSA + cosign verify). PW.4.1 (secured dev environment). PO.5.1 (archive + protect each release: object-lock release bucket). SBOM files produced by syft for containers (#46) and packages (#50). RV.1.3 vuln analysis — self-hosted Grype DB + vuln-scan Task shipped (#56). | Severity gating #52 HITL. PW.4.4 verify-third-party-components (#49 HITL — depends on upstream signing coverage). PW.7 continuous verification — e2e tests in CI shipped (#54); the build-archive sink (#63) lands the analytics surface that closes the continuous-verification loop. |
 | **US EO 14028 + OMB [M-22-18](https://www.whitehouse.gov/wp-content/uploads/2022/09/M-22-18.pdf) / [M-23-16](https://www.whitehouse.gov/wp-content/uploads/2023/06/M-23-16-Update-to-M-22-18.pdf)** | Producer side: SLSA-aligned attestations + signed releases give federal procurement consumers (national labs, USGS, anyone running Ceph in fed contexts) what their SSDF self-attestation forms ask for. CycloneDX SBOMs produced per package (#50), SPDX SBOMs per container (#46). | Fully-typed SBOM **attachment** to the attestation (mediaType + OCI referrer). Today: SBOM URI + content digest land as `*ARTIFACT_OUTPUTS` byproducts at `predicate.runDetails.byproducts[]`; mediaType is conveyed by URI suffix, not in the attestation. Canonical `cosign attach sbom` rewrite tracked in #55. |
 | **[EU Cyber Resilience Act](https://eur-lex.europa.eu/eli/reg/2024/2847/oj) (CRA)** | Annex I §1.2(f) integrity protection (signed artifacts), (h) tamper-evidence (Rekor), Article 13 documentation (provenance is third-party-verifiable). Annex II §2 vulnerability handling: scanning side shipped (#56). | Article 11 coordinated vulnerability disclosure (repo-governance, out of scope for ceph-tekton). Response/disclosure process is upstream's. |
@@ -303,6 +303,9 @@ ceph-tekton/
 │   └── tag-push.yaml
 ├── images/
 │   └── builders/               # ceph-builder:<distro>-<arch>
+│       ├── Dockerfile.centos10 # shipped (#10) — matrix expansion in #11
+│       ├── build-package.sh    # entrypoint wrapper
+│       └── pipeline.yaml       # builder-image build Pipeline
 ├── charts/
 │   ├── ceph-tekton-stack/      # umbrella: tekton, pac, chains, vault
 │   └── ceph-builds-api/

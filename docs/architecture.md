@@ -491,6 +491,12 @@ rewriting the old one.
   surface to every PipelineRun. mock/pbuilder add an extra isolation
   layer Tekton already provides. In-cluster registry pulls are fast and
   free of egress quota.
+- **Shipped so far:** the centos10-x86_64 starter (#10) — Containerfile
+  + buildah Task + driver Pipeline + Chains-grammar Results. See
+  [`builder-images.md`](builder-images.md) for the per-image recipe
+  decision log and the downstream consumption contract. Matrix
+  expansion (#11) and nightly + PaC triggers (#12) layer on top
+  without disturbing the #10 surface.
 
 ### Build cache: sccache on S3 (not a PVC)
 

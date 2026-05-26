@@ -1,0 +1,268 @@
+# build-builder-image — driver Pipeline for the ceph-builder image
+# Task.
+#
+# Per issue #10's acceptance criterion (`images/builders/pipeline.yaml`),
+# this Pipeline wraps `tasks/build-builder-image` so:
+#
+#   - PipelineRun is the kubectl object operators reach for, rather
+#     than a free-floating TaskRun. `tkn pipeline start
+#     build-builder-image --param ... --workspace ...` works as the
+#     dev-loop ergonomic.
+#   - Pipeline-level Results re-expose the Task's Chains-grammar
+#     Results (IMAGE_URL, IMAGE_DIGEST, IMAGES, ARTIFACT_OUTPUTS), so
+#     a PipelineRun-level Chains attestation (deep-inspection mode)
+#     sees the same subject grammar the TaskRun exposes. Same pattern
+#     as `pipelines/build-grype-db.yaml`.
+#   - The Pipeline accepts the params the matrix expansion (#11) and
+#     the nightly CronJob (#12) will set. We're NOT adding the
+#     CronJob here — that's #12's scope — but the Pipeline's shape
+#     has to match what the CronJob will hand it.
+#
+# SINGLE-TASK PIPELINE: only one Task (the buildah build/push). The
+# matrix-builder Pipeline in #11 wraps THIS Pipeline (or its Task) in
+# a `matrix:` fan-out across (distro, arch); the package-build
+# Pipeline (#16) is a CONSUMER of the image this Pipeline produces,
+# not a sibling Task in the same Pipeline.
+#
+# WHY NO git-clone TASK HERE: the Containerfile + build-package.sh
+# live in this repo (ceph-tekton), not in ceph/ceph. The build
+# context is "the ceph-tekton repo at the SHA being built", which
+# the caller is responsible for staging into the `source` workspace.
+# For interactive `tkn pipeline start`, the user binds a
+# volumeClaimTemplate workspace and uses kustomize's
+# `image-source-volume` overlay (a tiny initContainer that
+# `git clone`s the repo). For Sepia / CI the matrix-builder Pipeline
+# (#11) prefixes a `git-clone` Task. Embedding the clone HERE would
+# make the smoke-test setup harder (smoke loads the source via
+# initContainer rather than running a network-dependent `git clone`
+# inside the Pipeline).
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: build-builder-image
+spec:
+  description: |
+    Build + push a ceph-builder container image with buildah, emit
+    Chains-grammar Results so the image is attested by Tekton Chains
+    and downstream consumers (matrix-builder #11, package-build #16,
+    reproducibility-check #53, Kyverno verify #47) can consume by
+    digest.
+
+    Single Task today. The matrix-builder Pipeline (#11) wraps this
+    in a `matrix:` fan-out across (distro, arch); the nightly
+    CronJob (#12) schedules this Pipeline daily.
+  params:
+    - name: dockerfile-path
+      type: string
+      default: images/builders/Dockerfile.centos10
+      description: |
+        Containerfile path relative to the `source` workspace root.
+        Default = the centos10 starter (#10). Matrix expansion (#11)
+        threads `images/builders/Dockerfile.<distro>` per cell.
+    - name: build-context
+      type: string
+      default: images/builders
+      description: |
+        Build-context directory (where the Containerfile + the
+        files it COPYs in — like build-package.sh — live), relative
+        to the `source` workspace root.
+    - name: output-image
+      type: string
+      description: |
+        Full image reference to push (registry + repo + tag).
+        Example values:
+          - Sepia in-cluster:
+              image-registry.openshift-image-registry.svc:5000/ceph-tekton/ceph-builder:centos10-x86_64-<sha>
+          - GHCR (dev / CI):
+              ghcr.io/mmgaggle/ceph-builder:centos10-x86_64-<sha>
+          - Kind in-cluster registry (smoke):
+              localhost:5001/ceph-builder:centos10-x86_64-dev
+        The `<sha>` is the ceph-tekton commit SHA at build time;
+        the matrix Pipeline (#11) computes and threads it.
+    - name: output-image-latest
+      type: string
+      default: ""
+      description: |
+        Optional second tag for the image. The issue's acceptance
+        criterion calls for a `:centos10-x86_64-latest` companion
+        tag alongside the `-<sha>` tag. When set, the Task tags +
+        pushes both. Empty = only push `output-image`.
+    - name: ceph-sha
+      type: string
+      default: ""
+      description: |
+        ceph/ceph commit SHA the image's install-deps.sh is fetched
+        from. Empty = use the Containerfile's baked-in default
+        (current ceph/ceph main HEAD at recipe-creation time). The
+        nightly CronJob (#12) overrides this per-run to pick up
+        upstream install-deps.sh churn.
+    - name: builder-image-version
+      type: string
+      default: "0.1.0-centos10"
+      description: |
+        The Containerfile recipe's version, surfaced via the
+        `org.ceph.builder-image.version` OCI label. Bump
+        independently from CEPH_SHA so the recipe's version and
+        the upstream-input pin can both be tracked.
+    - name: install-deps-for-make-check
+      type: string
+      default: "true"
+      description: |
+        Threaded into the Containerfile's `FOR_MAKE_CHECK`
+        environment for install-deps.sh. `"true"` installs the
+        extra deps `make check` needs (the dev-loop default).
+        `"false"` produces a smaller image suitable for
+        package-build-only Pipelines.
+    - name: source-date-epoch
+      type: string
+      default: ""
+      description: |
+        SOURCE_DATE_EPOCH for the build. Threaded into both the
+        Containerfile build-arg AND buildah's `--timestamp` flag.
+        Empty = unset (buildah picks "now"); reproducibility-check
+        (#48) sets this to the ceph-tekton commit timestamp so
+        re-builds with identical inputs produce identical digests.
+    - name: source-revision
+      type: string
+      default: unknown
+      description: |
+        Git revision of ceph-tekton the recipe came from. Threaded
+        into the `org.opencontainers.image.revision` OCI label.
+        The matrix Pipeline (#11) / nightly CronJob (#12) fill
+        this with the real SHA.
+    - name: source-url
+      type: string
+      default: https://github.com/mmgaggle/ceph-tekton
+      description: |
+        OCI `org.opencontainers.image.source` URL — the upstream
+        URL of the recipe repo.
+    - name: subject-prefix
+      type: string
+      default: ""
+      description: |
+        Optional override for the Chains attestation subject URL.
+        Empty (default) = the subject IS `output-image`, which is
+        the right answer for an OCI artefact. Set when the image
+        will be re-published under a different canonical URL.
+    - name: tls-verify
+      type: string
+      default: "true"
+      description: |
+        Set "false" for kind dev clusters with self-signed registry
+        certs. Sepia + ghcr.io + quay.io all present valid certs.
+    - name: storage-driver
+      type: string
+      default: vfs
+      description: |
+        Buildah storage driver. `vfs` is the safe-everywhere
+        default. Sepia overlay may swap to `overlay` after
+        validating the OpenShift kernel.
+    - name: buildah-image
+      type: string
+      default: quay.io/buildah/stable:v1.40.0
+      description: |
+        Pinned buildah image. Bumping requires testing the
+        `--timestamp` + OCI manifest paths against the new release.
+  workspaces:
+    - name: source
+      description: |
+        Workspace containing the Containerfile + build context (the
+        ceph-tekton repo, or at least its `images/builders/` tree).
+        The matrix Pipeline (#11) populates this via a `git-clone`
+        Task prefix; for dev / smoke, a volumeClaimTemplate with an
+        initContainer-driven clone is the usual binding.
+    - name: registry-credentials
+      description: |
+        Optional. Mount a Secret containing a Docker auth config
+        (`config.json` or `.dockerconfigjson`) for the destination
+        registry. Sepia's in-cluster registry doesn't need this
+        (SA token handles auth); ghcr.io / quay.io / dockerhub do.
+        Leave unbound (or as an emptyDir) on smoke runs that push
+        to a kind-local registry with no auth.
+      optional: true
+  tasks:
+    - name: build
+      taskRef:
+        name: build-builder-image
+      params:
+        - name: dockerfile-path
+          value: $(params.dockerfile-path)
+        - name: build-context
+          value: $(params.build-context)
+        - name: output-image
+          value: $(params.output-image)
+        # extra-tags threading: when `output-image-latest` is set the
+        # Task tags + pushes both. Tekton doesn't natively allow
+        # conditional list-element inclusion at Pipeline-level, so we
+        # ALWAYS pass it through and let the Task skip empty entries
+        # (see the `for tag in "$@"; do [ -z "${tag}" ] && continue`
+        # loop in the Task's tag step).
+        - name: extra-tags
+          value:
+            - $(params.output-image-latest)
+        # build-args: thread the recipe-side inputs. The Task's
+        # `build-args` is an array of KEY=VALUE strings; each one
+        # corresponds to a Containerfile ARG.
+        - name: build-args
+          value:
+            - "CEPH_SHA=$(params.ceph-sha)"
+            - "BUILDER_IMAGE_VERSION=$(params.builder-image-version)"
+            - "INSTALL_DEPS_FOR_MAKE_CHECK=$(params.install-deps-for-make-check)"
+        - name: source-date-epoch
+          value: $(params.source-date-epoch)
+        - name: source-revision
+          value: $(params.source-revision)
+        - name: source-url
+          value: $(params.source-url)
+        - name: subject-prefix
+          value: $(params.subject-prefix)
+        - name: tls-verify
+          value: $(params.tls-verify)
+        - name: storage-driver
+          value: $(params.storage-driver)
+        - name: buildah-image
+          value: $(params.buildah-image)
+      workspaces:
+        - name: source
+          workspace: source
+        - name: registry-credentials
+          workspace: registry-credentials
+  results:
+    # Re-expose every Chains-grammar Result the Task emits at the
+    # Pipeline level — same pattern as build-grype-db.yaml. This
+    # gives a PipelineRun-level Chains attestation (with
+    # `artifacts.pipelinerun.enable-deep-inspection: "true"`) the
+    # same subject grammar the TaskRun emits.
+    - name: IMAGE_URL
+      description: |
+        Full image reference of the built image (registry + repo +
+        tag). Downstream Pipelines reference the image by digest,
+        but the tag-form ref is handy for `tkn pipelinerun describe`
+        + Grafana dashboards.
+      value: $(tasks.build.results.IMAGE_URL)
+    - name: IMAGE_DIGEST
+      description: |
+        sha256:<hex> of the pushed image manifest. The canonical
+        handle every downstream consumer (matrix-builder #11,
+        package-build #16, reproducibility-check #53, Kyverno
+        verify #47) keys off.
+      value: $(tasks.build.results.IMAGE_DIGEST)
+    - name: IMAGES
+      description: |
+        Chains multi-subject Result: `<url>@<digest>` line(s). The
+        single-arch build emits one line; the matrix manifest-
+        assemble Task in #11 emits N lines.
+      value: $(tasks.build.results.IMAGES)
+    - name: ARTIFACT_OUTPUTS
+      description: |
+        Chains object Result: {uri, digest, isBuildArtifact:"true"}.
+        isBuildArtifact "true" promotes this to subject[] in the
+        slsa/v2alpha4 attestation.
+      value: $(tasks.build.results.ARTIFACT_OUTPUTS)
+    - name: image-tags
+      description: |
+        Newline-separated list of every tag the image was pushed
+        with (the `output-image` ref + any `extra-tags`). Useful
+        for dashboards.
+      value: $(tasks.build.results.image-tags)

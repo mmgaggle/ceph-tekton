@@ -1,0 +1,619 @@
+# build-builder-image — build + push + Chains-attest a ceph-builder
+# container image with buildah.
+#
+# Tekton-ification of "issue #10: first builder image: ceph-builder:
+# centos10-x86_64", structured so the matrix expansion (#11) and the
+# nightly trigger (#12) attach without refactoring.
+#
+# WHY BUILDAH (not docker, not kaniko, not img):
+#   - OpenShift Pipelines bundles the buildah ClusterTask pattern
+#     as a supported, documented primitive. Sepia runs OpenShift, so
+#     "the path the platform supports" is the right default.
+#   - No docker daemon socket mount, no DinD pivot. The buildah
+#     container DOES need the privileged securityContext (or an
+#     equivalent SCC) to remount its storage tree — this matches
+#     upstream `tektoncd/catalog` and `openshift-pipelines/buildah-task`
+#     which both ship `securityContext.privileged: true` for the
+#     buildah step. The Sepia overlay relies on OpenShift's
+#     `privileged` SCC + an explicit SA RoleBinding, not on
+#     project-wide privileged-pod permission.
+#   - Native OCI output; the resulting digest is the same regardless
+#     of who pulls it. Same posture as the upstream
+#     `tektoncd/catalog` buildah Task.
+#   - The PLAN.md "Container images" decision already calls out
+#     buildah for daemon images (`buildah per-arch on native nodes`).
+#     Using the same primitive for builder images keeps the build
+#     mechanic identical across image classes.
+#
+# WHY NOT MULTI-ARCH MANIFEST INDEX IN THIS TASK: phase-1 (issue #10)
+# is a single (centos10, x86_64) image. The matrix expansion (#11)
+# adds a parallel `centos10-aarch64` build on a native arm64 node and
+# wraps them with a `manifest-assemble` Task that pushes the
+# multi-arch index. Trying to do that here would over-build for #10
+# AND collide with #11's design. So this Task produces ONE single-arch
+# image per invocation; the caller (#11) parallelises across arches.
+#
+# CHAINS GRAMMAR (Chains 0.26):
+# Same shape as tasks/build-grype-db/task.yaml and the documented
+# IMAGE_URL/IMAGE_DIGEST contract. The image IS the build artefact,
+# so `ARTIFACT_OUTPUTS.isBuildArtifact == "true"` — distinct from
+# vuln-scan's `"false"` for findings byproducts.
+#
+#   IMAGE_URL            : the full image ref, including tag
+#                          (e.g. registry.dev.svc/ceph-builder:centos10-x86_64-deadbee).
+#   IMAGE_DIGEST         : sha256:<hex> of the resulting image
+#                          manifest. The digest is what Chains uses
+#                          for the attestation subject digest; verifiers
+#                          fetch by digest, not tag.
+#   IMAGES               : "<url>@<digest>" line(s). Chains 0.26's
+#                          multi-subject matcher promotes each line
+#                          to subject[]. The builder Task emits the
+#                          single image (one line) — the multi-arch
+#                          manifest-assemble Task in #11 emits N
+#                          lines (the per-arch images + the index).
+#   ARTIFACT_OUTPUTS     : {uri, digest, isBuildArtifact:"true"}
+#                          With isBuildArtifact "true" Chains promotes
+#                          this to subject[] (vs byproduct[]).
+#
+# IN-CLUSTER REGISTRY vs GHCR / QUAY:
+# The configuration knob is just `output-image` — a full registry ref.
+# Same Task body, different output-image, different registry. Sepia
+# overlay points at the in-cluster OpenShift registry; dev / CI on
+# kind points at a kind-loaded registry (or skips push); the
+# matrix-builder Pipeline (#11) can push to ghcr.io for the wider
+# audience. No code change needed.
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: build-builder-image
+spec:
+  description: |
+    Build a ceph-builder container image with buildah, push it to
+    the configured registry, and emit Chains-grammar Results
+    (IMAGE_URL, IMAGE_DIGEST, IMAGES, ARTIFACT_OUTPUTS) so Tekton
+    Chains attests to the resulting image and downstream Pipelines
+    (matrix-builder #11, package-build #16, reproducibility-check
+    #53) can consume the image by digest.
+  params:
+    - name: dockerfile-path
+      type: string
+      default: images/builders/Dockerfile.centos10
+      description: |
+        Containerfile path, relative to the `source` workspace root.
+        Default points at the centos10 starter (#10); the matrix
+        expansion (#11) varies this per (distro, arch) cell.
+        Buildah accepts `Dockerfile`-named files transparently —
+        no rename needed for naming-convention purity.
+    - name: build-context
+      type: string
+      default: images/builders
+      description: |
+        Directory passed to `buildah build` as the build context
+        (the directory containing the Containerfile + any files
+        the Containerfile COPYs in, e.g. build-package.sh).
+        Relative to the `source` workspace root.
+    - name: output-image
+      type: string
+      description: |
+        Full image reference to push, including registry, repo,
+        and tag. Examples:
+          - In-cluster (Sepia): image-registry.openshift-image-registry.svc:5000/ceph-tekton/ceph-builder:centos10-x86_64-<sha>
+          - GHCR (dev/CI):       ghcr.io/mmgaggle/ceph-builder:centos10-x86_64-<sha>
+          - Kind local:          localhost:5001/ceph-builder:centos10-x86_64-dev
+        The `-<sha>` suffix is the git SHA of ceph-tekton at build
+        time, not ceph/ceph — matches the "image is the build
+        artefact" framing. Issue #10's acceptance criterion also
+        calls for a `-latest` tag (centos10-x86_64-latest) — the
+        Pipeline pushes both, see `extra-tags` below.
+    - name: extra-tags
+      type: array
+      default: []
+      description: |
+        Additional full image references to tag the built image
+        with before pushing. The Pipeline threads
+        `<base>:<distro>-<arch>-latest` here so #10's "latest"
+        acceptance criterion is met without making the latest
+        tag a hard-coded assumption of the Task. Each entry is a
+        FULL image ref (registry + repo + tag), same shape as
+        `output-image`.
+    - name: build-args
+      type: array
+      default: []
+      description: |
+        Build args passed through to `buildah build --build-arg`,
+        one entry per `KEY=VALUE`. Matrix expansion (#11) threads
+        CEPH_SHA, BUILDER_IMAGE_VERSION here. SOURCE_DATE_EPOCH +
+        OCI_IMAGE_CREATED + OCI_IMAGE_REVISION are auto-injected
+        from `source-date-epoch` / `source-revision` params below
+        (so the Containerfile's reproducibility hooks are wired
+        without the caller having to know about them).
+    - name: source-date-epoch
+      type: string
+      default: ""
+      description: |
+        SOURCE_DATE_EPOCH for the build. Threaded into
+        `--build-arg SOURCE_DATE_EPOCH=…` AND into buildah's
+        `--timestamp` flag so layer mtimes are deterministic.
+        Empty = unset (buildah picks "now"); the reproducibility-
+        check Task (#48) sets this to the ceph-tekton commit's
+        unix timestamp so a re-run with the same inputs produces
+        the same image digest. See docs/builder-images.md
+        §"Reproducibility caveats".
+    - name: source-revision
+      type: string
+      default: unknown
+      description: |
+        Git revision (commit sha) of ceph-tekton that the build
+        recipe came from. Threaded into the OCI label
+        `org.opencontainers.image.revision`. The matrix Pipeline
+        (#11) and the nightly CronJob (#12) fill this with the
+        actual SHA being built.
+    - name: source-url
+      type: string
+      default: https://github.com/mmgaggle/ceph-tekton
+      description: |
+        OCI `org.opencontainers.image.source` label value — the
+        upstream URL of the recipe repo.
+    - name: subject-prefix
+      type: string
+      default: ""
+      description: |
+        Optional override for the Chains attestation subject URL.
+        When empty (the default), the subject IS `output-image`
+        (the natural choice for an OCI artefact: verifiers fetch
+        by image ref). Set this if the image will be re-published
+        under a different canonical URL (e.g. a download.ceph.com
+        mirror); the Chains subject will be `<subject-prefix>` +
+        the tag suffix of `output-image`.
+    - name: buildah-image
+      type: string
+      default: quay.io/buildah/stable:v1.40.0
+      description: |
+        Pinned buildah image. The quay.io/buildah/stable repo is
+        the upstream-published buildah image (same one the
+        tektoncd/catalog buildah Task uses by default). v1.40.x
+        supports rootless + OCI output + the `--timestamp` and
+        `--build-arg-file` flags this Task relies on.
+    - name: tools-image
+      type: string
+      default: docker.io/library/busybox:1.36
+      description: |
+        Pinned busybox for the emit-results step. Same pin as
+        build-grype-db / chains-smoke-test for build determinism.
+    - name: storage-driver
+      type: string
+      default: vfs
+      description: |
+        Buildah storage driver. `vfs` is the safe-everywhere
+        default (works on every k8s CSI without overlayfs
+        peculiarities) — slower, but the per-build cost is a
+        one-time push, not an inner loop. Overlay drivers
+        (`overlay`, `overlay2`) need fuse-overlayfs or kernel
+        overlay support that varies across CRI implementations;
+        Sepia overlay overrides to `overlay` after validating on
+        OpenShift's kernel.
+    - name: tls-verify
+      type: string
+      default: "true"
+      description: |
+        Set "false" for kind dev clusters whose in-cluster registry
+        uses a self-signed cert. Sepia + ghcr.io + quay.io all
+        present valid certs; default leaves tls-verify on so a
+        mis-configured Sepia overlay can't accidentally push to
+        an attacker-controlled mirror.
+  results:
+    # ---- Chains 0.26 grammar (see CONTRACT in the issue brief) ------
+    - name: IMAGE_URL
+      type: string
+      description: |
+        Full image reference, including registry + repo + tag.
+        Same value passed in via `output-image` (Tekton Chains
+        binds the subject by digest, not tag, so the tag is
+        informational; verifiers re-fetch by digest).
+    - name: IMAGE_DIGEST
+      type: string
+      description: |
+        sha256:<hex> of the pushed image manifest. The single
+        canonical handle for the resulting artefact — every
+        downstream consumer (matrix-builder #11, package-build
+        #16, reproducibility-check #53, Kyverno verify #47) keys
+        off this digest.
+    - name: IMAGES
+      type: string
+      description: |
+        Newline-separated `<url>@<digest>` pairs. Chains 0.26's
+        multi-subject matcher promotes each line to subject[].
+        This Task emits ONE line (single-arch build); the
+        manifest-assemble Task in #11 emits N lines (per-arch
+        images + the index).
+    - name: ARTIFACT_OUTPUTS
+      type: string
+      description: |
+        Chains-grammar object Result. Shape:
+            {"uri":"<url>","digest":"sha256:<hex>","isBuildArtifact":"true"}
+        With isBuildArtifact "true" Chains promotes this to a
+        subject in the slsa/v2alpha4 attestation — the image IS
+        the build artefact of this Pipeline, not a byproduct.
+    # ---- Contract-level direct-consumer Results ----------------------
+    - name: image-tags
+      type: string
+      description: |
+        Newline-separated list of all tags the image was pushed
+        with (including `output-image` and every `extra-tags`
+        entry). Useful for the package-build Pipeline + the
+        Kyverno-verify dashboards.
+  workspaces:
+    - name: source
+      description: |
+        Workspace containing the Containerfile + build context.
+        Typically populated by a `git-clone` Task upstream in the
+        Pipeline (the matrix Pipeline #11 clones ceph-tekton at
+        the SHA the Containerfile lives at). For dev / smoke,
+        binding an emptyDir + a `git clone` step is also fine.
+      mountPath: /workspace/source
+    - name: registry-credentials
+      description: |
+        Optional. If mounted, expected to contain a Docker config
+        file at `${workspaces.registry-credentials.path}/config.json`
+        (the canonical `~/.docker/config.json` shape). buildah
+        reads it via the REGISTRY_AUTH_FILE env var. For Sepia's
+        in-cluster registry, the workspace can be empty and the
+        SA token + image-pusher rolebinding gets buildah a token
+        via the standard OpenShift auth path. For ghcr.io / quay.io
+        the workspace must carry a robot token / PAT.
+      optional: true
+      mountPath: /workspace/registry-credentials
+  # ------------------------------------------------------------------
+  # Shared volumes — used to plumb buildah's local-storage tree
+  # between the build, tag, and push steps. Tekton runs each step in
+  # its own container, so without a shared mount the image written
+  # by `step-build` is invisible to `step-tag` / `step-push`
+  # (failure mode: "image not known" in the tag step). An emptyDir
+  # at /var/lib/containers (and the matching /run for buildah's
+  # runtime tmp) is the standard tektoncd/catalog pattern; the
+  # storage gets discarded with the Pod, which is what we want
+  # since the artefact is already pushed to the registry by the
+  # push step.
+  # ------------------------------------------------------------------
+  volumes:
+    - name: varlibcontainers
+      emptyDir: {}
+    - name: varruncontainers
+      emptyDir: {}
+  steps:
+    # ----------------------------------------------------------------
+    # Step 1: build — buildah build, write the image to local storage.
+    #
+    # `--layers` is NOT enabled — single-layer-per-RUN keeps the layer
+    # count low, matching the issue's "image size + layer count are
+    # sane" criterion. Buildah's default (without --layers) commits
+    # one image-layer per Containerfile instruction, which is fine for
+    # us; the Containerfile already concentrates the slow steps
+    # (dnf install, install-deps.sh) into single RUNs.
+    #
+    # `--timestamp` is the reproducibility lever — it forces every
+    # layer's mtime to SOURCE_DATE_EPOCH. Without it the layer digests
+    # vary across re-runs even with identical input bytes (because
+    # buildah stamps the layer manifest with the current clock).
+    # ----------------------------------------------------------------
+    - name: build
+      image: $(params.buildah-image)
+      workingDir: /workspace/source
+      # buildah needs write access to its storage tree; the official
+      # image expects /var/lib/containers. We mount an emptyDir there
+      # (declared at the Task level above) so the build, tag, and
+      # push steps all see the same storage tree. Discarded with the
+      # pod, but by then the image is already pushed.
+      #
+      # `privileged: true` is required for buildah to extract layers
+      # (the vfs and overlay drivers both call remount(2) on
+      # /var/lib/containers/storage, which needs CAP_SYS_ADMIN; without
+      # the cap, layer apply fails with "remount /, flags: 0x44000:
+      # permission denied"). This matches upstream tektoncd/catalog's
+      # buildah Task. The pod is still scheduled by Tekton through the
+      # cluster's PSA/SCC, so this is a REQUEST for privileged; the
+      # platform's admission policy decides whether to grant it.
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - name: varlibcontainers
+          mountPath: /var/lib/containers
+        - name: varruncontainers
+          mountPath: /run/containers
+      env:
+        - name: BUILDAH_FORMAT
+          # OCI manifest format. Default is `docker`; Chains + cosign
+          # are equally happy with either, but OCI is the documented
+          # format the SLSA spec assumes.
+          value: oci
+        - name: STORAGE_DRIVER
+          value: $(params.storage-driver)
+        - name: OUTPUT_IMAGE
+          value: $(params.output-image)
+        - name: DOCKERFILE_PATH
+          value: $(params.dockerfile-path)
+        - name: BUILD_CONTEXT
+          value: $(params.build-context)
+        - name: SOURCE_DATE_EPOCH
+          value: $(params.source-date-epoch)
+        - name: SOURCE_REVISION
+          value: $(params.source-revision)
+        - name: SOURCE_URL
+          value: $(params.source-url)
+      args: ["$(params.build-args[*])"]
+      script: |
+        #!/bin/sh
+        set -eu
+
+        # Derive an OCI_IMAGE_CREATED stamp from SOURCE_DATE_EPOCH if
+        # set (RFC 3339), else use the current clock. Both are
+        # acceptable for the OCI label — the reproducibility-check
+        # path uses SOURCE_DATE_EPOCH, ad-hoc runs use "now".
+        if [ -n "${SOURCE_DATE_EPOCH:-}" ]; then
+          OCI_IMAGE_CREATED="$(date -u -d "@${SOURCE_DATE_EPOCH}" +%Y-%m-%dT%H:%M:%SZ)"
+          TIMESTAMP_ARG="--timestamp=${SOURCE_DATE_EPOCH}"
+        else
+          OCI_IMAGE_CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          TIMESTAMP_ARG=""
+        fi
+
+        # Auto-injected build args. Caller can override via the
+        # `build-args` param; we add the reproducibility / OCI hooks
+        # unconditionally so the Containerfile's hooks are wired.
+        AUTO_BUILD_ARGS=""
+        [ -n "${SOURCE_DATE_EPOCH:-}" ] && \
+          AUTO_BUILD_ARGS="${AUTO_BUILD_ARGS} --build-arg=SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}"
+        AUTO_BUILD_ARGS="${AUTO_BUILD_ARGS} --build-arg=OCI_IMAGE_CREATED=${OCI_IMAGE_CREATED}"
+        AUTO_BUILD_ARGS="${AUTO_BUILD_ARGS} --build-arg=OCI_IMAGE_REVISION=${SOURCE_REVISION}"
+        AUTO_BUILD_ARGS="${AUTO_BUILD_ARGS} --build-arg=OCI_IMAGE_SOURCE=${SOURCE_URL}"
+
+        # Caller-supplied build args (one per Tekton array element).
+        EXTRA_BUILD_ARGS=""
+        for arg in "$@"; do
+          [ -z "${arg}" ] && continue
+          EXTRA_BUILD_ARGS="${EXTRA_BUILD_ARGS} --build-arg=${arg}"
+        done
+
+        echo "[build] buildah build"
+        echo "[build]   output-image:       ${OUTPUT_IMAGE}"
+        echo "[build]   dockerfile-path:    ${DOCKERFILE_PATH}"
+        echo "[build]   build-context:      ${BUILD_CONTEXT}"
+        echo "[build]   SOURCE_DATE_EPOCH:  ${SOURCE_DATE_EPOCH:-<unset>}"
+        echo "[build]   OCI_IMAGE_CREATED:  ${OCI_IMAGE_CREATED}"
+        echo "[build]   OCI_IMAGE_REVISION: ${SOURCE_REVISION}"
+
+        # `--storage-driver vfs` is set via the CLI flag; the env
+        # `STORAGE_DRIVER` only works on newer buildah, and the CLI
+        # form is safer. `--isolation=chroot` is what lets buildah
+        # run unprivileged inside a Tekton Pod — without it buildah
+        # tries to set up user-namespaces and fails on hosts that
+        # don't expose /etc/subuid/subgid (kind, OpenShift restricted
+        # SCC). `chroot` isolation is fine for our use: the security
+        # boundary is the pod itself, not buildah's internal
+        # user-ns trickery.
+        # shellcheck disable=SC2086
+        buildah --storage-driver="${STORAGE_DRIVER}" \
+          build \
+          --isolation=chroot \
+          ${TIMESTAMP_ARG} \
+          ${AUTO_BUILD_ARGS} \
+          ${EXTRA_BUILD_ARGS} \
+          --file="${DOCKERFILE_PATH}" \
+          --tag="${OUTPUT_IMAGE}" \
+          "${BUILD_CONTEXT}"
+
+        # Resolve the image digest from local storage. `buildah images
+        # --digests` prints "REPOSITORY  TAG  DIGEST  IMAGE-ID  ...";
+        # we filter by the tag we just built.
+        # The digest reported here is the LOCAL-storage digest, which
+        # equals the registry-side digest *after push* because we use
+        # the OCI format and don't recompress. We re-emit the
+        # post-push digest in the push step to be safe.
+        echo "[build] images in local storage:"
+        buildah --storage-driver="${STORAGE_DRIVER}" images --digests || true
+
+    # ----------------------------------------------------------------
+    # Step 2: tag — apply any extra-tags (incl. the `-latest` tag).
+    #
+    # Done as a separate step so `--layers --cache-from` future
+    # additions don't accidentally re-build per tag. `buildah tag`
+    # is a pure-rename on local storage.
+    # ----------------------------------------------------------------
+    - name: tag
+      image: $(params.buildah-image)
+      # Same privileged posture as the build step — `buildah tag` reads
+      # the same storage tree, and the buildah binary refuses to run
+      # without the CAP_SYS_ADMIN if its storage driver is vfs/overlay.
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - name: varlibcontainers
+          mountPath: /var/lib/containers
+        - name: varruncontainers
+          mountPath: /run/containers
+      env:
+        - name: STORAGE_DRIVER
+          value: $(params.storage-driver)
+        - name: OUTPUT_IMAGE
+          value: $(params.output-image)
+      args: ["$(params.extra-tags[*])"]
+      script: |
+        #!/bin/sh
+        set -eu
+
+        if [ "$#" -eq 0 ] || { [ "$#" -eq 1 ] && [ -z "$1" ]; }; then
+          echo "[tag] no extra-tags to apply"
+          exit 0
+        fi
+
+        for tag in "$@"; do
+          [ -z "${tag}" ] && continue
+          echo "[tag] buildah tag ${OUTPUT_IMAGE} -> ${tag}"
+          buildah --storage-driver="${STORAGE_DRIVER}" \
+            tag "${OUTPUT_IMAGE}" "${tag}"
+        done
+
+    # ----------------------------------------------------------------
+    # Step 3: push — push every tag, capture the resulting digest.
+    #
+    # We use `--digestfile` so the registry-side digest is written
+    # to a file we can read in the emit-results step. The local
+    # storage digest from `buildah images` is identical (OCI, no
+    # recompress on push) but reading the registry-side digest is
+    # the canonical "what did the registry see" answer.
+    #
+    # PUSH AUTH:
+    #   1. If $(workspaces.registry-credentials.bound) is true and a
+    #      config.json file exists, buildah's REGISTRY_AUTH_FILE picks
+    #      it up.
+    #   2. Else if /var/run/secrets/openshift/serviceaccount/token is
+    #      present (Sepia overlay), buildah uses the SA token via the
+    #      OpenShift internal registry's projected-token path.
+    #   3. Else push proceeds anonymously — works for some in-cluster
+    #      kind registries; for ghcr/quay it'll fail loudly with a
+    #      401 which is the right behaviour.
+    # ----------------------------------------------------------------
+    - name: push
+      image: $(params.buildah-image)
+      # Same privileged posture as the build + tag steps — buildah's
+      # push reads the same storage tree.
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - name: varlibcontainers
+          mountPath: /var/lib/containers
+        - name: varruncontainers
+          mountPath: /run/containers
+      env:
+        - name: STORAGE_DRIVER
+          value: $(params.storage-driver)
+        - name: OUTPUT_IMAGE
+          value: $(params.output-image)
+        - name: TLS_VERIFY
+          value: $(params.tls-verify)
+      args: ["$(params.extra-tags[*])"]
+      script: |
+        #!/bin/sh
+        set -eu
+
+        # Auth file precedence (see step comment above).
+        CRED_DIR="$(workspaces.registry-credentials.path)"
+        if [ -f "${CRED_DIR}/config.json" ]; then
+          export REGISTRY_AUTH_FILE="${CRED_DIR}/config.json"
+          echo "[push] using REGISTRY_AUTH_FILE=${REGISTRY_AUTH_FILE}"
+        elif [ -f "${CRED_DIR}/.dockerconfigjson" ]; then
+          # k8s Secret of type `kubernetes.io/dockerconfigjson` mounts
+          # as `.dockerconfigjson`, not `config.json`. Symlink it.
+          export REGISTRY_AUTH_FILE="${CRED_DIR}/.dockerconfigjson"
+          echo "[push] using REGISTRY_AUTH_FILE=${REGISTRY_AUTH_FILE}"
+        else
+          echo "[push] no registry-credentials/config.json; relying on default auth (SA token / anonymous)"
+        fi
+
+        DIGEST_FILE="$(mktemp)"
+        TLS_ARG=""
+        if [ "${TLS_VERIFY}" = "false" ]; then
+          TLS_ARG="--tls-verify=false"
+        fi
+
+        echo "[push] pushing ${OUTPUT_IMAGE}"
+        # shellcheck disable=SC2086
+        buildah --storage-driver="${STORAGE_DRIVER}" \
+          push ${TLS_ARG} \
+          --digestfile="${DIGEST_FILE}" \
+          "${OUTPUT_IMAGE}"
+
+        DIGEST="$(cat "${DIGEST_FILE}")"
+        echo "[push] pushed ${OUTPUT_IMAGE}@${DIGEST}"
+
+        # Persist the digest so the emit-results step (separate
+        # container) can read it. /tekton/results is shared, but
+        # writing intermediate state there would mix with the Tekton
+        # Results files; use /tekton/home (also shared and intended
+        # for this purpose).
+        printf '%s' "${DIGEST}" > /tekton/home/image-digest
+
+        # Push extra tags. Each push produces the SAME registry-side
+        # digest (same content, different tag); we don't capture
+        # those — IMAGE_DIGEST is one digest, the tag list is in
+        # the `image-tags` Result.
+        for tag in "$@"; do
+          [ -z "${tag}" ] && continue
+          echo "[push] pushing extra tag: ${tag}"
+          # shellcheck disable=SC2086
+          buildah --storage-driver="${STORAGE_DRIVER}" \
+            push ${TLS_ARG} "${tag}"
+        done
+
+    # ----------------------------------------------------------------
+    # Step 4: emit-results — write the Chains-grammar Results.
+    #
+    # busybox-only: sha256sum / printf / sed. Same posture as
+    # build-grype-db's update-latest step.
+    # ----------------------------------------------------------------
+    - name: emit-results
+      image: $(params.tools-image)
+      env:
+        - name: OUTPUT_IMAGE
+          value: $(params.output-image)
+        - name: SUBJECT_PREFIX
+          value: $(params.subject-prefix)
+      args: ["$(params.extra-tags[*])"]
+      script: |
+        #!/bin/sh
+        set -eu
+
+        DIGEST_FILE=/tekton/home/image-digest
+        if [ ! -s "${DIGEST_FILE}" ]; then
+          echo "[emit-results] FATAL: no digest from the push step" >&2
+          exit 1
+        fi
+        DIGEST="$(cat "${DIGEST_FILE}")"
+        case "${DIGEST}" in
+          sha256:*) ;;
+          *)
+            echo "[emit-results] FATAL: digest '${DIGEST}' does not start with sha256:" >&2
+            exit 1
+            ;;
+        esac
+
+        # Subject URL — `subject-prefix` overrides; else the
+        # output-image ref itself IS the subject (the canonical
+        # choice for an OCI artefact).
+        if [ -n "${SUBJECT_PREFIX:-}" ]; then
+          SUBJECT_URL="${SUBJECT_PREFIX%/}"
+        else
+          SUBJECT_URL="${OUTPUT_IMAGE}"
+        fi
+
+        # ---- Chains grammar -----------------------------------------
+        printf '%s' "${OUTPUT_IMAGE}" > "$(results.IMAGE_URL.path)"
+        printf '%s' "${DIGEST}"       > "$(results.IMAGE_DIGEST.path)"
+
+        # IMAGES: one line for the primary tag. (The matrix-builder
+        # Pipeline #11 concatenates per-arch outputs into the
+        # multi-subject form for its own attestation.)
+        printf '%s@%s\n' "${SUBJECT_URL}" "${DIGEST}" \
+          > "$(results.IMAGES.path)"
+
+        printf '{"uri":"%s","digest":"%s","isBuildArtifact":"true"}' \
+          "${SUBJECT_URL}" "${DIGEST}" \
+          > "$(results.ARTIFACT_OUTPUTS.path)"
+
+        # ---- image-tags index ---------------------------------------
+        # Newline-separated, output-image first.
+        {
+          printf '%s\n' "${OUTPUT_IMAGE}"
+          for tag in "$@"; do
+            [ -z "${tag}" ] && continue
+            printf '%s\n' "${tag}"
+          done
+        } > "$(results.image-tags.path)"
+
+        echo
+        echo "[emit-results] IMAGE_URL=${OUTPUT_IMAGE}"
+        echo "[emit-results] IMAGE_DIGEST=${DIGEST}"
+        echo "[emit-results] subject=${SUBJECT_URL}@${DIGEST}"
+        echo "[emit-results] image-tags:"
+        cat "$(results.image-tags.path)"

@@ -256,7 +256,10 @@ where possible.
    Vault initialization + transit engine config.
 3. **Builder images** — Dockerfiles per `(distro, arch)`, builder-image
    pipeline, in-cluster registry push, nightly schedule + install-deps.sh
-   trigger.
+   trigger. **Shipped so far:** centos10-x86_64 starter (#10, see
+   `images/builders/Dockerfile.centos10` + `tasks/build-builder-image/`
+   + `docs/builder-images.md`); matrix expansion (#11) and nightly +
+   PaC trigger (#12) still queued.
 4. **Make check pipeline** — first tracer-bullet end-to-end build on one
    `(distro, arch)`, then matrix-expand. PaC trigger from PR.
 5. **Package matrix pipeline** — `build-package` Task, sccache integration,

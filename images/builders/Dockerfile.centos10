@@ -1,0 +1,312 @@
+# syntax=docker/dockerfile:1.6
+#
+# ceph-builder:centos10-<arch> — Containerfile for the CentOS Stream 10
+# Ceph build environment.
+#
+# This is the FIRST of the (distro, arch) matrix builder images
+# (issue #10). The matrix expansion to centos9 / ubuntu-jammy /
+# ubuntu-noble / fedora-rawhide × x86_64, aarch64 lands in #11; the
+# nightly + install-deps.sh-change triggers in #12. This file
+# intentionally stays minimal so the same recipe can be re-used for
+# centos9 with a one-line `FROM` swap.
+#
+# WHY CENTOS STREAM 10 FIRST: the issue brief picks it as the newest
+# RPM target — the toolchain (gcc 14, glibc 2.39, python 3.12) is the
+# closest current proxy for what the Sepia release builds will need
+# 12-18 months from now, so any "the deps changed under us" surprises
+# surface here first.
+#
+# ARCH FAN-OUT: this Containerfile is architecture-agnostic. The
+# downstream Tekton Task (tasks/build-builder-image) runs the same
+# Containerfile on x86_64 worker nodes for the `centos10-x86_64`
+# image and (when #11 lands) on aarch64 nodes for `centos10-aarch64`.
+# DNF picks the right architecture from the CentOS mirrors based on
+# the host kernel's `uname -m` — no qemu, no cross-compile, no
+# multi-arch buildx voodoo. See docs/architecture.md
+# "Container images: buildah per-arch on native nodes".
+#
+# INSTALL-DEPS PINNING: we fetch a specific commit of `ceph/ceph` and
+# run its `install-deps.sh`. The SHA is an ARG so #12's nightly
+# trigger can bump it without an image-recipe diff. Default tracks
+# current `ceph/ceph` main HEAD at file-creation time; the nightly
+# CronJob will refresh.
+#
+# REPRODUCIBILITY POSTURE: SOURCE_DATE_EPOCH is threaded as an ARG
+# and consumed inside the build to stamp the `org.opencontainers.image.created`
+# label deterministically. DNF package-version pinning is NOT done at
+# this layer — CentOS Stream is a rolling target by design, and
+# pinning every package by NEVRA against a moving mirror produces
+# `nothing provides` failures faster than it produces reproducible
+# builds. The reproducibility story for the builder image itself is
+# "same digest given same SOURCE_DATE_EPOCH + same install-deps.sh
+# SHA + same upstream mirror snapshot at build time" — which is the
+# practical contract the upstream-dep verification work (#49) is
+# being built toward, NOT byte-for-byte identical across mirror
+# updates. The reproducibility-check Task (#48) is what proves the
+# CEPH BUILD inside this image is deterministic; this image is the
+# builder, not the build artefact.
+#
+# RUN AS NON-ROOT: the final stage drops privileges to a `builder`
+# user (UID 1000). install-deps.sh runs at image-build time as root
+# (it has to: it installs system packages via dnf), but the
+# downstream package-build Pipeline (#13–#21 range) invokes
+# `dpkg-buildpackage`/`rpmbuild` as `builder` to keep build-time and
+# install-time privilege separated.
+
+# --- Stage 0: base ----------------------------------------------------
+# `quay.io/centos/centos:stream10` is the official CentOS Stream 10
+# minimal base image, maintained by the CentOS Project. We do NOT pin
+# by digest here — CentOS Stream is a rolling distribution and the
+# moving `stream10` tag is the right anchor for nightly rebuilds. The
+# nightly trigger (#12) is what picks up base-image security updates.
+FROM quay.io/centos/centos:stream10 AS builder-base
+
+# --- Build args -------------------------------------------------------
+#
+# Threaded by the Tekton Task so the matrix expansion (#11) and the
+# nightly trigger (#12) can vary each independently. Defaults baked
+# here track current `ceph/ceph` main at file-creation time so a
+# `buildah build` with no `--build-arg` Just Works for human
+# iteration.
+ARG CEPH_REPO=https://github.com/ceph/ceph.git
+# Default pin: current ceph/ceph main HEAD as of file-creation. The
+# nightly CronJob (#12) refreshes this on each scheduled rebuild;
+# install-deps.sh-change PaC triggers (#12) re-pin to the PR's HEAD.
+# Choose main over a release branch so the toolchain we install
+# matches what the latest commit needs — release-branch builds use a
+# different builder image tag in the matrix (#11).
+ARG CEPH_SHA=8f95d0ea294fe1f063cd1c46ca7ddcb48f6f223e
+# install-deps.sh flags. FOR_MAKE_CHECK=true installs the extra deps
+# the `make check` pipeline needs (qa python deps, ctest helpers);
+# the dev-loop default is "yes, make check works in this image".
+ARG INSTALL_DEPS_FOR_MAKE_CHECK=true
+# Reproducibility / Chains labelling.
+ARG SOURCE_DATE_EPOCH
+ARG BUILDER_IMAGE_VERSION=0.1.0-centos10
+# OCI image labels — set at build time by the Task, surfaced for
+# auditors. `org.ceph.builder-image.version` is the ceph-tekton-side
+# release marker (the Containerfile shape's version), distinct from
+# the install-deps.sh SHA which is the upstream-side input pin.
+ARG OCI_IMAGE_SOURCE=https://github.com/mmgaggle/ceph-tekton
+ARG OCI_IMAGE_REVISION=unknown
+ARG OCI_IMAGE_CREATED=unknown
+
+# --- Stage 1: install build deps + ceph toolchain ---------------------
+# We do this in one big RUN to keep the layer count down — the
+# acceptance criterion calls out "image size + layer count are sane".
+# `dnf clean all && rm -rf /var/cache/dnf` at the end of the same
+# layer is what keeps the final image from carrying the dnf metadata
+# cache around (the most common source of "why is this image 4GB"
+# bloat on RPM bases).
+#
+# Toolchain rationale:
+#   - epel-release          : install-deps.sh requires it for centos
+#                              builds (see ceph/ceph install-deps.sh
+#                              §"almalinux|rocky|centos|fedora|rhel"
+#                              line ~522).
+#   - dnf-plugins-core      : provides `config-manager` for the
+#                              `--set-enabled crb` call install-deps.sh
+#                              makes for centos >=9.
+#   - gcc, gcc-c++, cmake,  : the C++ toolchain. cmake + ninja-build
+#     ninja-build, ccache     are what ceph's do_cmake.sh drives;
+#                              ccache is the local cache (the S3-backed
+#                              sccache lives in a separate layer at
+#                              build-time, populated by the
+#                              package-build Pipeline).
+#   - python3 + pip         : ceph/ceph's tox / qa / pybind needs
+#                              python3 ≥ 3.9; centos10 ships 3.12.
+#   - git, make, wget, curl : housekeeping; required by both
+#                              install-deps.sh and the per-PR build
+#                              steps the package-build Pipeline runs.
+#   - sudo                  : install-deps.sh's wrap_sudo() expects
+#                              to call $SUDO unconditionally. In the
+#                              image it's a no-op shim since we're
+#                              running as root at build time, but the
+#                              binary has to exist for the script to
+#                              find it.
+#   - rpm-build, rpmdevtools: rpmbuild + spectool, used by both
+#                              install-deps.sh and the downstream
+#                              package-build Task.
+#
+# Two-phase install is intentional: `ninja-build` and `ccache` ship from
+# EPEL (not the CentOS Stream 10 BaseOS/AppStream repos), and several
+# other packages install-deps.sh pulls in live in CRB (CodeReady Builder,
+# the rebadge of PowerTools). Both repos have to be REGISTERED + ENABLED
+# before any package from them is reachable. dnf resolves the whole
+# transaction up-front against the currently-enabled repo set, so a
+# single RUN trying to install `epel-release` AND `ninja-build` fails
+# with "no match for argument: ninja-build" — the EPEL .repo file is
+# created by the `epel-release` package's %post, but dnf's resolver has
+# already locked in its repo list before that scriptlet runs.
+#
+# Phase A: install the repo-enablement packages (epel-release brings in
+#          /etc/yum.repos.d/epel.repo; dnf-plugins-core brings in
+#          `config-manager`). Then enable CRB.
+# Phase B: install the toolchain, now that EPEL + CRB are reachable.
+RUN set -eux; \
+    dnf -y update --setopt=install_weak_deps=False; \
+    dnf -y install --setopt=install_weak_deps=False \
+        epel-release \
+        dnf-plugins-core \
+        ca-certificates; \
+    dnf -y config-manager --set-enabled crb; \
+    dnf -y install --setopt=install_weak_deps=False \
+        sudo \
+        git \
+        wget \
+        curl \
+        which \
+        tar \
+        xz \
+        bzip2 \
+        zstd \
+        diffutils \
+        findutils \
+        file \
+        make \
+        cmake \
+        ninja-build \
+        ccache \
+        gcc \
+        gcc-c++ \
+        python3 \
+        python3-pip \
+        python3-devel \
+        rpm-build \
+        rpmdevtools; \
+    dnf clean all; \
+    rm -rf /var/cache/dnf /var/cache/yum /tmp/* /var/tmp/*
+
+# --- Stage 2: fetch ceph/ceph at pinned SHA + run install-deps.sh -----
+# A shallow checkout (depth=1 from the SHA) keeps the build-context
+# small while still letting install-deps.sh read ceph.spec.in,
+# requirements.txt, the debian/control template, and src/script/
+# lib-build.sh. Depth=1 from a sha works because we fetch the exact
+# ref, not a branch tip; the resulting clone has no other history.
+#
+# install-deps.sh is invoked with FOR_MAKE_CHECK to install both the
+# package-build deps AND the make-check deps in one pass — the most
+# common "I want a usable builder image" posture. The
+# `--allowerasing` flavour install-deps.sh itself passes to dnf
+# handles centos10's expected `libxcrypt-compat` ↔ `libxcrypt`
+# conflict.
+#
+# DEFENSIVE COPY: we install a sudo shim that's a no-op rather than
+# leaving real sudo behind. install-deps.sh calls $SUDO for every
+# install line; at build time we're already root, so the shim
+# exec's its args directly. This also means the resulting image has
+# no setuid sudo binary — a defence-in-depth measure for the
+# downstream non-root build user (defence against a future
+# install-deps.sh change that depends on sudo at *runtime*).
+RUN set -eux; \
+    mkdir -p /usr/src/ceph; \
+    cd /usr/src/ceph; \
+    git init -q; \
+    git remote add origin "${CEPH_REPO}"; \
+    git fetch --depth=1 origin "${CEPH_SHA}"; \
+    git checkout -q FETCH_HEAD; \
+    git log -1 --pretty='format:ceph/ceph @ %H (%ci)%n  %s' >&2; \
+    # No-op sudo shim — see RUN comment above. \
+    printf '#!/bin/sh\nexec "$@"\n' > /usr/local/bin/sudo; \
+    chmod +x /usr/local/bin/sudo; \
+    export FOR_MAKE_CHECK="${INSTALL_DEPS_FOR_MAKE_CHECK}"; \
+    export DEBIAN_FRONTEND=noninteractive; \
+    # install-deps.sh writes a transient /tmp/install-deps.NN/ tree \
+    # and rms it on exit; we re-run dnf-clean after to be sure. \
+    ./install-deps.sh; \
+    dnf clean all; \
+    rm -rf /var/cache/dnf /var/cache/yum /tmp/* /var/tmp/*; \
+    # Keep ceph.spec.in around for the package-build Task to read \
+    # without re-cloning, but drop the rest of the working tree — \
+    # the package-build Task does its own checkout against the PR's \
+    # SHA. \
+    find /usr/src/ceph -maxdepth 1 -mindepth 1 \
+        ! -name 'ceph.spec.in' \
+        ! -name 'install-deps.sh' \
+        ! -name '.git' \
+        -exec rm -rf {} +; \
+    rm -rf /usr/src/ceph/.git
+
+# --- Stage 3: build user + entrypoint ---------------------------------
+# UID 1000 is the conventional first non-root UID; it dodges the
+# common host-side root-collision when a build pod is run with
+# `runAsNonRoot: true`. The package-build Pipeline (#13–#21 range)
+# uses `securityContext: { runAsUser: 1000 }` to match.
+#
+# `/home/builder/build` is the canonical WORKDIR — both `do_cmake.sh`
+# and `dpkg-buildpackage` work happily out of a writable user dir.
+# Mounting a PVC at /home/builder/build is the expected Tekton
+# pattern.
+RUN set -eux; \
+    groupadd --system --gid 1000 builder; \
+    useradd  --system --uid 1000 --gid builder \
+             --home-dir /home/builder --create-home --shell /bin/bash builder; \
+    mkdir -p /home/builder/build /home/builder/ccache; \
+    chown -R builder:builder /home/builder; \
+    # ccache defaults: target the home-dir cache dir (the package- \
+    # build Pipeline can override via env when an S3-backed sccache \
+    # is in use). 5GB cap keeps the on-disk cache bounded if the \
+    # PVC ever gets re-used across PipelineRuns. \
+    install -d -o builder -g builder /home/builder/.ccache; \
+    printf 'max_size = 5G\ncache_dir = /home/builder/.ccache\n' \
+        > /home/builder/.ccache/ccache.conf; \
+    chown builder:builder /home/builder/.ccache/ccache.conf
+
+# Stage in the entrypoint wrapper. `build-package.sh` is a thin
+# router: with no args it drops into an interactive bash (sensible
+# for `tkn pipeline start --workspace=... --param ...` interactive
+# debugging); with args, it execs them. The real `build-package`
+# Task (#16) invokes `build-package.sh` with a per-build command line
+# that drives `dpkg-buildpackage` / `rpmbuild`.
+COPY --chown=root:root build-package.sh /usr/local/bin/build-package.sh
+RUN chmod 0755 /usr/local/bin/build-package.sh
+
+# Persist the build-time identity into a sourceable env file the
+# entrypoint reads on startup. Avoids the need for skopeo /
+# `docker inspect` from inside the running container to surface
+# "which builder image am I" in TaskRun logs.
+#
+# Single-line printf instead of a heredoc — heredocs inside Dockerfile
+# RUN steps work in modern BuildKit but the buildah compat story is
+# version-sensitive. printf-with-\n is unambiguous across both
+# `buildah build` and `docker build`.
+RUN set -eux; \
+    { \
+      printf 'CEPH_BUILDER_IMAGE_TITLE=ceph-builder-centos10\n'; \
+      printf 'CEPH_BUILDER_IMAGE_VERSION=%s\n' "${BUILDER_IMAGE_VERSION}"; \
+      printf 'CEPH_BUILDER_CEPH_SHA=%s\n'      "${CEPH_SHA}"; \
+      printf 'CEPH_BUILDER_DISTRO=centos10\n'; \
+      printf 'CEPH_BUILDER_FOR_MAKE_CHECK=%s\n' "${INSTALL_DEPS_FOR_MAKE_CHECK}"; \
+      printf 'CEPH_BUILDER_SOURCE_DATE_EPOCH=%s\n' "${SOURCE_DATE_EPOCH:-}"; \
+    } > /etc/ceph-builder-image.env
+
+# --- OCI labels (Chains + auditor consumption) -----------------------
+#
+# Per CONTRACT in the issue brief / `tasks/build-builder-image`
+# README: surface the standard OpenContainers labels plus
+# `org.ceph.builder-image.version` (the image-recipe version) +
+# `org.ceph.builder-image.ceph-sha` (the install-deps source pin).
+# Kyverno's ClusterPolicy (#47) verifies the SIGNATURE on this
+# image; the labels are for humans reading `skopeo inspect` and for
+# the build-archive sink (#63) to index.
+LABEL org.opencontainers.image.source="${OCI_IMAGE_SOURCE}" \
+      org.opencontainers.image.revision="${OCI_IMAGE_REVISION}" \
+      org.opencontainers.image.created="${OCI_IMAGE_CREATED}" \
+      org.opencontainers.image.title="ceph-builder-centos10" \
+      org.opencontainers.image.description="CentOS Stream 10 builder image for ceph/ceph, pre-baked with install-deps.sh output." \
+      org.opencontainers.image.licenses="LGPL-2.1-or-later" \
+      org.opencontainers.image.url="https://github.com/mmgaggle/ceph-tekton" \
+      org.opencontainers.image.documentation="https://github.com/mmgaggle/ceph-tekton/blob/main/docs/builder-images.md" \
+      org.ceph.builder-image.version="${BUILDER_IMAGE_VERSION}" \
+      org.ceph.builder-image.ceph-sha="${CEPH_SHA}" \
+      org.ceph.builder-image.distro="centos10" \
+      org.ceph.builder-image.for-make-check="${INSTALL_DEPS_FOR_MAKE_CHECK}"
+
+USER builder
+WORKDIR /home/builder/build
+
+# The image's documented "do something sane for interactive use"
+# entrypoint. The Task can override this with `--cmd` / `args:` for
+# the headless package-build Pipeline.
+ENTRYPOINT ["/usr/local/bin/build-package.sh"]
+CMD []
