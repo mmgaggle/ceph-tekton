@@ -18,13 +18,19 @@ output "grype_db_bucket" {
   value       = aws_s3_bucket.grype_db.id
 }
 
+output "events_bucket" {
+  description = "Name of the Tekton CloudEvents archive bucket (issue #63)."
+  value       = aws_s3_bucket.events.id
+}
+
 output "buckets" {
-  description = "All four bucket names keyed by content class."
+  description = "All bucket names keyed by content class."
   value = {
     dev      = aws_s3_bucket.dev.id
     branch   = aws_s3_bucket.branch.id
     release  = aws_s3_bucket.release.id
     grype_db = aws_s3_bucket.grype_db.id
+    events   = aws_s3_bucket.events.id
   }
 }
 

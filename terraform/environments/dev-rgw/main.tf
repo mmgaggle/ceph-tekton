@@ -43,13 +43,18 @@ module "artifacts" {
   branch_bucket_name   = "${var.bucket_prefix}ceph-artifacts-branch"
   release_bucket_name  = "${var.bucket_prefix}ceph-artifacts-release"
   grype_db_bucket_name = "${var.bucket_prefix}ceph-grype-db"
+  events_bucket_name   = "${var.bucket_prefix}ceph-tekton-events"
 
   # Short retention windows make test cycles cheap. The release bucket
   # keeps the minimum legal object-lock retention (1y on RGW; bumpable
-  # via the variable for longer-window testing).
+  # via the variable for longer-window testing). Events bucket: keep
+  # 30d in dev-rgw so test cycles don't accumulate gigabytes of
+  # PipelineRun JSONL — Sepia's "never expire" posture is a separate
+  # apply with that env's storage budget.
   dev_expiration_days       = 30
   branch_expiration_days    = 180
   grype_db_expiration_days  = 30
+  events_expiration_days    = 30
   release_object_lock_mode  = "GOVERNANCE"
   release_object_lock_years = var.release_object_lock_years
 

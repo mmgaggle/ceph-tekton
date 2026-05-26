@@ -208,6 +208,77 @@ resource "aws_s3_bucket_lifecycle_configuration" "grype_db" {
 }
 
 # ===========================================================================
+# ceph-tekton-events
+#   Tekton PipelineRun + TaskRun lifecycle CloudEvents, archived to S3 as
+#   JSON-Lines partitioned by date (issue #63). The CloudEvents sink
+#   service (kustomize/base/cloudevents-sink/) accepts CloudEvents POSTs
+#   from Tekton's cloud-events controller, buffers them, and flushes to
+#   keys shaped like
+#     events/dt=YYYY-MM-DD/hr=HH/<uuid>.jsonl
+#   so DuckDB / Athena can prune by date partition.
+#
+#   Different content class from the four artifact / tooling buckets:
+#     - PRIVATE by default. PipelineRun payloads include step logs,
+#       internal URLs, and occasionally leaked secrets — this is the
+#       first bucket in the module without public read.
+#     - No versioning (each JSONL is a fresh object keyed by uuid).
+#     - No object-lock (analytics state, not release evidence).
+#     - Optional long retention via lifecycle expiry — default 0
+#       (never expire). Long-window trend queries want as much history
+#       as we can afford.
+# ===========================================================================
+
+resource "aws_s3_bucket" "events" {
+  bucket        = var.events_bucket_name
+  force_destroy = var.force_destroy
+  tags          = var.tags
+}
+
+# Lifecycle is conditional on BOTH the module-level `enable_lifecycle`
+# flag (skipped on backends that can't service it — see comments in
+# variables.tf) AND on a non-zero `events_expiration_days`. Zero means
+# "never expire", and S3 lifecycle has no "infinite" sentinel — the
+# safe encoding is to not create the rule at all.
+resource "aws_s3_bucket_lifecycle_configuration" "events" {
+  count  = var.enable_lifecycle && var.events_expiration_days > 0 ? 1 : 0
+  bucket = aws_s3_bucket.events.id
+
+  rule {
+    id     = "expire-old-events"
+    status = "Enabled"
+
+    filter {}
+
+    expiration {
+      days = var.events_expiration_days
+    }
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 1
+    }
+  }
+}
+
+# Even when lifecycle expiry is off, still sweep aborted MPUs so the
+# bucket can't accumulate orphaned upload state across the long
+# retention window. Cheap insurance — same posture release bucket has.
+resource "aws_s3_bucket_lifecycle_configuration" "events_mpu_only" {
+  count  = var.enable_lifecycle && var.events_expiration_days == 0 ? 1 : 0
+  bucket = aws_s3_bucket.events.id
+
+  rule {
+    id     = "abort-incomplete-multipart-uploads"
+    status = "Enabled"
+
+    filter {}
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 1
+    }
+  }
+}
+
+# ===========================================================================
 # AWS-only hardening (toggled off by default for zgw-posix / older-RGW compatibility)
 # ===========================================================================
 
@@ -217,6 +288,7 @@ locals {
     branch   = aws_s3_bucket.branch.id
     release  = aws_s3_bucket.release.id
     grype_db = aws_s3_bucket.grype_db.id
+    events   = aws_s3_bucket.events.id
   }
 }
 
@@ -267,6 +339,11 @@ locals {
     branch   = var.branch_public_read
     release  = var.release_public_read
     grype_db = var.grype_db_public_read
+    # The events bucket has no `*_public_read` knob — PipelineRun
+    # payloads contain step logs and occasional leaked secrets, so
+    # the only supported posture is private. See variables.tf §
+    # "events bucket" for the rationale.
+    events = false
   }
   buckets_with_public_read = {
     for k, v in local.bucket_public_read : k => local.bucket_ids[k] if v

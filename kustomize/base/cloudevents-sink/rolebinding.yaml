@@ -1,0 +1,22 @@
+# Binds the cloudevents-sink Role to the cloudevents-sink SA in the
+# cloudevents-sink namespace. Same-name-everywhere convention matches
+# build-grype-db's bindings — when an operator greps for
+# `cloudevents-sink` the four objects (Namespace, SA, Role,
+# RoleBinding) line up by name in the output.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cloudevents-sink
+  namespace: cloudevents-sink
+  labels:
+    app.kubernetes.io/name: cloudevents-sink
+    app.kubernetes.io/component: sink
+    app.kubernetes.io/part-of: ceph-tekton
+subjects:
+  - kind: ServiceAccount
+    name: cloudevents-sink
+    namespace: cloudevents-sink
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cloudevents-sink

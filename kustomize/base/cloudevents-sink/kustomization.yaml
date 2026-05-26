@@ -1,0 +1,42 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# cloudevents-sink — HTTP receiver for Tekton PipelineRun + TaskRun
+# lifecycle CloudEvents (issue #63).
+#
+# Architectural shape: Tekton's cloud-events controller emits
+# CloudEvents 1.0 binary-mode HTTP to the configured
+# `default-cloud-events-sink`. This Deployment + Service is what that
+# URL resolves to inside the cluster:
+#
+#   http://cloudevents-sink.cloudevents-sink.svc.cluster.local
+#
+# The sink buffers events in-memory and flushes JSON-Lines to S3 every
+# 30s OR after 50 events (whichever first). State lives in S3 only —
+# the bucket is terraform-managed by the `s3-buckets` module's `events`
+# bucket variant (private, no public read, default never-expire).
+#
+# Why kustomize and not helm: this is six small YAMLs with no
+# parametrization beyond the env-var knobs the sink itself reads.
+# Helm would add a values.yaml + template dance for zero net
+# flexibility. Same posture as kustomize/base/build-grype-db/ +
+# kustomize/base/zgw-posix/.
+#
+# Scope of THIS base: namespace, ServiceAccount, Role + RoleBinding,
+# Deployment, Service. The S3 credentials Secret (dev) or the
+# AWS_ROLE_ARN configmap-like settings (Sepia) live in the per-env
+# overlay so the base contains no environment-specific values.
+#
+# Tekton wiring (the controller flag + sink URL) is NOT in this base —
+# it modifies a TektonConfig the broader Sepia overlay manages.
+# See docs/build-archive.md §"Enabling Tekton CloudEvents".
+
+namespace: cloudevents-sink
+
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - role.yaml
+  - rolebinding.yaml
+  - deployment.yaml
+  - service.yaml

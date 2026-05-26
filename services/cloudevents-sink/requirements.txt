@@ -1,0 +1,16 @@
+# cloudevents-sink runtime deps (issue #63).
+#
+# Floors only — pin major.minor and let the container build pick up the
+# latest patch. Updating pins is a deliberate supply-chain choice
+# (matches the posture build-grype-db's vunnel/grype-db pins use).
+#
+# Flask 3.x: stable HTTP layer, no async dance needed for the rate
+# Tekton emits. Werkzeug is Flask's WSGI dep; pinning the floor lets
+# `pip-audit` flag a future CVE without breaking the build.
+Flask>=3.0,<4.0
+Werkzeug>=3.0,<4.0
+# boto3 for S3 PUT + AssumeRoleWithWebIdentity (the SDK does the STS
+# round-trip natively when AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE
+# are set, matching the projected-SA-token pattern the build-grype-db
+# Task uses for the same auth flow).
+boto3>=1.34,<2.0
