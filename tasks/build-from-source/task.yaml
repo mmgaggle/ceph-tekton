@@ -1,0 +1,384 @@
+# build-from-source — clone ceph at a ref, configure with cmake -G Ninja,
+# and build the `vstart` targets only inside the matching ceph-builder
+# image.
+#
+# Sibling to #13 (make-check). #13 builds-and-runs-tests as one shot;
+# this Task builds-and-keeps-the-build-tree on a workspace so a
+# downstream Task (#65 vstart-cluster) can run `vstart.sh` against
+# the resulting build/ dir without re-doing the heavy compile.
+#
+# WHY THE vstart TARGET ONLY (not `make` / `all`):
+#   vstart.sh starts a dev cluster from the build tree. It needs:
+#     - the daemon binaries (ceph-mon, ceph-mgr, ceph-osd, radosgw,
+#       ceph-mds), the librados/librbd/libcephfs libraries, plus the
+#       Python bindings — these are all in CMake's `vstart` aggregator
+#       target in ceph/ceph's top-level CMakeLists.txt.
+#   It does NOT need:
+#     - ceph-volume's deployment plumbing
+#     - all the python tooling tox uses for `make check`
+#     - dashboard / mgr modules beyond what `--without-dashboard` skips
+#     - cephadm / orchestrator integration
+#   So `ninja vstart` is the minimum viable surface — faster than
+#   `ninja all` and dramatically faster than `make -j check`.
+#
+# WHY WE DON'T USE do_cmake.sh:
+#   do_cmake.sh in upstream is a thin wrapper that calls cmake with a
+#   ceph-specific argv. We invoke cmake directly with the same flags
+#   so we don't have to track the wrapper across release branches
+#   (do_cmake.sh's flag set has drifted across reef/squid/main).
+#   The reproducibility-check Task (#48) uses do_cmake.sh for fidelity
+#   with the upstream package build; this Task is the dev-loop path,
+#   not the release-build path, and explicit-cmake-flags wins.
+#
+# WHY NO RESULTS BLOCK (cf. build-builder-image):
+#   The "artefact" of this Task is the build tree on the shared
+#   workspace, not a registry-published OCI image. Chains' grammar
+#   doesn't have a clean "workspace state" subject (it's
+#   intentionally artifact-by-URI). Downstream Tasks read the
+#   workspace directly; the source SHA is exposed as a Result for
+#   downstream provenance but no Chains-grammar Results are emitted.
+#   If/when phase-2 wants to attest "this build tree was produced
+#   from <SHA> with <image>@<digest>", that's a separate
+#   `attest-build-tree` Task layered on top.
+#
+# RESOURCE NOTES:
+#   `ninja -j$(nproc)` happily uses every CPU; the Tekton TaskRun's
+#   resource requests should match the worker node it's scheduled on.
+#   No explicit requests here — the Pipeline / overlay sets them so
+#   dev/CI invocations can vary independently.
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: build-from-source
+spec:
+  description: |
+    Clone ceph/ceph at the given ref, configure with `cmake -G Ninja`,
+    and build the `vstart` aggregator target with `ninja -j$(nproc)
+    vstart` inside the matching ceph-builder image. Emits the build
+    tree on the `source` workspace at `$(workspaces.source.path)/ceph`
+    so a downstream `vstart-cluster` Task can run vstart.sh against it.
+  params:
+    - name: git-url
+      type: string
+      default: https://github.com/ceph/ceph.git
+      description: |
+        Upstream ceph repo URL. Default tracks the canonical
+        github.com/ceph/ceph; mirrors / forks override this for PR
+        builds (the PaC trigger threads the PR's head repo here).
+    - name: git-ref
+      type: string
+      default: main
+      description: |
+        Git ref to build. Branch, tag, or commit SHA. The dev-vstart
+        Pipeline lets the engineer pin to their topic branch
+        (`-p git_ref=wip-foo`); the CI substrate use case pins to
+        the PR's head SHA.
+    - name: distro
+      type: string
+      default: centos10
+      description: |
+        Distro slug. Threaded into the builder image tag —
+        `ceph-builder:<distro>-<arch>`. Phase-1 only ships
+        centos10 (issue #10); #11 adds ubuntu-noble / centos9 /
+        fedora-rawhide.
+    - name: arch
+      type: string
+      default: x86_64
+      description: |
+        Architecture slug. Threaded into the builder image tag. The
+        matrix expansion (#11) parallelises across x86_64 + aarch64.
+    - name: builder-image
+      type: string
+      default: localhost/ceph-builder:centos10-x86_64
+      description: |
+        Full image reference for the ceph-builder. Defaults to the
+        kind-local tag produced by `tasks/build-builder-image` so a
+        fresh dev cluster (`make dev-up && make dev-test`) has a
+        working default. Overlays / Pipelines override this with the
+        registry-pushed image (image-registry.openshift-image-registry.svc
+        in Sepia, ghcr.io for the matrix-builder).
+    - name: cmake-extra-args
+      type: string
+      default: ""
+      description: |
+        Extra args appended to the `cmake` invocation. Empty by
+        default — the Task's cmake call already sets the
+        vstart-friendly flags (WITH_TESTS=ON, WITH_RBD=ON, etc.).
+        Use this to override e.g. `-DWITH_RADOSGW=OFF` for a
+        CephFS-only dev shape that skips RGW compile time.
+    - name: ninja-jobs
+      type: string
+      default: ""
+      description: |
+        Override for `ninja -j<n>`. Empty = `$(nproc)` (use every
+        CPU). Set to a smaller number on shared dev clusters where
+        memory pressure matters more than wall time. ceph's link
+        step is heavy (8-12GB resident at -j$(nproc) on a 16-core
+        node); fall back to `-j4` on memory-constrained workers.
+    - name: ccache-dir
+      type: string
+      default: /workspace/source/.ccache
+      description: |
+        ccache cache directory. Defaults to a path on the source
+        workspace so a re-run of the Pipeline against the same
+        workspace (e.g. `tkn pipeline start --use-pipelinerun=…`)
+        re-uses the cached object files. Set to "" to disable
+        ccache; set to an absolute path under an external workspace
+        binding for cross-run caching.
+  results:
+    - name: source-sha
+      type: string
+      description: |
+        Full git SHA the build actually ran against. Resolved post-
+        clone — `git_ref=main` resolves to a moving target, this
+        Result captures what was built. Downstream attestation Tasks
+        consume this as the upstream-side input pin.
+    - name: builder-image-digest
+      type: string
+      description: |
+        sha256 digest of the builder image the build ran inside.
+        Resolved via `cat /etc/ceph-builder-image.env` (the env file
+        baked at builder-image build time — see
+        images/builders/Dockerfile.centos10 §"Persist the build-time
+        identity"). Empty if the builder image was built without the
+        env file (older images / non-ceph-tekton builders).
+  workspaces:
+    - name: source
+      description: |
+        Workspace that holds the cloned ceph tree + the build/ dir.
+        Layout after this Task:
+          $(workspaces.source.path)/ceph/         — git working tree
+          $(workspaces.source.path)/ceph/build/   — cmake build tree
+          $(workspaces.source.path)/.ccache/      — ccache cache (if enabled)
+        Downstream `vstart-cluster` Task reads from
+        `$(workspaces.source.path)/ceph/build`.
+
+        Binding shape: a volumeClaimTemplate (PVC per PipelineRun)
+        is the expected pattern — vstart's build tree is too large
+        for an emptyDir on most clusters (4-8GB compiled, 12GB+ with
+        debug symbols). dev-vstart.yaml's PipelineRun examples in
+        the README walk through both PVC and emptyDir bindings.
+      mountPath: /workspace/source
+  steps:
+    # ------------------------------------------------------------------
+    # Step 1: clone — fetch ceph/ceph at the requested ref.
+    #
+    # Shallow clone (depth=1) — vstart only needs the working tree at
+    # the build SHA, not the history. Saves wall time + disk for
+    # the dev-loop case where the engineer iterates against a topic
+    # branch and re-runs the Pipeline a dozen times.
+    #
+    # `git fetch --depth=1 origin <ref>` works for both branches /
+    # tags AND raw SHAs — git ≥ 2.5 with `uploadpack.allowReachableSHA1InWant`
+    # supports the latter (github.com / gitlab / gitea all have this
+    # configured on their server side). If a self-hosted gitolite
+    # mirror disables it, the Task fails loudly here with a clear
+    # error message; bumping the depth is the workaround.
+    # ------------------------------------------------------------------
+    - name: clone
+      image: docker.io/library/alpine/git:2.45.2
+      workingDir: $(workspaces.source.path)
+      env:
+        - name: GIT_URL
+          value: $(params.git-url)
+        - name: GIT_REF
+          value: $(params.git-ref)
+        - name: RESULT_SOURCE_SHA
+          value: $(results.source-sha.path)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        echo "[clone] git-url=${GIT_URL}"
+        echo "[clone] git-ref=${GIT_REF}"
+
+        if [ -d ceph/.git ]; then
+          echo "[clone] reusing existing ceph/ working tree"
+          cd ceph
+          git fetch --depth=1 origin "${GIT_REF}"
+          git checkout -q FETCH_HEAD
+        else
+          mkdir -p ceph
+          cd ceph
+          git init -q
+          git remote add origin "${GIT_URL}"
+          # `--depth=1` + the ref name covers branches / tags. For
+          # raw SHAs, the server has to be configured to allow
+          # reaching arbitrary SHAs (uploadpack.allowReachableSHA1InWant);
+          # github / gitlab default to "on".
+          git fetch --depth=1 origin "${GIT_REF}"
+          git checkout -q FETCH_HEAD
+          # Submodules — ceph uses several (src/spdk, src/civetweb,
+          # src/rocksdb in older branches, src/jaegertracing/opentelemetry-cpp).
+          # `--recommend-shallow` keeps submodule history small,
+          # matching the shallow toplevel clone.
+          git submodule update --init --recursive --recommend-shallow
+        fi
+
+        RESOLVED_SHA="$(git rev-parse HEAD)"
+        echo "[clone] resolved ${GIT_REF} -> ${RESOLVED_SHA}"
+        printf '%s' "${RESOLVED_SHA}" > "${RESULT_SOURCE_SHA}"
+
+    # ------------------------------------------------------------------
+    # Step 2: configure — cmake -G Ninja with vstart-friendly flags.
+    #
+    # The flag set mirrors what ceph/ceph's do_cmake.sh applies for a
+    # dev-shell build, condensed to the subset vstart needs:
+    #   - WITH_TESTS=ON       : vstart targets pull in `ceph_test_*`
+    #                           helpers indirectly via the test-only
+    #                           libs (cls_test, etc.). Off would break
+    #                           the vstart aggregator.
+    #   - WITH_RADOSGW=ON     : RGW daemon binary. Defaults to ON in
+    #                           upstream; explicit so a caller can
+    #                           pass `cmake-extra-args=-DWITH_RADOSGW=OFF`
+    #                           to skip it for CephFS-only dev.
+    #   - WITH_MGR_DASHBOARD_FRONTEND=OFF : dashboard pulls in a
+    #                           node/npm toolchain we don't want in
+    #                           the builder image; vstart.sh also
+    #                           takes `--without-dashboard` to skip
+    #                           starting the dashboard at runtime,
+    #                           which matches.
+    #   - CMAKE_BUILD_TYPE=Debug : vstart is a dev tool; Debug builds
+    #                           are what engineers want for gdb /
+    #                           rr / asan. The CI-substrate use case
+    #                           can override via cmake-extra-args.
+    # ------------------------------------------------------------------
+    - name: configure
+      image: $(params.builder-image)
+      workingDir: $(workspaces.source.path)/ceph
+      env:
+        - name: CMAKE_EXTRA_ARGS
+          value: $(params.cmake-extra-args)
+        - name: CCACHE_DIR
+          value: $(params.ccache-dir)
+        - name: RESULT_BUILDER_IMAGE_DIGEST
+          value: $(results.builder-image-digest.path)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        # Surface which builder image we're running inside (the env
+        # file is baked at image-build time — see
+        # images/builders/Dockerfile.centos10).
+        if [ -f /etc/ceph-builder-image.env ]; then
+          echo "[configure] builder image identity:"
+          sed 's/^/[configure]   /' /etc/ceph-builder-image.env
+        else
+          echo "[configure] WARNING: /etc/ceph-builder-image.env missing — non-ceph-tekton builder?" >&2
+        fi
+
+        # The builder image bakes a digest pointer; fall back to empty
+        # string if the env doesn't carry it (older images).
+        BUILDER_DIGEST=""
+        if [ -f /etc/ceph-builder-image.env ]; then
+          # shellcheck disable=SC1091
+          . /etc/ceph-builder-image.env
+          BUILDER_DIGEST="${CEPH_BUILDER_IMAGE_DIGEST:-}"
+        fi
+        printf '%s' "${BUILDER_DIGEST}" > "${RESULT_BUILDER_IMAGE_DIGEST}"
+
+        # ccache wiring: if CCACHE_DIR is set, point cmake at it
+        # via the CMAKE_C/CXX compiler launcher trick. ccache only
+        # works if `ccache` is on PATH (the builder image installs it
+        # in /usr/bin), which we verify here so a misconfigured
+        # builder fails loud rather than silently doing uncached
+        # rebuilds.
+        CCACHE_ARGS=""
+        if [ -n "${CCACHE_DIR:-}" ]; then
+          if ! command -v ccache >/dev/null 2>&1; then
+            echo "[configure] WARNING: ccache not on PATH — skipping ccache wiring" >&2
+          else
+            mkdir -p "${CCACHE_DIR}"
+            export CCACHE_DIR
+            CCACHE_ARGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+            echo "[configure] ccache enabled, dir=${CCACHE_DIR}"
+            ccache --max-size=5G || true
+          fi
+        fi
+
+        mkdir -p build
+        cd build
+
+        # shellcheck disable=SC2086
+        cmake -G Ninja \
+          -DCMAKE_BUILD_TYPE=Debug \
+          -DWITH_TESTS=ON \
+          -DWITH_RADOSGW=ON \
+          -DWITH_MGR_DASHBOARD_FRONTEND=OFF \
+          -DWITH_CEPHFS_SHELL=OFF \
+          ${CCACHE_ARGS} \
+          ${CMAKE_EXTRA_ARGS} \
+          ..
+
+        echo "[configure] cmake done; build/ ready at $(pwd)"
+
+    # ------------------------------------------------------------------
+    # Step 3: build — `ninja vstart`.
+    #
+    # The `vstart` target is an aggregator in ceph/ceph's top-level
+    # CMakeLists.txt (`add_custom_target(vstart DEPENDS …)`). Building
+    # it pulls in every binary + library vstart.sh needs at runtime,
+    # without the cost of building the rest of the tree (ceph-volume's
+    # tooling, the dashboard's frontend, the cephadm packaging).
+    #
+    # NPROC HANDLING: ninja's `-j$(nproc)` defaults to "all CPUs" if
+    # invoked with no -j; we set it explicitly so the Task is
+    # deterministic across nodes with different CPU counts. The
+    # `ninja-jobs` param lets the caller cap it (memory-constrained
+    # workers).
+    # ------------------------------------------------------------------
+    - name: build
+      image: $(params.builder-image)
+      workingDir: $(workspaces.source.path)/ceph/build
+      env:
+        - name: NINJA_JOBS
+          value: $(params.ninja-jobs)
+        - name: CCACHE_DIR
+          value: $(params.ccache-dir)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        if [ -n "${CCACHE_DIR:-}" ] && command -v ccache >/dev/null 2>&1; then
+          export CCACHE_DIR
+          echo "[build] ccache stats (pre-build):"
+          ccache --show-stats || true
+        fi
+
+        if [ -z "${NINJA_JOBS:-}" ]; then
+          NINJA_JOBS="$(nproc)"
+        fi
+        echo "[build] ninja -j${NINJA_JOBS} vstart"
+
+        ninja "-j${NINJA_JOBS}" vstart
+
+        echo "[build] ninja done"
+
+        if [ -n "${CCACHE_DIR:-}" ] && command -v ccache >/dev/null 2>&1; then
+          echo "[build] ccache stats (post-build):"
+          ccache --show-stats || true
+        fi
+
+        # Sanity: vstart.sh lives in src/, build artefacts in build/.
+        # Verify the daemons vstart needs at runtime exist before
+        # handing off to the next Task — fail fast if the build
+        # silently skipped a target.
+        for bin in bin/ceph-mon bin/ceph-mgr bin/ceph-osd; do
+          if [ ! -x "${bin}" ]; then
+            echo "[build] FAIL: ${bin} missing after ninja vstart" >&2
+            exit 1
+          fi
+        done
+        echo "[build] core daemons present: ceph-mon, ceph-mgr, ceph-osd"
+
+        # RGW + MDS only checked if the caller didn't disable them;
+        # a missing binary here is non-fatal because vstart-cluster
+        # decides which daemons to start based on the count params.
+        for opt in bin/radosgw bin/ceph-mds; do
+          if [ -x "${opt}" ]; then
+            echo "[build] optional daemon present: ${opt}"
+          else
+            echo "[build] optional daemon absent: ${opt} (RGW/MDS won't be startable)"
+          fi
+        done

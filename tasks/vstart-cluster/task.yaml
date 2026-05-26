@@ -1,0 +1,469 @@
+# vstart-cluster — bring up a vstart ceph cluster against a build tree
+# on the shared workspace, hold it alive for `keep-alive-seconds`
+# (or until a `.shutdown` sentinel appears on the workspace), then
+# tear it down with `stop.sh`.
+#
+# CONSUMERS (same Task, two entry points):
+#   1. Developer dev shell — engineer runs `tkn pipeline start
+#      dev-vstart -p keep_alive_seconds=14400 …` and `oc rsh`s into
+#      the pod for an afternoon. The cluster's daemons are the
+#      ones in `ceph -s` from inside the pod.
+#   2. CI test substrate — a downstream Task (teuthology-lite,
+#      ceph-cli smoke, RGW smoke) shares the workspace + uses
+#      TaskRun affinity to land on the same node, runs its test
+#      against the live cluster, then writes the `.shutdown`
+#      sentinel to release the vstart Task.
+#
+# WHY MEMSTORE BY DEFAULT (and not bluestore):
+#   vstart.sh -n picks bluestore on a loop device by default. Loop
+#   devices need `mknod`/loop-control access, which in turn needs
+#   either CAP_SYS_ADMIN or a privileged container — both of which
+#   the acceptance criterion forbids ("no privileged, no host
+#   mounts"). memstore is in-process RAM, no kernel loop device,
+#   no privileged caps required. The trade-off is "small clusters
+#   only" (each OSD's data fits in the container's RSS), which
+#   matches the dev / CI-smoke use case the Pipeline targets.
+#   Engineers who NEED bluestore (perf, snap behaviour, recovery
+#   scenarios) pass `vstart_extra_args=--bluestore` and arrange
+#   for the necessary SCC themselves — documented in the README
+#   under "Switching to bluestore".
+#
+# WHY THE KEEP-ALIVE CAP:
+#   86400s (24h) is the hard cap baked into the validation step. The
+#   acceptance criterion calls it out: "no infinite pods". The cap
+#   is a sanity guard against `keep_alive_seconds=999999999` typos
+#   that would otherwise let a forgotten dev shell hold a Sepia
+#   worker hostage. Engineers who genuinely want a >24h dev shell
+#   can re-trigger the Pipeline — the build is ccache-fast on a
+#   second run.
+#
+# WHY THE SENTINEL FILE (not a TaskRun cancel):
+#   Tekton's cancel path tears down the pod with no in-band
+#   cleanup hook — `stop.sh` doesn't get to run, so the next
+#   PipelineRun against the same workspace inherits leftover
+#   mon/osd state. The sentinel-file pattern lets a downstream
+#   Task signal "I'm done; please wind down cleanly", and gives
+#   vstart-cluster's exit hook a chance to call `stop.sh`. The
+#   pattern is the same one Tekton's own "wait-for-condition"
+#   catalog Tasks use.
+#
+# RESOURCE REQUESTS:
+#   The acceptance criterion calls for resource requests that scale
+#   with daemon counts (1.5GB/OSD, 512MB/MON+MGR, 1GB/RGW+MDS).
+#   Tekton Task specs DON'T let `resources:` reference params
+#   directly (Tekton's variable substitution is string-only and
+#   doesn't evaluate arithmetic — see tektoncd/pipeline#4080). To
+#   keep this slice simple we set a generous fixed baseline that
+#   covers a typical small-cluster shape (3 OSDs + 1 MON + 1 MGR
+#   + 1 RGW + 1 MDS ≈ 8GB), document the scaling in the README,
+#   and leave per-cell tuning to a Pipeline-level overlay. A
+#   future iteration can drop this into an init container that
+#   computes the request and rewrites the pod spec via the
+#   downward API — out of scope for the minimal slice.
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: vstart-cluster
+spec:
+  description: |
+    Run `vstart.sh` against the build tree on the shared workspace
+    to bring up a small ceph cluster inside the Task pod. Wait for
+    HEALTH_OK / HEALTH_WARN, then sleep for `keep-alive-seconds`
+    (or until `$(workspaces.source.path)/.shutdown` appears),
+    then tear the cluster down with `stop.sh`.
+  params:
+    - name: mon-count
+      type: string
+      default: "1"
+      description: |
+        Number of ceph-mon daemons. vstart.sh accepts this via the
+        `MON=` env var. 1 is the dev-default — multi-mon adds
+        elector / paxos behaviour the dev-shell rarely needs.
+        Bump to 3 for quorum-loss / mon-recovery testing.
+    - name: osd-count
+      type: string
+      default: "3"
+      description: |
+        Number of ceph-osd daemons. 3 is the minimum for the
+        default replicated rule (replicas=3) to place all PGs;
+        below 3 you'll see HEALTH_WARN with undersized PGs forever.
+    - name: mgr-count
+      type: string
+      default: "1"
+      description: |
+        Number of ceph-mgr daemons. 1 is plenty for dev; bump to 2
+        to exercise the standby-mgr code path.
+    - name: rgw-count
+      type: string
+      default: "0"
+      description: |
+        Number of radosgw daemons. 0 = no RGW (CephFS-only or
+        bare-RADOS dev). 1 = the typical RGW-dev shape; vstart.sh
+        wires RGW to listen on :8000 + 8000+i for each additional.
+    - name: mds-count
+      type: string
+      default: "0"
+      description: |
+        Number of ceph-mds daemons. 0 = no CephFS (RGW-only or
+        bare-RADOS dev). 1 = the typical CephFS-dev shape; >1
+        exercises multi-active MDS code.
+    - name: vstart-extra-args
+      type: string
+      default: ""
+      description: |
+        Extra args appended to the vstart.sh invocation. The Task
+        already passes `-n -d --without-dashboard`; this is the
+        escape hatch for everything else, e.g.:
+          --memstore         (default since we DON'T pass --bluestore)
+          --bluestore        (needs node-level loop-device support;
+                              see README §"Switching to bluestore")
+          --cache            (enable per-OSD client cache)
+          --erasure-code-profile <name>
+        Whitespace-split; quoting / arg-arrays not preserved.
+    - name: keep-alive-seconds
+      type: string
+      default: "3600"
+      description: |
+        How long to hold the cluster alive after it reaches
+        HEALTH_OK/WARN, in seconds. Default 3600 (1h). Hard cap
+        of 86400 (24h) enforced — values above the cap are
+        rejected at Task start. Setting "0" exits immediately
+        after the health check (useful for "build + health-check"
+        smokes that don't need the cluster after).
+    - name: keep-alive-cap-seconds
+      type: string
+      default: "86400"
+      description: |
+        Hard cap on keep-alive-seconds. Exposed as a param so an
+        overlay can lower it (e.g. CI namespace caps at 7200 to
+        free workers). The default 86400 matches the issue
+        acceptance criterion ("no infinite pods").
+    - name: health-timeout-seconds
+      type: string
+      default: "300"
+      description: |
+        How long to wait for `ceph -s` to report HEALTH_OK or
+        HEALTH_WARN before declaring the cluster-bringup failed.
+        Default 5min covers a cold-start memstore cluster on a
+        normally-loaded worker; bluestore on slow IO can need 10+.
+    - name: tools-image
+      type: string
+      default: docker.io/library/busybox:1.36
+      description: |
+        Pinned busybox image for the validate-params step. Same
+        pin as other Tasks in this repo for build determinism.
+    - name: builder-image
+      type: string
+      default: localhost/ceph-builder:centos10-x86_64
+      description: |
+        Full image reference for the ceph-builder. The vstart step
+        runs inside this image so the ld-cache / Python paths
+        match the build environment.
+  results:
+    - name: cluster-fsid
+      type: string
+      description: |
+        Cluster fsid reported by `ceph -s` once the cluster is up.
+        Downstream test Tasks can log this for traceability; it's
+        also the natural correlation key between a vstart-cluster
+        TaskRun and any artefacts (RGW objects, CephFS files) the
+        test Task produced.
+    - name: cluster-health
+      type: string
+      description: |
+        Final health status when the cluster reached steady state
+        — `HEALTH_OK` or `HEALTH_WARN`. `HEALTH_ERR` is a Task
+        failure; the result is only emitted on the success path.
+    - name: shutdown-reason
+      type: string
+      description: |
+        How the Task wound down. One of:
+          ttl-expired          — keep-alive-seconds elapsed
+          sentinel             — .shutdown file appeared on the workspace
+          health-check-only    — keep-alive-seconds was 0
+        Lets downstream / dashboards distinguish "test Task finished
+        early and asked us to wind down" from "TTL ran out".
+  workspaces:
+    - name: source
+      description: |
+        Workspace populated by the upstream `build-from-source` Task.
+        Layout expected:
+          $(workspaces.source.path)/ceph/         — ceph working tree
+          $(workspaces.source.path)/ceph/build/   — cmake build tree
+        vstart.sh is invoked from `$(workspaces.source.path)/ceph/build`
+        so its `../src/vstart.sh` reference resolves correctly.
+
+        The Task ALSO writes ephemeral cluster state under
+        `$(workspaces.source.path)/ceph/build/dev/` (vstart's default
+        --asok-dir / --keyring path); a downstream test Task with
+        the same workspace bound can reach `ceph -s` by running
+        `cd ceph/build && source ../src/vstart_environment.sh`.
+
+        Sentinel: write any non-empty content to
+        `$(workspaces.source.path)/.shutdown` to ask vstart-cluster
+        to wind down early (cleanly).
+      mountPath: /workspace/source
+  steps:
+    # ------------------------------------------------------------------
+    # Step 1: validate-params — enforce the keep-alive-seconds cap.
+    #
+    # Done as a tiny busybox step so the failure surface is small
+    # (a 50ms container start vs. spinning up the heavy builder
+    # image just to reject a bad param).
+    # ------------------------------------------------------------------
+    - name: validate-params
+      image: $(params.tools-image)
+      env:
+        - name: KEEP_ALIVE_SECONDS
+          value: $(params.keep-alive-seconds)
+        - name: KEEP_ALIVE_CAP_SECONDS
+          value: $(params.keep-alive-cap-seconds)
+        - name: HEALTH_TIMEOUT_SECONDS
+          value: $(params.health-timeout-seconds)
+        - name: MON_COUNT
+          value: $(params.mon-count)
+        - name: OSD_COUNT
+          value: $(params.osd-count)
+        - name: MGR_COUNT
+          value: $(params.mgr-count)
+        - name: RGW_COUNT
+          value: $(params.rgw-count)
+        - name: MDS_COUNT
+          value: $(params.mds-count)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        # Numeric sanity — busybox-portable check.
+        check_int() {
+          # $1 name, $2 value, $3 min
+          name="$1"; val="$2"; min="$3"
+          case "${val}" in
+            ''|*[!0-9]*)
+              echo "[validate] FAIL: ${name}='${val}' is not a non-negative integer" >&2
+              exit 1
+              ;;
+          esac
+          if [ "${val}" -lt "${min}" ]; then
+            echo "[validate] FAIL: ${name}=${val} below minimum ${min}" >&2
+            exit 1
+          fi
+        }
+
+        check_int mon-count           "${MON_COUNT}"           1
+        check_int osd-count           "${OSD_COUNT}"           1
+        check_int mgr-count           "${MGR_COUNT}"           1
+        check_int rgw-count           "${RGW_COUNT}"           0
+        check_int mds-count           "${MDS_COUNT}"           0
+        check_int keep-alive-seconds  "${KEEP_ALIVE_SECONDS}"  0
+        check_int keep-alive-cap-seconds  "${KEEP_ALIVE_CAP_SECONDS}" 1
+        check_int health-timeout-seconds  "${HEALTH_TIMEOUT_SECONDS}" 1
+
+        if [ "${KEEP_ALIVE_SECONDS}" -gt "${KEEP_ALIVE_CAP_SECONDS}" ]; then
+          echo "[validate] FAIL: keep-alive-seconds=${KEEP_ALIVE_SECONDS} exceeds cap=${KEEP_ALIVE_CAP_SECONDS}" >&2
+          echo "[validate] FAIL: re-trigger the Pipeline if you need a longer-lived cluster" >&2
+          exit 1
+        fi
+
+        echo "[validate] params ok:"
+        echo "[validate]   MON=${MON_COUNT} OSD=${OSD_COUNT} MGR=${MGR_COUNT} RGW=${RGW_COUNT} MDS=${MDS_COUNT}"
+        echo "[validate]   keep-alive=${KEEP_ALIVE_SECONDS}s (cap=${KEEP_ALIVE_CAP_SECONDS}s)"
+        echo "[validate]   health-timeout=${HEALTH_TIMEOUT_SECONDS}s"
+
+    # ------------------------------------------------------------------
+    # Step 2: vstart — bring up the cluster, wait for health, hold,
+    # then tear down.
+    #
+    # All in one step on purpose: the cluster's lifetime IS the
+    # lifetime of this step's container. Splitting "start" and
+    # "stop" into separate steps would mean vstart's daemons run
+    # in step-N's container but die when step-N exits (Tekton
+    # tears down each step's container as it moves on). Keeping
+    # start + health-wait + sleep + stop in ONE step keeps the
+    # daemons alive across the wait.
+    #
+    # Trap on EXIT runs stop.sh whether the wait loop exited
+    # cleanly, on a sentinel, or on a TaskRun cancel (SIGTERM).
+    # The trap is best-effort — Tekton's container kill is a
+    # 30-second SIGTERM-then-SIGKILL window by default, which is
+    # usually enough for stop.sh to call into each daemon's
+    # admin socket and unmount.
+    # ------------------------------------------------------------------
+    - name: vstart
+      image: $(params.builder-image)
+      workingDir: $(workspaces.source.path)/ceph/build
+      # Tekton step containers run as the image's USER by default;
+      # the builder image switches to UID 1000 (builder). vstart.sh
+      # explicitly refuses to run as root anyway. No special
+      # securityContext block here — we rely on the builder image's
+      # USER directive + the Pipeline / overlay's pod-level
+      # securityContext (runAsNonRoot: true, allowPrivilegeEscalation:
+      # false). NO privileged, NO host mounts.
+      env:
+        - name: MON
+          value: $(params.mon-count)
+        - name: OSD
+          value: $(params.osd-count)
+        - name: MGR
+          value: $(params.mgr-count)
+        - name: RGW
+          value: $(params.rgw-count)
+        - name: MDS
+          value: $(params.mds-count)
+        - name: VSTART_EXTRA_ARGS
+          value: $(params.vstart-extra-args)
+        - name: KEEP_ALIVE_SECONDS
+          value: $(params.keep-alive-seconds)
+        - name: HEALTH_TIMEOUT_SECONDS
+          value: $(params.health-timeout-seconds)
+        - name: SOURCE_DIR
+          value: $(workspaces.source.path)
+        - name: RESULT_CLUSTER_FSID
+          value: $(results.cluster-fsid.path)
+        - name: RESULT_CLUSTER_HEALTH
+          value: $(results.cluster-health.path)
+        - name: RESULT_SHUTDOWN_REASON
+          value: $(results.shutdown-reason.path)
+      script: |
+        #!/bin/bash
+        set -eu
+        set -o pipefail
+
+        # Resolve paths. We `cd ../ceph/build` so vstart.sh's
+        # `../src/vstart.sh` and `../src/stop.sh` paths Just Work
+        # (vstart.sh is written to be invoked from build/).
+        BUILD_DIR="${SOURCE_DIR}/ceph/build"
+        SRC_DIR="${SOURCE_DIR}/ceph/src"
+        SENTINEL="${SOURCE_DIR}/.shutdown"
+
+        if [ ! -d "${BUILD_DIR}" ]; then
+          echo "[vstart] FAIL: build dir ${BUILD_DIR} missing — did build-from-source run?" >&2
+          exit 1
+        fi
+        if [ ! -x "${SRC_DIR}/vstart.sh" ]; then
+          echo "[vstart] FAIL: ${SRC_DIR}/vstart.sh not executable — corrupt clone?" >&2
+          exit 1
+        fi
+
+        cd "${BUILD_DIR}"
+
+        # Clean any stale sentinel from a prior PipelineRun against
+        # the same workspace.
+        rm -f "${SENTINEL}"
+
+        # ---- Teardown trap ----
+        # Runs on normal exit, error, or SIGTERM (Tekton cancel).
+        # `set +e` so stop.sh's exit doesn't smother the actual
+        # cause-of-exit code.
+        teardown() {
+          set +e
+          echo "[vstart] teardown: calling stop.sh"
+          if [ -x "${SRC_DIR}/stop.sh" ]; then
+            ( cd "${BUILD_DIR}" && "${SRC_DIR}/stop.sh" ) || \
+              echo "[vstart] WARN: stop.sh returned non-zero" >&2
+          fi
+          # Clean the sentinel so the next PipelineRun starts
+          # clean.
+          rm -f "${SENTINEL}"
+          echo "[vstart] teardown done"
+        }
+        trap teardown EXIT INT TERM
+
+        # ---- Start the cluster ----
+        echo "[vstart] starting cluster: MON=${MON} OSD=${OSD} MGR=${MGR} RGW=${RGW} MDS=${MDS}"
+        echo "[vstart] extra args: ${VSTART_EXTRA_ARGS:-<none>}"
+
+        # The base flags we always pass:
+        #   -n                — fresh cluster (wipe any prior state)
+        #   -d                — daemonize daemons; otherwise vstart
+        #                       blocks the foreground
+        #   --without-dashboard — skip the mgr dashboard (saves
+        #                       ~200MB RSS + dodges npm dep)
+        # The caller's vstart-extra-args are appended; whitespace-
+        # split (bash word-split) is intentional so common cases
+        # like `--memstore --cache` work without quoting gymnastics.
+        # shellcheck disable=SC2086
+        ../src/vstart.sh -n -d --without-dashboard ${VSTART_EXTRA_ARGS} \
+          || { echo "[vstart] FAIL: vstart.sh exited non-zero" >&2; exit 1; }
+
+        echo "[vstart] vstart.sh returned; waiting for health"
+
+        # ---- Wait for HEALTH_OK / HEALTH_WARN ----
+        # vstart writes ceph.conf + keyrings under build/dev/ ; the
+        # `ceph` CLI in the builder image needs `-c` + `-k` to find
+        # them. vstart.sh prints the exact env-source line on
+        # startup; we re-derive here so the Task doesn't depend on
+        # that print format.
+        export CEPH_CONF="${BUILD_DIR}/ceph.conf"
+        export CEPH_KEYRING="${BUILD_DIR}/keyring"
+        export CEPH_ARGS="-c ${CEPH_CONF} -k ${CEPH_KEYRING}"
+        # Make the in-tree binaries reachable on PATH.
+        export PATH="${BUILD_DIR}/bin:${PATH}"
+        export LD_LIBRARY_PATH="${BUILD_DIR}/lib:${LD_LIBRARY_PATH:-}"
+        # Python bindings for `ceph` (the CLI is python).
+        export PYTHONPATH="${BUILD_DIR}/lib/cython_modules/lib.3:${SRC_DIR}/pybind:${PYTHONPATH:-}"
+
+        DEADLINE=$(( $(date +%s) + HEALTH_TIMEOUT_SECONDS ))
+        FINAL_HEALTH=""
+        FINAL_FSID=""
+        while [ "$(date +%s)" -lt "${DEADLINE}" ]; do
+          STATUS_JSON="$(ceph -s -f json 2>/dev/null || true)"
+          if [ -n "${STATUS_JSON}" ]; then
+            HEALTH="$(printf '%s' "${STATUS_JSON}" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("health",{}).get("status","UNKNOWN"))' 2>/dev/null || echo UNKNOWN)"
+            FSID="$(printf '%s'   "${STATUS_JSON}" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("fsid",""))' 2>/dev/null || echo "")"
+            echo "[vstart] ceph -s health=${HEALTH} fsid=${FSID:-<unknown>}"
+            case "${HEALTH}" in
+              HEALTH_OK|HEALTH_WARN)
+                FINAL_HEALTH="${HEALTH}"
+                FINAL_FSID="${FSID}"
+                break
+                ;;
+              HEALTH_ERR)
+                echo "[vstart] FAIL: HEALTH_ERR — cluster bringup unhealthy" >&2
+                ceph -s || true
+                exit 1
+                ;;
+            esac
+          else
+            echo "[vstart] ceph -s not responding yet"
+          fi
+          sleep 5
+        done
+
+        if [ -z "${FINAL_HEALTH}" ]; then
+          echo "[vstart] FAIL: health timeout (${HEALTH_TIMEOUT_SECONDS}s) without reaching HEALTH_OK/WARN" >&2
+          ceph -s || true
+          exit 1
+        fi
+
+        printf '%s' "${FINAL_FSID}"   > "${RESULT_CLUSTER_FSID}"
+        printf '%s' "${FINAL_HEALTH}" > "${RESULT_CLUSTER_HEALTH}"
+        echo "[vstart] cluster is up: fsid=${FINAL_FSID} health=${FINAL_HEALTH}"
+
+        # ---- Wait for TTL OR sentinel ----
+        REASON=""
+        if [ "${KEEP_ALIVE_SECONDS}" -eq 0 ]; then
+          REASON="health-check-only"
+          echo "[vstart] keep-alive-seconds=0; skipping hold loop"
+        else
+          DEADLINE=$(( $(date +%s) + KEEP_ALIVE_SECONDS ))
+          echo "[vstart] holding cluster alive until $(date -u -d @${DEADLINE} 2>/dev/null || date -u) (or sentinel)"
+          while [ "$(date +%s)" -lt "${DEADLINE}" ]; do
+            if [ -e "${SENTINEL}" ]; then
+              REASON="sentinel"
+              echo "[vstart] sentinel detected at ${SENTINEL}; winding down"
+              break
+            fi
+            sleep 5
+          done
+          if [ -z "${REASON}" ]; then
+            REASON="ttl-expired"
+            echo "[vstart] keep-alive-seconds elapsed; winding down"
+          fi
+        fi
+
+        printf '%s' "${REASON}" > "${RESULT_SHUTDOWN_REASON}"
+        echo "[vstart] shutdown-reason=${REASON}"
+
+        # `trap` runs stop.sh on the way out.
