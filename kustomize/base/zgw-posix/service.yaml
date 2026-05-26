@@ -1,0 +1,36 @@
+# ClusterIP Service fronting the zgw-posix Pod.
+#
+# FQDN convention — downstream consumers (Tekton Tasks, smoke pipelines,
+# the vuln-scan-smoke-test's `db-pointer-url` candidate) should resolve
+# this Service at:
+#
+#   http://zgw-posix.zgw-posix.svc.cluster.local
+#
+# The first `zgw-posix` is the Service name, the second is the
+# Namespace. CoreDNS resolves the short form `zgw-posix.zgw-posix` from
+# any namespace; the .svc.cluster.local suffix is the unambiguous
+# absolute form and is what should appear in pipeline params / config
+# so the resolution can't be redirected by a namespace's local search
+# domain.
+#
+# Plain HTTP on port 80 — no TLS in dev. Real Sepia RGW terminates
+# TLS via the OpenShift route layer; the kind dev cluster does not.
+# `verify-s3-module.sh` runs against http on localhost; in-cluster
+# parity matches.
+apiVersion: v1
+kind: Service
+metadata:
+  name: zgw-posix
+  namespace: zgw-posix
+  labels:
+    app.kubernetes.io/name: zgw-posix
+    app.kubernetes.io/part-of: ceph-tekton
+spec:
+  type: ClusterIP
+  selector:
+    app: zgw-posix
+  ports:
+    - name: s3
+      port: 80
+      targetPort: s3
+      protocol: TCP

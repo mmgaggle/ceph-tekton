@@ -37,6 +37,13 @@ source "${SCRIPT_DIR}/lib.sh"
 # + pod-pull cost) so we put it after Chains. Kyverno + reproducibility
 # + generate-sbom are independent and ordered alphabetically for
 # stable-ish "Nth-failure" diagnostics.
+#
+# zgw-posix-up runs immediately before vuln-scan-smoke because the
+# vuln-scan-smoke-test pipeline will eventually point its
+# `db-pointer-url` at the in-cluster zgw-posix Service instead of
+# standing up its own busybox httpd Pod. Failing fast on zgw-posix
+# saves us a multi-minute grype-DB stage that won't have anywhere
+# to land.
 ASSERTIONS=(
   hello-world
   chains-smoke
@@ -44,6 +51,7 @@ ASSERTIONS=(
   kyverno-smoke
   reproducibility-smoke
   generate-sbom-smoke
+  zgw-posix-up
   vuln-scan-smoke
 )
 

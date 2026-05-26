@@ -1,0 +1,43 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# zgw-posix — in-cluster S3 endpoint for the dev kind cluster.
+#
+# Architectural shape: Sepia colocates real Ceph RGW with the OpenShift
+# Tekton cluster so Pipelines reach S3 without leaving the cluster
+# network. The dev cluster mirrors that shape with a single-Pod
+# zgw-posix (RGW + experimental POSIX backend driver) standing in for
+# the real RGW. Same on-the-wire S3 surface, narrower feature set —
+# no versioning, no lifecycle, no object-lock. See
+# hack/verify-s3-module.sh's header comment for the documented
+# zgw-posix limitations.
+#
+# Consumers reach it at:
+#   http://zgw-posix.zgw-posix.svc.cluster.local
+# with creds from Secret zgw-posix-credentials in namespace zgw-posix.
+#
+# Why kustomize, not helm: per the repo convention (charts/* for
+# upstream third-party charts, kustomize/base/* for self-authored
+# manifests), zgw-posix is a single Pod we author here with no
+# upstream chart.
+#
+# Why not pinned-by-digest: the upstream image `quay.io/dparkes/
+# zgw-posix:latest` doesn't yet cut tagged releases. When it does,
+# move to a digest pin in deployment.yaml and bump it in a PR after
+# testing.
+namespace: zgw-posix
+
+resources:
+  - namespace.yaml
+  - secret.yaml
+  - pvc.yaml
+  - deployment.yaml
+  - service.yaml
+
+# Labels are set on each resource individually rather than via the
+# kustomization-level `commonLabels:` field. commonLabels gets baked
+# into selector fields too (Service.spec.selector,
+# Deployment.spec.selector.matchLabels), and adding a label there
+# makes the kustomization an immutable-selector edit if we ever want
+# to remove it. Explicit per-resource labels keep the selector
+# narrowly `app: zgw-posix` so it's easy to refactor.

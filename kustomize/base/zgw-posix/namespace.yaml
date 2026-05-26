@@ -1,0 +1,21 @@
+# Namespace for the in-cluster zgw-posix Pod that gives the dev kind
+# cluster an S3 endpoint Tasks can reach without leaving the cluster
+# network. Sepia has a real RGW co-located with the OpenShift cluster;
+# the dev approximation is this single-Pod zgw-posix (a Ceph RGW with
+# the experimental POSIX backend driver) — same on-the-wire S3 shape,
+# narrower feature set (no versioning, no lifecycle, no object-lock).
+#
+# Labels:
+#   app.kubernetes.io/name=zgw-posix       — what's in here
+#   app.kubernetes.io/part-of=ceph-tekton  — which stack it belongs to
+#   ceph-tekton.io/tier=dev                — dev-only marker; the Sepia
+#                                            overlay does not pull this
+#                                            base in
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: zgw-posix
+  labels:
+    app.kubernetes.io/name: zgw-posix
+    app.kubernetes.io/part-of: ceph-tekton
+    ceph-tekton.io/tier: dev

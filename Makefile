@@ -63,6 +63,10 @@ dev-vault-up: ## Install Vault (helm) + enable transit + k8s auth.
 dev-kyverno-up: ## Install Kyverno (helm) + apply ceph-image-signature ClusterPolicy.
 	@./hack/dev-kyverno-up.sh
 
+.PHONY: dev-zgw-up
+dev-zgw-up: ## Apply the zgw-posix base + smoke-probe the in-cluster S3 endpoint.
+	@./hack/dev-zgw-up.sh
+
 # ---- validation (no cluster needed) ----
 
 .PHONY: kustomize-validate

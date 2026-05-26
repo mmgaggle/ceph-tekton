@@ -4,5 +4,13 @@ kind: Kustomization
 # Local-dev overlay. Pulls in Tekton Pipelines via the base. Add
 # dev-only patches here as the cluster needs them (e.g., shrunk
 # resource requests, NodePort exposure, looser security contexts).
+#
+# Resource ordering: Tekton goes first so kustomize/kubectl apply the
+# tekton-pipelines namespace + CRDs + controller before anything that
+# might reference them. zgw-posix has no Tekton dependency, but
+# Tekton's webhook reconciler taxes the kind cluster cold-start
+# noticeably and we'd rather not have zgw-posix's PVC + Pod schedule
+# fighting for kubelet attention during that window.
 resources:
   - ../../base/tekton-pipelines
+  - ../../base/zgw-posix

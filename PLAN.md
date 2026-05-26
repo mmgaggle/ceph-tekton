@@ -246,7 +246,11 @@ where possible.
 
 1. **Bootstrap & cluster install** — OpenShift install in Sepia, helm charts
    for Tekton operator + PaC + Chains + Vault, `make deploy`, k3s/kind dev
-   overlay.
+   overlay. **Shipped so far (dev side):** the k3s/kind path —
+   `kustomize/overlays/dev-local/` wires Tekton Pipelines + Tekton Chains
+   + the in-cluster zgw-posix S3 endpoint (the dev approximation of
+   Sepia's co-located real RGW). Helm bootstraps for Vault + Kyverno
+   sit alongside as opt-in `make dev-*-up` targets.
 2. **Terraform & out-of-cluster state** — S3 buckets with lifecycle +
    object-lock, RGW OIDC provider + roles/policies, GitHub App creation,
    Vault initialization + transit engine config.

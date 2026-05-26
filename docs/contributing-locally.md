@@ -294,6 +294,53 @@ Three-bullet summary:
 Debug: `kubectl describe clusterpolicy verify-ceph-image-signatures-dev`
 and `kubectl -n kyverno logs deploy/kyverno-admission-controller`.
 
+### Local in-cluster S3 (zgw-posix)
+
+`kustomize/base/zgw-posix/` adds a single-Pod RGW with the experimental
+POSIX backend driver to the dev kind cluster, exposed at
+`zgw-posix.zgw-posix.svc.cluster.local` (plain HTTP, port 80 → container
+port 8000). Same image (`quay.io/dparkes/zgw-posix:latest`) and same
+default credentials (`cephtekton` / `cephtekton`) as
+`hack/verify-s3-module.sh`'s podman-on-localhost flow, so the mental
+model is unified between the standalone terraform module verify and
+the in-cluster flow.
+
+The dev-local overlay applies it automatically — `make dev-up` brings
+it up alongside Tekton Pipelines. For a manual bring-up against an
+already-running cluster, or to re-create just the zgw-posix base after
+a teardown, run:
+
+```sh
+./hack/dev-zgw-up.sh
+```
+
+That script applies the kustomize base, waits for the Pod to become
+Ready, port-forwards and confirms `aws s3api list-buckets` returns
+cleanly, then prints the in-cluster Service URL and the laptop-side
+port-forward command.
+
+Three-bullet summary:
+
+- Tekton Tasks running in the dev cluster reach S3 at
+  `http://zgw-posix.zgw-posix.svc.cluster.local` with
+  `envFrom: secretRef: name: zgw-posix-credentials` (copy the Secret
+  into your Task's namespace, or read it cross-namespace via RBAC).
+  Region: `default` (matches `radosgw-admin`'s stock zonegroup).
+- Access keys default to `cephtekton` / `cephtekton`; override via the
+  `zgw-posix-credentials` Secret in `kustomize/base/zgw-posix/secret.yaml`
+  (or by patching it in your overlay).
+- This is a dev approximation of the real RGW that Sepia OpenShift
+  co-locates with its Tekton install. zgw-posix omits versioning,
+  lifecycle, and object-lock (see `hack/verify-s3-module.sh`'s header
+  for the documented limitations); higher-fidelity validation of those
+  features lives in `terraform/environments/dev-rgw/` against a real
+  Ceph RGW.
+
+Debug: `kubectl -n zgw-posix logs deploy/zgw-posix` for RGW logs;
+`kubectl -n zgw-posix get pvc zgw-posix-data` to confirm the local-path
+PV bound. The PV is destroyed with the kind cluster — there is no
+durability story by design.
+
 ### Reproducibility check
 
 Full walkthrough: [`reproducibility.md`](reproducibility.md).
@@ -362,6 +409,7 @@ For the full PaC-driven loop (a personal fork of `ceph/ceph` whose
 | `make dev-chains-up` | Install Tekton Chains + bootstrap cosign signing keys | [`provenance.md`](provenance.md) |
 | `make dev-vault-up` | Install Vault (helm) + enable transit + k8s auth | [`vault.md`](vault.md) |
 | `make dev-kyverno-up` | Install Kyverno (helm) + apply ceph-image-signature ClusterPolicy | [`deploy-verification.md`](deploy-verification.md) |
+| `make dev-zgw-up` | Apply the zgw-posix kustomize base + smoke-probe the S3 endpoint | this doc |
 | `make kustomize-validate` | Render every kustomize overlay (no apply) | this doc |
 | `make pipelines-validate` | Server-side dry-run of pipeline manifests against the dev cluster | this doc |
 
@@ -374,6 +422,7 @@ For the full PaC-driven loop (a personal fork of `ceph/ceph` whose
 | `hack/dev-chains-setup.sh` | Install Chains + generate cosign keypair | [`provenance.md`](provenance.md) |
 | `hack/dev-vault-up.sh` | Install Vault + enable transit + k8s auth | [`vault.md`](vault.md) |
 | `hack/dev-kyverno-up.sh` | Install Kyverno + apply ClusterPolicies | [`deploy-verification.md`](deploy-verification.md) |
+| `hack/dev-zgw-up.sh` | Apply the zgw-posix base + smoke-probe the S3 endpoint | this doc |
 
 ### Smoke pipelines
 
@@ -401,13 +450,15 @@ For the full PaC-driven loop (a personal fork of `ceph/ceph` whose
 
 ## What's in (and not in) the dev cluster
 
-`make dev-up` installs **only Tekton Pipelines**. Each other component is
-opt-in via its own `make dev-*-up` target so contributors who don't need
-it don't pay the install cost:
+`make dev-up` installs Tekton Pipelines **and** the zgw-posix in-cluster
+S3 endpoint (both come up via the dev-local kustomize overlay). Each
+other component is opt-in via its own `make dev-*-up` target so
+contributors who don't need it don't pay the install cost:
 
 | Component | Bootstrap | Optional / dependencies |
 |---|---|---|
 | Tekton Pipelines | `make dev-up` | required baseline |
+| zgw-posix (in-cluster S3) | `make dev-up` (or `make dev-zgw-up` standalone) | independent; dev approximation of the real RGW Sepia co-locates with OpenShift |
 | Pipelines-as-Code | `kubectl apply -k kustomize/base/pipelines-as-code/` | needs a GitHub App secret first (see [`pipelines-as-code.md`](pipelines-as-code.md)) |
 | Tekton Chains | `make dev-chains-up` | independent |
 | Vault | `make dev-vault-up` | independent |

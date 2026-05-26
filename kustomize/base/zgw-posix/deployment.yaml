@@ -1,0 +1,99 @@
+# Single-replica Deployment running zgw-posix — Ceph RGW with the
+# experimental POSIX backend driver. Listens on container port 8000;
+# the sibling Service maps :80 to :8000 so in-cluster consumers can
+# hit it at `http://zgw-posix.zgw-posix.svc.cluster.local`.
+#
+# Why Deployment and not StatefulSet, given there's a PVC attached:
+#   replicas: 1, RWO access mode, no headless-service / per-pod-DNS
+#   needs. A Deployment with strategy: Recreate gives us "shut the
+#   old pod down before the new one tries to acquire the same RWO PVC"
+#   without the extra surface area of a StatefulSet (volumeClaimTemplates,
+#   ordinals, headless Service). If we ever want a multi-Pod fanout
+#   for load testing, switch to StatefulSet then.
+#
+# Image: `quay.io/dparkes/zgw-posix:latest`. Same image
+# `hack/verify-s3-module.sh` lifecycles in podman on localhost. The
+# `latest` tag is intentional here — dparkes/zgw-posix is a research
+# build that doesn't yet cut tagged releases. When it does, pin via
+# digest in this file and bump in a PR after testing.
+#
+# Resources: 500m / 1Gi requests, 2 / 4Gi limits. The dev verify
+# script's container observes ~150MB RSS at idle and bursts to ~700MB
+# during PUT-heavy phases; 1Gi request gives the scheduler something
+# to honor and 4Gi limit absorbs a worst-case S3 multipart upload.
+#
+# Mount path: the upstream image's start script writes object data
+# under `/var/lib/ceph/zgw` by default. We mount the PVC there so
+# objects survive Pod restarts (within the lifetime of the kind
+# cluster). If a future tag changes the default, override
+# `ZGW_DATA_DIR` via the Secret/env and patch the volumeMount.
+#
+# Probes: zgw-posix doesn't ship a documented /healthz endpoint, so
+# we probe the S3 TCP port directly. A successful three-way handshake
+# is the strongest signal we have without paying for an authed
+# list-buckets round trip on every probe interval.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zgw-posix
+  namespace: zgw-posix
+  labels:
+    app.kubernetes.io/name: zgw-posix
+    app.kubernetes.io/part-of: ceph-tekton
+    app: zgw-posix
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: zgw-posix
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: zgw-posix
+        app.kubernetes.io/part-of: ceph-tekton
+        app: zgw-posix
+    spec:
+      containers:
+        - name: zgw-posix
+          image: quay.io/dparkes/zgw-posix:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: s3
+              containerPort: 8000
+              protocol: TCP
+          envFrom:
+            - secretRef:
+                name: zgw-posix-credentials
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/ceph/zgw
+          readinessProbe:
+            tcpSocket:
+              port: s3
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket:
+              port: s3
+            # 30s grace before the kubelet decides we're dead. zgw-posix
+            # parses its on-disk layout at startup; on a re-rolled Pod
+            # with existing data this can take a beat.
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: zgw-posix-data
