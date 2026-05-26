@@ -1,0 +1,164 @@
+# syntax=docker/dockerfile:1.6
+#
+# ceph-builder:centos9-<arch> — Containerfile for the CentOS Stream 9
+# Ceph build environment.
+#
+# Companion to Dockerfile.centos10. See that file's header for the
+# full rationale; this header only documents what DIFFERS from
+# centos10. The structure (3 stages, UID 1000 builder user,
+# install-deps.sh pinned by CEPH_SHA, OCI labels + env file for
+# the entrypoint) is identical so the Tekton Task contract is
+# unchanged — only the `dockerfile-path` and `output-image` params
+# vary per matrix cell.
+#
+# WHY CENTOS STREAM 9 IS STILL IN THE MATRIX: the active ceph
+# release branches (reef, squid) still produce RPMs against
+# stream9. Until those branches reach EOL the matrix has to keep
+# building a stream9 image so downstream package-build Pipelines
+# (#16) have a target. The recipe deliberately tracks stream9
+# rolling — pinning by digest here would lock us out of the
+# upstream stream9 security stream we explicitly want.
+#
+# DELTAS vs centos10:
+#   - FROM quay.io/centos/centos:stream9 (vs :stream10).
+#   - Toolchain identical: gcc 11, glibc 2.34, python 3.9 ship in
+#     stream9. install-deps.sh handles the version difference
+#     internally (the script's `if rhel < 10` branches do the
+#     right thing).
+#   - `crb` repo name is the same in stream9 (renamed from
+#     `powertools` in late 2022); the `dnf config-manager
+#     --set-enabled crb` line is unchanged.
+#   - EPEL 9 (epel-release in the BaseOS repo) is what `dnf -y
+#     install epel-release` resolves to — same package name, EPEL
+#     resolves the major version from the host.
+
+# --- Stage 0: base ----------------------------------------------------
+FROM quay.io/centos/centos:stream9 AS builder-base
+
+# --- Build args -------------------------------------------------------
+# Same shape as Dockerfile.centos10; only the BUILDER_IMAGE_VERSION
+# default and the OCI label distro string differ.
+ARG CEPH_REPO=https://github.com/ceph/ceph.git
+ARG CEPH_SHA=8f95d0ea294fe1f063cd1c46ca7ddcb48f6f223e
+ARG INSTALL_DEPS_FOR_MAKE_CHECK=true
+ARG SOURCE_DATE_EPOCH
+ARG BUILDER_IMAGE_VERSION=0.1.0-centos9
+ARG OCI_IMAGE_SOURCE=https://github.com/mmgaggle/ceph-tekton
+ARG OCI_IMAGE_REVISION=unknown
+ARG OCI_IMAGE_CREATED=unknown
+
+# --- Stage 1: install build deps + ceph toolchain ---------------------
+# Same two-phase install as centos10 (EPEL + CRB enablement before
+# the toolchain dnf transaction). See Dockerfile.centos10 for the
+# detailed per-package rationale; nothing distro-specific deviates
+# here.
+RUN set -eux; \
+    dnf -y update --setopt=install_weak_deps=False; \
+    dnf -y install --setopt=install_weak_deps=False \
+        epel-release \
+        dnf-plugins-core \
+        ca-certificates; \
+    dnf -y config-manager --set-enabled crb; \
+    dnf -y install --setopt=install_weak_deps=False \
+        sudo \
+        git \
+        wget \
+        curl \
+        which \
+        tar \
+        xz \
+        bzip2 \
+        zstd \
+        diffutils \
+        findutils \
+        file \
+        make \
+        cmake \
+        ninja-build \
+        ccache \
+        gcc \
+        gcc-c++ \
+        python3 \
+        python3-pip \
+        python3-devel \
+        rpm-build \
+        rpmdevtools; \
+    dnf clean all; \
+    rm -rf /var/cache/dnf /var/cache/yum /tmp/* /var/tmp/*
+
+# --- Stage 2: fetch ceph/ceph at pinned SHA + run install-deps.sh -----
+# Same posture as Dockerfile.centos10: shallow checkout from the
+# pinned SHA, no-op sudo shim (install-deps.sh calls $SUDO
+# unconditionally), drop everything except ceph.spec.in +
+# install-deps.sh after the install completes. install-deps.sh's
+# `almalinux|rocky|centos|fedora|rhel` branch handles stream9
+# transparently.
+RUN set -eux; \
+    mkdir -p /usr/src/ceph; \
+    cd /usr/src/ceph; \
+    git init -q; \
+    git remote add origin "${CEPH_REPO}"; \
+    git fetch --depth=1 origin "${CEPH_SHA}"; \
+    git checkout -q FETCH_HEAD; \
+    git log -1 --pretty='format:ceph/ceph @ %H (%ci)%n  %s' >&2; \
+    printf '#!/bin/sh\nexec "$@"\n' > /usr/local/bin/sudo; \
+    chmod +x /usr/local/bin/sudo; \
+    export FOR_MAKE_CHECK="${INSTALL_DEPS_FOR_MAKE_CHECK}"; \
+    export DEBIAN_FRONTEND=noninteractive; \
+    ./install-deps.sh; \
+    dnf clean all; \
+    rm -rf /var/cache/dnf /var/cache/yum /tmp/* /var/tmp/*; \
+    find /usr/src/ceph -maxdepth 1 -mindepth 1 \
+        ! -name 'ceph.spec.in' \
+        ! -name 'install-deps.sh' \
+        ! -name '.git' \
+        -exec rm -rf {} +; \
+    rm -rf /usr/src/ceph/.git
+
+# --- Stage 3: build user + entrypoint ---------------------------------
+# UID 1000 builder, /home/builder/{build,ccache}, build-package.sh
+# entrypoint, identity env file. Identical to Dockerfile.centos10
+# — the downstream Tekton package-build Pipeline uses
+# `runAsUser: 1000` regardless of distro.
+RUN set -eux; \
+    groupadd --system --gid 1000 builder; \
+    useradd  --system --uid 1000 --gid builder \
+             --home-dir /home/builder --create-home --shell /bin/bash builder; \
+    mkdir -p /home/builder/build /home/builder/ccache; \
+    chown -R builder:builder /home/builder; \
+    install -d -o builder -g builder /home/builder/.ccache; \
+    printf 'max_size = 5G\ncache_dir = /home/builder/.ccache\n' \
+        > /home/builder/.ccache/ccache.conf; \
+    chown builder:builder /home/builder/.ccache/ccache.conf
+
+COPY --chown=root:root build-package.sh /usr/local/bin/build-package.sh
+RUN chmod 0755 /usr/local/bin/build-package.sh
+
+RUN set -eux; \
+    { \
+      printf 'CEPH_BUILDER_IMAGE_TITLE=ceph-builder-centos9\n'; \
+      printf 'CEPH_BUILDER_IMAGE_VERSION=%s\n' "${BUILDER_IMAGE_VERSION}"; \
+      printf 'CEPH_BUILDER_CEPH_SHA=%s\n'      "${CEPH_SHA}"; \
+      printf 'CEPH_BUILDER_DISTRO=centos9\n'; \
+      printf 'CEPH_BUILDER_FOR_MAKE_CHECK=%s\n' "${INSTALL_DEPS_FOR_MAKE_CHECK}"; \
+      printf 'CEPH_BUILDER_SOURCE_DATE_EPOCH=%s\n' "${SOURCE_DATE_EPOCH:-}"; \
+    } > /etc/ceph-builder-image.env
+
+LABEL org.opencontainers.image.source="${OCI_IMAGE_SOURCE}" \
+      org.opencontainers.image.revision="${OCI_IMAGE_REVISION}" \
+      org.opencontainers.image.created="${OCI_IMAGE_CREATED}" \
+      org.opencontainers.image.title="ceph-builder-centos9" \
+      org.opencontainers.image.description="CentOS Stream 9 builder image for ceph/ceph, pre-baked with install-deps.sh output." \
+      org.opencontainers.image.licenses="LGPL-2.1-or-later" \
+      org.opencontainers.image.url="https://github.com/mmgaggle/ceph-tekton" \
+      org.opencontainers.image.documentation="https://github.com/mmgaggle/ceph-tekton/blob/main/docs/builder-images.md" \
+      org.ceph.builder-image.version="${BUILDER_IMAGE_VERSION}" \
+      org.ceph.builder-image.ceph-sha="${CEPH_SHA}" \
+      org.ceph.builder-image.distro="centos9" \
+      org.ceph.builder-image.for-make-check="${INSTALL_DEPS_FOR_MAKE_CHECK}"
+
+USER builder
+WORKDIR /home/builder/build
+
+ENTRYPOINT ["/usr/local/bin/build-package.sh"]
+CMD []

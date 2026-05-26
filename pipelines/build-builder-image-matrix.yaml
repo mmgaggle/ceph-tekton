@@ -1,0 +1,265 @@
+# build-builder-image-matrix — fan out the build-builder-image Task
+# across the (distro, arch) cells of the builder-image matrix.
+#
+# Per issue #11. The scope landed in THIS slice is intentionally
+# narrower than the issue's original `{5 distros} × {x86_64,
+# aarch64}` target:
+#
+#   - 4 distros: centos9, centos10, ubuntu-jammy, ubuntu-noble.
+#   - 1 arch:    x86_64.
+#
+# fedora-rawhide and aarch64 are deferred to follow-up issues:
+#   - rawhide needs an "allowed-to-fail" cell story under
+#     Tekton's `matrix:` (Tekton has `finally:` + Pipeline-level
+#     conditions, but no per-cell `continue-on-error` knob yet)
+#     and a separate triage workflow.
+#   - aarch64 needs native arm64 worker nodes in Sepia (#2). The
+#     issue body forbids qemu emulation, and today's dev cluster
+#     (kind on EC2) is x86_64-only.
+#
+# WHY THIS SHAPE — one pipelineTask per arch dimension, matrix
+# fan-out across distros INSIDE each pipelineTask:
+#
+#   - The aarch64 follow-up adds a second pipelineTask
+#     (`build-aarch64`) that needs its own `taskRunSpecs[*].podTemplate.nodeSelector`
+#     to land on arm64 workers — and Tekton's matrix doesn't
+#     fan out `taskRunSpecs` per cell. Splitting by arch at the
+#     pipelineTask level keeps node-affinity a per-arch property,
+#     not a per-cell incantation.
+#   - Distros, on the other hand, are pure parameter variation
+#     (different Dockerfile path, different tag). `matrix.include`
+#     is exactly what that's for.
+#
+# Adding rawhide later = appending one line to `matrix.include`
+# (or, if we want it allowed-to-fail, wrapping it in a separate
+# pipelineTask marked `finally:` with a status-tolerant
+# downstream). Adding aarch64 later = duplicating the
+# build-x86_64 pipelineTask, swapping the tag suffix +
+# `taskRunSpecs.podTemplate.nodeSelector` + appending a
+# `manifest-assemble` finalisation Task to publish the multi-arch
+# index.
+#
+# TAG SCHEME (per the user's call, not the issue's `:latest`):
+#   <output-image-base>:<distro>-x86_64-<source-revision>   primary
+#   <output-image-base>:<distro>-x86_64                     moving
+#
+# We avoid `:latest` because the existing single-cell pipeline
+# uses `:<distro>-x86_64-latest`, and reusing that name from the
+# matrix would silently overload it. The per-distro
+# `<distro>-x86_64` tag IS the moving pointer here.
+#
+# Pipeline-level Results re-expose the Chains grammar Results
+# from EVERY matrix cell so a single PipelineRun-level Chains
+# attestation (deep-inspection mode) gets the per-cell subject
+# digests. Tekton aggregates matrix Results as JSON arrays of
+# `{value, name}` objects keyed by Task instance — see
+# tekton.dev/pipelines `matrix:` Result-aggregation docs.
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: build-builder-image-matrix
+spec:
+  description: |
+    Build + push the (distro, arch) matrix of ceph-builder
+    images. Fans out the build-builder-image Task across the
+    distros in matrix.include; one pipelineTask per arch so
+    a future aarch64 cell can land on arm64 workers via
+    nodeSelector.
+
+    Today: 4 distros × x86_64 (issue #11, narrowed scope).
+    Coming: + rawhide (follow-up), + aarch64 once #2 lands.
+  params:
+    - name: output-image-base
+      type: string
+      description: |
+        Registry + repo (no tag) under which every cell's image
+        is pushed. The pipeline appends `:<distro>-<arch>-<sha>`
+        per cell. Examples:
+          - Sepia in-cluster:
+              image-registry.openshift-image-registry.svc:5000/ceph-tekton/ceph-builder
+          - GHCR:
+              ghcr.io/mmgaggle/ceph-builder
+          - Kind smoke:
+              registry.e2e-registry.svc:5000/ceph-builder
+    - name: ceph-sha
+      type: string
+      default: ""
+      description: |
+        ceph/ceph commit SHA whose install-deps.sh is baked into
+        each image. Empty = the Containerfiles' baked-in default.
+        Threaded into every cell.
+    - name: source-revision
+      type: string
+      default: unknown
+      description: |
+        ceph-tekton git revision (the recipe's own SHA). Used
+        as the per-image `-<sha>` tag suffix AND threaded into
+        the `org.opencontainers.image.revision` OCI label. The
+        matrix Pipeline caller (CI / nightly) fills this with
+        the real SHA.
+    - name: source-url
+      type: string
+      default: https://github.com/mmgaggle/ceph-tekton
+      description: |
+        OCI `org.opencontainers.image.source` URL of the recipe
+        repo.
+    - name: source-date-epoch
+      type: string
+      default: ""
+      description: |
+        SOURCE_DATE_EPOCH for the build. Threaded into every
+        cell; reproducibility-check (#48) sets this to the
+        ceph-tekton commit timestamp so re-runs with identical
+        inputs produce identical digests.
+    - name: install-deps-for-make-check
+      type: string
+      default: "true"
+      description: |
+        FOR_MAKE_CHECK threaded into install-deps.sh. "true" =
+        full dev image (default); "false" = smaller, package-
+        build-only image.
+    - name: tls-verify
+      type: string
+      default: "true"
+      description: |
+        Set "false" for kind dev clusters with self-signed
+        registry certs. Sepia + ghcr.io + quay.io all present
+        valid certs.
+    - name: storage-driver
+      type: string
+      default: vfs
+      description: |
+        Buildah storage driver. `vfs` is safe-everywhere;
+        Sepia overlay may swap to `overlay`.
+    - name: buildah-image
+      type: string
+      default: quay.io/buildah/stable:v1.40.0
+      description: |
+        Pinned buildah image used by every cell's build Task.
+  workspaces:
+    - name: source
+      description: |
+        Workspace containing the Containerfiles + build context
+        (the ceph-tekton repo, or at least its `images/builders/`
+        tree). Populated by an upstream `git-clone` Task in CI,
+        or by a volumeClaimTemplate + initContainer clone for
+        dev / smoke. SHARED across every matrix cell — same
+        Containerfiles, different `dockerfile-path` per cell.
+    - name: registry-credentials
+      description: |
+        Optional. Docker auth config for the destination
+        registry. Sepia's in-cluster registry doesn't need this
+        (SA token); ghcr.io / quay.io / dockerhub do.
+      optional: true
+  tasks:
+    # ------------------------------------------------------------------
+    # build-x86_64 — one pipelineTask, fanned out across 4 distros
+    # via `matrix.include`.
+    #
+    # `matrix.include` semantics: each include entry contributes its
+    # `params` to the TaskRun for that cell. Cell-count is the
+    # length of `include`; no Cartesian product needed because all
+    # four cells share the same arch.
+    #
+    # Why this isn't a sub-Pipeline call: Tekton's Pipeline-in-
+    # Pipeline composition (`pipelineRef:` inside `tasks:`) is
+    # `tekton.dev/v1alpha1` and not enabled by default in v1.6;
+    # calling the Task directly is the documented v1 path.
+    # ------------------------------------------------------------------
+    - name: build-x86_64
+      taskRef:
+        name: build-builder-image
+      matrix:
+        include:
+          - name: centos9
+            params:
+              - name: distro
+                value: centos9
+          - name: centos10
+            params:
+              - name: distro
+                value: centos10
+          - name: ubuntu-jammy
+            params:
+              - name: distro
+                value: ubuntu-jammy
+          - name: ubuntu-noble
+            params:
+              - name: distro
+                value: ubuntu-noble
+      params:
+        - name: dockerfile-path
+          value: images/builders/Dockerfile.$(matrix.distro)
+        - name: build-context
+          value: images/builders
+        - name: output-image
+          # Per-cell primary tag: <base>:<distro>-x86_64-<sha>.
+          value: $(params.output-image-base):$(matrix.distro)-x86_64-$(params.source-revision)
+        - name: extra-tags
+          # Per-cell moving pointer: <base>:<distro>-x86_64.
+          # The Task tags both then pushes both.
+          value:
+            - $(params.output-image-base):$(matrix.distro)-x86_64
+        - name: build-args
+          value:
+            - "CEPH_SHA=$(params.ceph-sha)"
+            - "BUILDER_IMAGE_VERSION=0.1.0-$(matrix.distro)"
+            - "INSTALL_DEPS_FOR_MAKE_CHECK=$(params.install-deps-for-make-check)"
+        - name: source-date-epoch
+          value: $(params.source-date-epoch)
+        - name: source-revision
+          value: $(params.source-revision)
+        - name: source-url
+          value: $(params.source-url)
+        - name: tls-verify
+          value: $(params.tls-verify)
+        - name: storage-driver
+          value: $(params.storage-driver)
+        - name: buildah-image
+          value: $(params.buildah-image)
+      workspaces:
+        - name: source
+          workspace: source
+        - name: registry-credentials
+          workspace: registry-credentials
+  results:
+    # Tekton aggregates matrix-Task Results as JSON arrays
+    # ordered to match `matrix.include`. Downstream Pipelines
+    # iterating over these get the same per-cell ordering as
+    # `matrix.include`.
+    #
+    # Same Chains-grammar Results as the single-cell pipeline,
+    # but each is an array — Chains 0.26's multi-subject matcher
+    # handles arrays-of-IMAGE_DIGEST natively when paired with
+    # `artifacts.pipelinerun.enable-deep-inspection: "true"`.
+    - name: IMAGE_URLS
+      description: |
+        JSON array of every cell's IMAGE_URL Result (primary tag
+        only). Order matches `matrix.include`.
+      value: $(tasks.build-x86_64.results.IMAGE_URL[*])
+    - name: IMAGE_DIGESTS
+      description: |
+        JSON array of every cell's IMAGE_DIGEST Result. Each
+        entry is `sha256:<hex>`. Order matches `matrix.include`.
+      value: $(tasks.build-x86_64.results.IMAGE_DIGEST[*])
+    - name: IMAGES
+      description: |
+        JSON array of every cell's IMAGES Result (each entry
+        itself a `<url>@<digest>` newline-joined string from
+        the Task). The PipelineRun-level Chains attestation,
+        with deep-inspection enabled, walks this for the
+        subject list.
+      value: $(tasks.build-x86_64.results.IMAGES[*])
+    - name: ARTIFACT_OUTPUTS
+      description: |
+        JSON array of every cell's ARTIFACT_OUTPUTS Result
+        ({uri, digest, isBuildArtifact:"true"}). Chains
+        promotes each to subject[] under deep-inspection.
+      value: $(tasks.build-x86_64.results.ARTIFACT_OUTPUTS[*])
+    - name: image-tags
+      description: |
+        JSON array of every cell's `image-tags` Result
+        (newline-separated tag lists). Useful for dashboards
+        + the publish-repo Task (#22).
+      value: $(tasks.build-x86_64.results.image-tags[*])

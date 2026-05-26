@@ -1,0 +1,223 @@
+# syntax=docker/dockerfile:1.6
+#
+# ceph-builder:ubuntu-jammy-<arch> — Containerfile for the Ubuntu
+# 22.04 LTS (jammy) Ceph build environment.
+#
+# Companion to Dockerfile.centos10. The Stage 0–3 STRUCTURE is the
+# same — base FROM, install build toolchain, fetch ceph/ceph at a
+# pinned SHA and run install-deps.sh, then drop to a UID 1000
+# builder user with the build-package.sh entrypoint and the
+# `/etc/ceph-builder-image.env` identity file. Only the package
+# manager differs.
+#
+# WHY JAMMY 22.04: it's the oldest Ubuntu LTS the active ceph
+# release branches still build .deb packages for. Until those
+# branches reach EOL the matrix has to keep building a jammy image
+# so downstream package-build Pipelines (#16) have a target. The
+# newer noble (24.04) lives in a separate Dockerfile so jammy and
+# noble can roll independently.
+#
+# DELTAS vs centos10:
+#   - FROM docker.io/library/ubuntu:22.04 (rolling jammy tag — the
+#     same base the Ubuntu CI uses, and the one install-deps.sh
+#     auto-detects via /etc/os-release).
+#   - apt instead of dnf. `DEBIAN_FRONTEND=noninteractive` is set
+#     for both the toolchain layer AND the install-deps.sh layer
+#     so any debconf prompts (tzdata, locales) auto-default.
+#   - No EPEL / CRB equivalent — Ubuntu ships the C++ toolchain in
+#     `main` + `universe`. We enable `universe` explicitly because
+#     `ccache` lives there on jammy (it was moved out of `main`
+#     in 20.04+).
+#   - Package names differ: `build-essential` (the
+#     gcc/g++/libc-dev meta) instead of `gcc gcc-c++`; `cmake`
+#     instead of `cmake`; `python3-dev` instead of `python3-devel`;
+#     `dpkg-dev` + `debhelper` instead of `rpm-build`
+#     `rpmdevtools`.
+#   - install-deps.sh's `ubuntu|debian` branch calls `apt-get
+#     install -y`, not dnf. The `--allowerasing` thing is
+#     centos-specific; no equivalent flag on the Ubuntu branch.
+
+# --- Stage 0: base ----------------------------------------------------
+# Rolling jammy tag — picks up base-image security updates each
+# nightly rebuild (#12). We do NOT pin by digest: Ubuntu LTS point
+# releases are the right anchor for nightly rebuilds.
+FROM docker.io/library/ubuntu:22.04 AS builder-base
+
+# --- Build args -------------------------------------------------------
+# Same shape as Dockerfile.centos10. The matrix Pipeline (#11) and
+# the nightly CronJob (#12) override CEPH_SHA and the OCI_* args.
+ARG CEPH_REPO=https://github.com/ceph/ceph.git
+ARG CEPH_SHA=8f95d0ea294fe1f063cd1c46ca7ddcb48f6f223e
+ARG INSTALL_DEPS_FOR_MAKE_CHECK=true
+ARG SOURCE_DATE_EPOCH
+ARG BUILDER_IMAGE_VERSION=0.1.0-ubuntu-jammy
+ARG OCI_IMAGE_SOURCE=https://github.com/mmgaggle/ceph-tekton
+ARG OCI_IMAGE_REVISION=unknown
+ARG OCI_IMAGE_CREATED=unknown
+
+# Set at the image level so every RUN gets it — apt-based image
+# builds hang on debconf prompts (tzdata especially) without it.
+ENV DEBIAN_FRONTEND=noninteractive \
+    LC_ALL=C.UTF-8 \
+    LANG=C.UTF-8
+
+# --- Stage 1: install build deps + ceph toolchain ---------------------
+# Single RUN to keep the layer count down — same posture as
+# Dockerfile.centos10. `apt-get clean && rm -rf
+# /var/lib/apt/lists/*` at the end of the same layer is what keeps
+# the final image from carrying the apt cache.
+#
+# Toolchain rationale (parallel to centos10 toolchain block):
+#   - build-essential       : gcc 11, g++ 11, libc6-dev, make. The
+#                              canonical "I want to build C++ on
+#                              Ubuntu" meta.
+#   - cmake, ninja-build,   : ceph's do_cmake.sh + ccache, same as
+#     ccache                  centos10.
+#   - python3 + dev + pip   : install-deps.sh sets up venvs via
+#                              the python3 packages; jammy ships
+#                              3.10.
+#   - git, wget, curl,      : housekeeping; required by both
+#     ca-certificates         install-deps.sh and the package-
+#                              build Pipeline.
+#   - sudo                  : install-deps.sh's wrap_sudo() expects
+#                              $SUDO to exist (same as centos10).
+#                              The no-op shim layer below shadows
+#                              the binary at /usr/local/bin/sudo.
+#   - dpkg-dev, debhelper,  : dpkg-buildpackage + the helpers
+#     devscripts, fakeroot    install-deps.sh calls during the deb
+#                              control-file deps resolution.
+#   - software-properties-  : `add-apt-repository` for the
+#     common                  `universe` enable; technically Ubuntu
+#                              22.04 has universe enabled by
+#                              default in the minimal base, but
+#                              keeping the explicit enable makes
+#                              the recipe robust to base-image
+#                              changes.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        software-properties-common \
+        gnupg; \
+    add-apt-repository -y universe; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        sudo \
+        git \
+        wget \
+        curl \
+        tar \
+        xz-utils \
+        bzip2 \
+        zstd \
+        diffutils \
+        findutils \
+        file \
+        make \
+        cmake \
+        ninja-build \
+        ccache \
+        build-essential \
+        pkg-config \
+        python3 \
+        python3-pip \
+        python3-dev \
+        python3-venv \
+        dpkg-dev \
+        debhelper \
+        devscripts \
+        fakeroot \
+        equivs \
+        lsb-release; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# --- Stage 2: fetch ceph/ceph at pinned SHA + run install-deps.sh -----
+# install-deps.sh's `ubuntu|debian` branch reads `debian/control`
+# (built from `debian/control.in` by the upstream script) and
+# resolves the Build-Depends via `apt-get install` + `mk-build-deps`
+# from devscripts. Same shallow-from-SHA fetch pattern as
+# centos10.
+#
+# SUDO SHIM: identical defensive copy as Dockerfile.centos10. We
+# install-deps.sh-time as root but the script calls $SUDO
+# unconditionally; the shim execs args directly with no setuid
+# escalation.
+RUN set -eux; \
+    mkdir -p /usr/src/ceph; \
+    cd /usr/src/ceph; \
+    git init -q; \
+    git remote add origin "${CEPH_REPO}"; \
+    git fetch --depth=1 origin "${CEPH_SHA}"; \
+    git checkout -q FETCH_HEAD; \
+    git log -1 --pretty='format:ceph/ceph @ %H (%ci)%n  %s' >&2; \
+    printf '#!/bin/sh\nexec "$@"\n' > /usr/local/bin/sudo; \
+    chmod +x /usr/local/bin/sudo; \
+    export FOR_MAKE_CHECK="${INSTALL_DEPS_FOR_MAKE_CHECK}"; \
+    ./install-deps.sh; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*; \
+    # Keep debian/control + install-deps.sh around for the package- \
+    # build Task; drop the rest of the working tree (same trim as \
+    # centos10 keeps ceph.spec.in around). \
+    find /usr/src/ceph -maxdepth 1 -mindepth 1 \
+        ! -name 'debian' \
+        ! -name 'install-deps.sh' \
+        ! -name '.git' \
+        -exec rm -rf {} +; \
+    # Inside debian/, only the control template is needed by the \
+    # downstream Task; drop the rest to keep the image small. \
+    find /usr/src/ceph/debian -maxdepth 1 -mindepth 1 \
+        ! -name 'control' \
+        ! -name 'control.in' \
+        ! -name 'rules' \
+        -exec rm -rf {} + 2>/dev/null || true; \
+    rm -rf /usr/src/ceph/.git
+
+# --- Stage 3: build user + entrypoint ---------------------------------
+# UID 1000 builder, /home/builder/{build,ccache}, build-package.sh
+# entrypoint, identity env file. Identical to Dockerfile.centos10
+# so the downstream Tekton package-build Pipeline's
+# `runAsUser: 1000` works distro-agnostically.
+RUN set -eux; \
+    groupadd --system --gid 1000 builder; \
+    useradd  --system --uid 1000 --gid builder \
+             --home-dir /home/builder --create-home --shell /bin/bash builder; \
+    mkdir -p /home/builder/build /home/builder/ccache; \
+    chown -R builder:builder /home/builder; \
+    install -d -o builder -g builder /home/builder/.ccache; \
+    printf 'max_size = 5G\ncache_dir = /home/builder/.ccache\n' \
+        > /home/builder/.ccache/ccache.conf; \
+    chown builder:builder /home/builder/.ccache/ccache.conf
+
+COPY --chown=root:root build-package.sh /usr/local/bin/build-package.sh
+RUN chmod 0755 /usr/local/bin/build-package.sh
+
+RUN set -eux; \
+    { \
+      printf 'CEPH_BUILDER_IMAGE_TITLE=ceph-builder-ubuntu-jammy\n'; \
+      printf 'CEPH_BUILDER_IMAGE_VERSION=%s\n' "${BUILDER_IMAGE_VERSION}"; \
+      printf 'CEPH_BUILDER_CEPH_SHA=%s\n'      "${CEPH_SHA}"; \
+      printf 'CEPH_BUILDER_DISTRO=ubuntu-jammy\n'; \
+      printf 'CEPH_BUILDER_FOR_MAKE_CHECK=%s\n' "${INSTALL_DEPS_FOR_MAKE_CHECK}"; \
+      printf 'CEPH_BUILDER_SOURCE_DATE_EPOCH=%s\n' "${SOURCE_DATE_EPOCH:-}"; \
+    } > /etc/ceph-builder-image.env
+
+LABEL org.opencontainers.image.source="${OCI_IMAGE_SOURCE}" \
+      org.opencontainers.image.revision="${OCI_IMAGE_REVISION}" \
+      org.opencontainers.image.created="${OCI_IMAGE_CREATED}" \
+      org.opencontainers.image.title="ceph-builder-ubuntu-jammy" \
+      org.opencontainers.image.description="Ubuntu 22.04 (jammy) builder image for ceph/ceph, pre-baked with install-deps.sh output." \
+      org.opencontainers.image.licenses="LGPL-2.1-or-later" \
+      org.opencontainers.image.url="https://github.com/mmgaggle/ceph-tekton" \
+      org.opencontainers.image.documentation="https://github.com/mmgaggle/ceph-tekton/blob/main/docs/builder-images.md" \
+      org.ceph.builder-image.version="${BUILDER_IMAGE_VERSION}" \
+      org.ceph.builder-image.ceph-sha="${CEPH_SHA}" \
+      org.ceph.builder-image.distro="ubuntu-jammy" \
+      org.ceph.builder-image.for-make-check="${INSTALL_DEPS_FOR_MAKE_CHECK}"
+
+USER builder
+WORKDIR /home/builder/build
+
+ENTRYPOINT ["/usr/local/bin/build-package.sh"]
+CMD []
