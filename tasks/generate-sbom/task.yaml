@@ -1,45 +1,74 @@
 # generate-sbom — per-artifact CycloneDX SBOM Task.
 #
 # Runs `syft` against every artifact file matching a glob in a workspace
-# (typically the build-output workspace produced by `build-package` — see
-# issue #16), emits one CycloneDX-JSON SBOM per artifact, and surfaces the
-# per-artifact Tekton Chains type-hint Results so Chains attaches every
-# (artifact, SBOM) pair to the slsa/v2alpha4 attestation it signs.
+# (typically the build-output workspace produced by `build-package` —
+# see issue #16), emits one CycloneDX-JSON SBOM per artifact, and
+# surfaces a Chains-valid type-hint Result so the SBOM file's URI +
+# digest are signed into the SLSA attestation Chains mints for the
+# TaskRun.
 #
-# Today this Task ships standalone. Once issue #16 lands, the
-# package-build pipeline will declare:
+# WHAT CHANGED IN #55 (vs. the original #50 shape):
 #
-#   tasks:
-#     - name: build-package    # writes *.deb / *.rpm into the workspace
-#       ...
-#     - name: sbom
-#       runAfter: [build-package]
-#       taskRef: { name: generate-sbom }
-#       workspaces:
-#         - { name: artifacts, workspace: build-output }
-#         - { name: sboms,     workspace: build-output }   # or a sibling PVC
+#   The original Task declared three Result names that LOOKED like
+#   Chains type-hints but aren't part of the Chains 0.26 grammar
+#   (`SBOM_NAMES`, `SBOM_COUNT`, `SBOM_MEDIATYPE`) and shipped an
+#   `ARTIFACT_OUTPUTS` value with a nested `sbom: {uri, digest,
+#   mediaType}` block that Chains silently ignores. The valid Chains
+#   0.26 output type-hint set is documented at
+#     https://github.com/tektoncd/chains/blob/v0.26.0/docs/slsa-provenance.md#output-artifacts
+#   and is limited to:
+#     - *IMAGE_URL / *IMAGE_DIGEST
+#     - IMAGES
+#     - *ARTIFACT_URI / *ARTIFACT_DIGEST
+#     - *ARTIFACT_OUTPUTS (object with `uri`, `digest`,
+#       `isBuildArtifact` — no mediaType, no nested sbom)
 #
-# and the same Chains config that already observes container SBOMs (#46)
-# picks up the per-package SBOMs without further wiring.
+#   So this Task now emits exactly:
+#
+#     - IMAGES — one `<artifact-url>@sha256:<digest>` line per scanned
+#       artifact. Chains promotes each pair to a separate subject in
+#       the SLSA attestation.
+#
+#     - SBOM_IMAGES — one `<sbom-url>@sha256:<digest>` line per
+#       per-artifact SBOM file. This is the SAME `IMAGES`-shape Chains
+#       grammar (Chains promotes each line to a subject too); the
+#       distinct Result name lets downstream tooling tell artifacts
+#       and SBOMs apart. The SBOM file lands in S3 at a stable
+#       `<branch>/<sha>/<distro>/<arch>/sboms/<basename>.cdx.json`
+#       prefix when the upload step runs.
+#
+#     - sbom-ARTIFACT_OUTPUTS — Chains-valid object Result (one
+#       descriptor for the rollup SBOM file: `uri`, `digest`,
+#       `isBuildArtifact: "false"`). Chains lifts this into
+#       `predicate.runDetails.byproducts[]`. mediaType is NOT carried
+#       in this shape — the file extension `.cdx.json` is the
+#       mediaType signal, matching the caveat documented in
+#       `pipelines/chains-smoke-test.yaml`'s `sbom` step.
+#
+#   The fully-typed SBOM attachment (mediaType embedded in the
+#   attestation; OCI referrer; `cosign download sbom <image>` round-
+#   trip) is provided for CONTAINER images by the sibling Task
+#   `tasks/attach-sbom/task.yaml`, which runs `cosign attach sbom
+#   --sbom <file> --type cyclonedx <image-ref>` after the image push.
+#   Packages cannot use that path (no OCI registry); they keep the
+#   S3-sibling + signed-byproduct convention this Task produces.
 #
 # WHY CYCLONEDX FOR PACKAGES (vs. SPDX for container images, #46):
-#   - CycloneDX models dependency relationships (`dependencies[]`) more
-#     naturally than SPDX does, and the dep-management ecosystem
-#     (OWASP Dependency-Track, Snyk, GitHub Dependency Graph, Grype with
-#     --output cyclonedx-json) consumes it more readily than SPDX-JSON
-#     for *package* artefacts (.deb, .rpm) where the SBOM is really a
-#     graph of installed shared libraries + bundled deps.
-#   - Chains is format-agnostic: it copies `SBOM_MEDIATYPE` verbatim
-#     into the resolvedDependencies descriptor. The SPDX-for-images /
-#     CycloneDX-for-packages split is a deliberate consumer-fit
-#     decision, NOT a Chains constraint. See docs/provenance.md
+#   - CycloneDX models dependency relationships (`dependencies[]`)
+#     more naturally than SPDX does, and the dep-management ecosystem
+#     (OWASP Dependency-Track, Snyk, GitHub Dependency Graph, Grype
+#     with `--output cyclonedx-json`) consumes it more readily than
+#     SPDX-JSON for *package* artefacts (.deb, .rpm) where the SBOM
+#     is really a graph of installed shared libraries + bundled deps.
+#   - The SPDX-for-images / CycloneDX-for-packages split is a
+#     deliberate consumer-fit decision. See docs/provenance.md
 #     ("Per-build package SBOMs") for the verifier-side walkthrough.
 #
 # FAILURE SEMANTICS:
-#   The Task fails (exit non-zero) if syft can't produce a CycloneDX SBOM
-#   for any matched artifact. Empty matches (`artifact-glob` matches no
-#   files in the workspace) are a fatal misconfiguration — emitting zero
-#   SBOMs silently would be worse than failing.
+#   The Task fails (exit non-zero) if syft can't produce a CycloneDX
+#   SBOM for any matched artifact. Empty matches (`artifact-glob`
+#   matches no files in the workspace) are a fatal misconfiguration —
+#   emitting zero SBOMs silently would be worse than failing.
 ---
 apiVersion: tekton.dev/v1
 kind: Task
@@ -47,22 +76,25 @@ metadata:
   name: generate-sbom
 spec:
   description: |
-    Scan every artifact under `artifact-glob` in the artifacts workspace
-    with syft, emit one CycloneDX-JSON SBOM per artifact into the sboms
-    workspace, optionally upload to S3, and emit the Chains-grammar
-    plural Results (`IMAGES`, `ARTIFACT_OUTPUTS`) Chains uses to attach
-    each (artifact, SBOM) pair to the SLSA v2alpha4 attestation —
-    plus contract-level index Results (`SBOM_NAMES`, `SBOM_COUNT`,
-    `SBOM_MEDIATYPE`) for verifier tooling and dashboards.
+    Scan every artifact under `artifact-glob` in the artifacts
+    workspace with syft, emit one CycloneDX-JSON SBOM per artifact
+    into the sboms workspace, optionally upload to S3, and emit the
+    Chains-valid type-hint Results (`IMAGES`, `SBOM_IMAGES`, and the
+    `sbom-ARTIFACT_OUTPUTS` byproduct object) so Chains signs the
+    artifact + SBOM URIs + digests into the slsa/v2alpha4
+    attestation. For CONTAINER images the fully-typed SBOM attachment
+    is done by the sibling `attach-sbom` Task (cosign attach sbom);
+    this Task is the package path (S3-sibling SBOM + signed
+    byproduct).
   params:
     - name: artifact-glob
       type: string
       default: "*"
       description: |
-        Shell glob (relative to the artifacts workspace root) matching the
-        files to scan. Examples: `*.deb`, `*.rpm`, `**/*.deb`, or a bare
-        `*` to scan everything. Each matched file produces one CycloneDX
-        SBOM and one set of type-hinted Results.
+        Shell glob (relative to the artifacts workspace root) matching
+        the files to scan. Examples: `*.deb`, `*.rpm`, `**/*.deb`, or
+        a bare `*` to scan everything. Each matched file produces one
+        CycloneDX SBOM and one IMAGES/SBOM_IMAGES entry.
     - name: syft-image
       type: string
       default: docker.io/anchore/syft:v1.18.0
@@ -77,22 +109,25 @@ spec:
       default: docker.io/library/busybox:1.36
       description: |
         Pinned busybox image used by the emit-results step. Gives us
-        /bin/sh, sha256sum, find, awk, sed, printf — everything needed
-        to hash the SBOMs, iterate matches, and write Tekton Result
-        files. Same pin as chains-smoke-test for build determinism.
+        /bin/sh, sha256sum, find, awk, sed, printf — everything
+        needed to hash the SBOMs, iterate matches, and write Tekton
+        Result files. Same pin as chains-smoke-test for build
+        determinism.
     - name: uploader-image
       type: string
       default: docker.io/amazon/aws-cli:2.17.0
       description: |
-        Pinned image with the AWS CLI for the optional S3 upload step.
-        Skipped entirely when `s3-bucket` is empty (dev / smoke).
+        Pinned image with the AWS CLI for the optional S3 upload
+        step. Skipped entirely when `s3-bucket` is empty (dev /
+        smoke).
     - name: s3-bucket
       type: string
       default: ""
       description: |
-        S3 bucket name to upload SBOMs to. Empty string disables upload
-        (smoke runs offline; SBOMs remain in the sboms workspace and the
-        SBOM_URL Results point at `workspace://sboms/<name>.cdx.json`).
+        S3 bucket name to upload SBOMs to. Empty string disables
+        upload (smoke runs offline; SBOMs remain in the sboms
+        workspace and the per-artifact URLs in IMAGES / SBOM_IMAGES /
+        sbom-ARTIFACT_OUTPUTS point at `workspace://...`).
     - name: s3-endpoint
       type: string
       default: ""
@@ -127,43 +162,47 @@ spec:
       type: string
       default: ""
       description: |
-        Optional URL prefix prepended to every ARTIFACT_URL Result so
-        the Chains subject identifies the *published* artifact location
-        rather than the workspace-local path. Example:
+        Optional URL prefix prepended to every artifact URL in IMAGES
+        (and every SBOM URL in SBOM_IMAGES / sbom-ARTIFACT_OUTPUTS)
+        so the Chains subjects identify the *published* artifact
+        location rather than the workspace-local path. Example:
         `https://artifacts.ceph.com/ceph-artifacts-branch/main/<sha>/centos10/x86_64/`.
-        Empty = subject URL is `workspace://artifacts/<filename>`.
+        Empty = URLs are `workspace://artifacts/<filename>` and
+        `workspace://sboms/<filename>.cdx.json`.
   results:
     # ----------------------------------------------------------------
-    # Multi-subject Chains type-hint grammar.
+    # Chains-valid multi-subject type-hint grammar (Chains 0.26).
     #
-    # Per tektoncd/chains/docs/slsa-provenance.md, Chains supports two
-    # equivalent ways to surface N (artifact, SBOM) pairs from a single
-    # TaskRun:
+    # Two declared plural Results, both shaped like Chains' `IMAGES`
+    # grammar (newline-separated `<url>@sha256:<digest>` pairs).
+    # Chains promotes each line in each Result to a subject in the
+    # SLSA attestation it signs:
     #
-    #   (a) `ARTIFACT_OUTPUTS` — a single Result whose VALUE is a JSON
-    #       array, one entry per artifact, each entry carrying its own
-    #       `uri` / `digest` and an optional nested SBOM descriptor.
-    #       This is the recommended pattern when the artifact list is
-    #       only known at scan time (Tekton requires every Result to be
-    #       declared in `spec.results`, so per-artifact discrete Result
-    #       names with a runtime suffix don't work cleanly).
+    #   * IMAGES      — one line per scanned artifact (the .deb /
+    #                   .rpm / .tar). Chains-grammar name; works on
+    #                   every Chains version since 0.13.
+    #   * SBOM_IMAGES — one line per per-artifact SBOM file. Same
+    #                   shape (`<url>@sha256:<digest>`), distinct
+    #                   Result name so verifier tooling can tell
+    #                   artifacts and SBOMs apart on the attestation
+    #                   subject list.
     #
-    #   (b) `IMAGES` — a single Result whose VALUE is a list of
-    #       `<url>@sha256:<digest>` pairs (one per line). Chains
-    #       promotes each pair to a subject.  Pre-dates `ARTIFACT_OUTPUTS`
-    #       and is kept for older Chains versions.
+    # Plus one Chains-valid `*ARTIFACT_OUTPUTS` byproduct object Result
+    # for the rollup SBOM file:
     #
-    # We emit BOTH so:
-    #   - `IMAGES` gives Chains' multi-subject promotion (works on every
-    #     Chains version since 0.13).
-    #   - `ARTIFACT_OUTPUTS` carries the SBOM descriptors (Chains 0.20+
-    #     reads the nested `sbom` block and emits `resolvedDependencies`).
-    #
-    # The per-artifact `<NAME>_*` discrete-Result form mentioned in the
-    # issue body is the *display* convention this Task targets; under
-    # the hood Tekton's "all Results must be declared" rule means the
-    # actual wire format is the two declared plural Results below.
-    # Verifier-facing names + count are unchanged.
+    #   * sbom-ARTIFACT_OUTPUTS — { uri, digest, isBuildArtifact }.
+    #     `isBuildArtifact: "false"` lands the descriptor under
+    #     `predicate.runDetails.byproducts[]` (not under subject) in
+    #     the slsa/v2alpha4 attestation, matching the existing
+    #     `sbom-ARTIFACT_OUTPUTS` shape from
+    #     pipelines/chains-smoke-test.yaml. mediaType is NOT carried
+    #     in this Result — Chains' object Result schema does not
+    #     accept mediaType, and the `.cdx.json` filename extension is
+    #     the mediaType signal. For containers, the
+    #     `tasks/attach-sbom/task.yaml` Task additionally runs
+    #     `cosign attach sbom --type cyclonedx` so verifiers can
+    #     `cosign download sbom <image>` and recover the mediaType
+    #     from the OCI referrer.
     # ----------------------------------------------------------------
     - name: IMAGES
       type: string
@@ -171,46 +210,34 @@ spec:
         Newline-separated list of `<url>@sha256:<digest>` pairs, one
         per scanned artifact. Chains' multi-subject matcher promotes
         each pair to a subject in the SLSA attestation. The `<url>`
-        is either `subject-prefix`/`<basename>` or
+        is either `<subject-prefix>/<basename>` or
         `workspace://artifacts/<basename>` (smoke / no prefix).
-    - name: ARTIFACT_OUTPUTS
+    - name: SBOM_IMAGES
       type: string
       description: |
-        JSON array of per-artifact descriptors. Each entry has shape:
-            {
-              "name":   "<basename>",
-              "uri":    "<artifact-url>",
-              "digest": "sha256:<hex>",
-              "sbom": {
-                "uri":       "<sbom-url>",
-                "digest":    "sha256:<hex>",
-                "mediaType": "application/vnd.cyclonedx+json"
-              }
-            }
-        Chains 0.20+ uses the nested `sbom` block to populate the
-        attestation's `predicate.buildDefinition.resolvedDependencies[]`
-        entry per artifact, so a verifier sees one SBOM descriptor per
-        package without having to grep individual Result names.
-    - name: SBOM_NAMES
-      type: string
+        Newline-separated list of `<sbom-url>@sha256:<digest>` pairs,
+        one per per-artifact SBOM file. Same Chains-grammar shape as
+        IMAGES; distinct Result name so downstream verifiers can
+        separate artifact subjects from SBOM subjects. `<sbom-url>` is
+        `<subject-prefix>/sboms/<basename>.cdx.json` when
+        `subject-prefix` is set (matching the S3 layout the upload
+        step writes), else `workspace://sboms/<basename>.cdx.json`.
+    - name: sbom-ARTIFACT_OUTPUTS
+      type: object
+      properties:
+        uri:    { type: string }
+        digest: { type: string }
+        isBuildArtifact: { type: string }
       description: |
-        Newline-separated list of `<NAME>` slugs (one per artifact)
-        derived from the artifact basename. Provided for downstream
-        consumers and the smoke-test assert step; Chains itself reads
-        `IMAGES` + `ARTIFACT_OUTPUTS`.
-    - name: SBOM_COUNT
-      type: string
-      description: |
-        Decimal count of (artifact, SBOM) pairs emitted. Smoke tests
-        and dashboards use this as a sanity check (0 => bug or
-        misconfigured artifact-glob — the Task fails in that case).
-    - name: SBOM_MEDIATYPE
-      type: string
-      description: |
-        application/vnd.cyclonedx+json — the CycloneDX-JSON media type
-        applied to every per-artifact SBOM. Repeated per-artifact
-        inside `ARTIFACT_OUTPUTS[].sbom.mediaType`, exposed once here
-        as a contract-level Result.
+        Chains-valid object Result describing the rollup SBOM file
+        (`sbom.cdx.json`) as a build byproduct. Chains lifts this
+        into `predicate.runDetails.byproducts[]` of the slsa/v2alpha4
+        attestation. Shape is exactly what Chains 0.26 accepts:
+        `{uri, digest, isBuildArtifact}` — no `mediaType`, no nested
+        `sbom` block. `isBuildArtifact` is `"false"` because the SBOM
+        is metadata about the build, not the build's product. Same
+        shape as the `sbom-ARTIFACT_OUTPUTS` Result on
+        `pipelines/chains-smoke-test.yaml`'s sbom step.
   workspaces:
     - name: artifacts
       description: |
@@ -220,18 +247,18 @@ spec:
       mountPath: /workspace/artifacts
     - name: sboms
       description: |
-        Workspace where one `<package>.cdx.json` is written per matched
-        artifact. The same workspace must be readable by the
-        emit-results and upload steps. In dev this is an emptyDir;
-        in real pipelines it's commonly the same workspace as
-        `artifacts` (deb/rpm + their SBOMs land side-by-side ready for
-        publish-repo to pick up).
+        Workspace where one `<package>.cdx.json` is written per
+        matched artifact, plus the `sbom.cdx.json` rollup. The same
+        workspace must be readable by the emit-results and upload
+        steps. In dev this is an emptyDir; in real pipelines it's
+        commonly the same workspace as `artifacts` (deb/rpm + their
+        SBOMs land side-by-side ready for publish-repo to pick up).
       mountPath: /workspace/sboms
     - name: s3-credentials
       description: |
         Optional. If mounted, expected to contain `AWS_ACCESS_KEY_ID`,
-        `AWS_SECRET_ACCESS_KEY`, and optionally `AWS_SESSION_TOKEN` as
-        files (one secret value per file). Same shape as the
+        `AWS_SECRET_ACCESS_KEY`, and optionally `AWS_SESSION_TOKEN`
+        as files (one secret value per file). Same shape as the
         reproducibility-check Task uses.
 
         In Sepia the calling Pipeline leaves this workspace empty and
@@ -325,43 +352,30 @@ spec:
           exit 1
         fi
 
-        # Compute the rollup SBOM's sha256 once — every per-artifact
-        # SBOM_DIGEST points at the same bytes for v1 (see scan-step
-        # comment). When we move to per-artifact syft invocations, this
-        # is the only piece that changes.
+        # Rollup SBOM digest — used for the per-artifact SBOM file
+        # digests too (the per-artifact files are hardlinks /
+        # copies of the rollup; see scan-step comment).
         ROLLUP_SHA="sha256:$(sha256sum "${ROLLUP_SBOM}" | awk '{print $1}')"
 
-        NAMES_FILE="$(results.SBOM_NAMES.path)"
         IMAGES_FILE="$(results.IMAGES.path)"
-        OUTPUTS_FILE="$(results.ARTIFACT_OUTPUTS.path)"
-        : > "${NAMES_FILE}"
+        SBOM_IMAGES_FILE="$(results.SBOM_IMAGES.path)"
         : > "${IMAGES_FILE}"
+        : > "${SBOM_IMAGES_FILE}"
         COUNT=0
-        FIRST=1
 
-        # ARTIFACT_OUTPUTS is a JSON array. We build it incrementally
-        # without jq (not in busybox) by tracking FIRST to skip the
-        # leading comma. The shape Chains 0.20+ reads is:
-        #
-        #   [{ "name":..., "uri":..., "digest":...,
-        #      "sbom": { "uri":..., "digest":..., "mediaType":... } }, ...]
-        #
-        # JSON-escaping is conservative: artifact basenames are
-        # filesystem paths under our control (no quotes, no backslashes
-        # in practice — package names use `[A-Za-z0-9._+-]`), so we
-        # don't need a full shell JSON encoder.
-        printf '[' > "${OUTPUTS_FILE}"
+        # Subject URL prefix for SBOM files. When `subject-prefix` is
+        # set (real pipelines), the SBOMs live under `<prefix>/sboms/`
+        # — matching the S3 layout the upload step writes. Otherwise
+        # SBOMs surface as `workspace://sboms/...` (smoke / no upload).
+        if [ -n "${SUBJECT_PREFIX}" ]; then
+          SBOM_URL_PREFIX="${SUBJECT_PREFIX%/}/sboms"
+        else
+          SBOM_URL_PREFIX="workspace://sboms"
+        fi
 
         for f in ${MATCHES}; do
           [ -f "${f}" ] || continue
           BASENAME=$(basename "${f}")
-          # Display slug — uppercase, non-alnum -> _, `PKG_` prefix so
-          # we always start with a letter. Used for SBOM_NAMES indexing
-          # and the smoke-test assert step.
-          SLUG=$(printf '%s' "${BASENAME}" \
-            | tr '[:lower:]' '[:upper:]' \
-            | sed 's/[^A-Z0-9]/_/g')
-          NAME="PKG_${SLUG}"
 
           ARTIFACT_SHA="sha256:$(sha256sum "${f}" | awk '{print $1}')"
           if [ -n "${SUBJECT_PREFIX}" ]; then
@@ -377,39 +391,40 @@ spec:
           rm -f "${SBOM_FILE}"
           ln "${ROLLUP_SBOM}" "${SBOM_FILE}" 2>/dev/null \
             || cp "${ROLLUP_SBOM}" "${SBOM_FILE}"
-          SBOM_URL="workspace://sboms/${BASENAME}.cdx.json"
+          SBOM_URL="${SBOM_URL_PREFIX}/${BASENAME}.cdx.json"
 
-          # IMAGES Result: one `<url>@<digest>` line per artifact.
+          # IMAGES Result: one `<artifact-url>@<digest>` line per artifact.
           printf '%s@%s\n' "${ARTIFACT_URL}" "${ARTIFACT_SHA}" >> "${IMAGES_FILE}"
+          # SBOM_IMAGES Result: one `<sbom-url>@<digest>` line per SBOM
+          # file. Same Chains grammar; distinct Result name lets
+          # verifiers separate artifact subjects from SBOM subjects.
+          printf '%s@%s\n' "${SBOM_URL}" "${ROLLUP_SHA}" >> "${SBOM_IMAGES_FILE}"
 
-          # ARTIFACT_OUTPUTS Result: JSON array entry.
-          if [ "${FIRST}" -eq 1 ]; then
-            FIRST=0
-          else
-            printf ',' >> "${OUTPUTS_FILE}"
-          fi
-          printf '{"name":"%s","uri":"%s","digest":"%s","sbom":{"uri":"%s","digest":"%s","mediaType":"application/vnd.cyclonedx+json"}}' \
-            "${BASENAME}" "${ARTIFACT_URL}" "${ARTIFACT_SHA}" \
-            "${SBOM_URL}" "${ROLLUP_SHA}" \
-            >> "${OUTPUTS_FILE}"
-
-          echo "${NAME}" >> "${NAMES_FILE}"
           COUNT=$((COUNT + 1))
-          echo "[emit] ${NAME}  artifact=${BASENAME}  sbom=${BASENAME}.cdx.json  digest=${ROLLUP_SHA}"
+          echo "[emit] artifact=${BASENAME}  sbom=${BASENAME}.cdx.json  digest=${ROLLUP_SHA}"
         done
 
-        printf ']' >> "${OUTPUTS_FILE}"
+        # sbom-ARTIFACT_OUTPUTS object Result — Chains-valid byproduct
+        # descriptor for the rollup SBOM. Shape Chains 0.26 accepts:
+        # `{uri, digest, isBuildArtifact}` — no mediaType, no nested
+        # sbom block. Object Results are written one key per line as
+        # `<key>=<value>` in busybox-friendly form.
+        ROLLUP_URL="${SBOM_URL_PREFIX}/sbom.cdx.json"
+        printf 'uri=%s\n'             "${ROLLUP_URL}" >  "$(results.sbom-ARTIFACT_OUTPUTS.path)"
+        printf 'digest=%s\n'          "${ROLLUP_SHA}" >> "$(results.sbom-ARTIFACT_OUTPUTS.path)"
+        printf 'isBuildArtifact=%s\n' "false"         >> "$(results.sbom-ARTIFACT_OUTPUTS.path)"
 
-        printf '%s' "${COUNT}"                       > "$(results.SBOM_COUNT.path)"
-        printf '%s' "application/vnd.cyclonedx+json" > "$(results.SBOM_MEDIATYPE.path)"
-        echo "[emit] SBOM_COUNT=${COUNT}"
-        echo "[emit] SBOM_NAMES:"
-        cat "${NAMES_FILE}"
         echo "[emit] IMAGES:"
         cat "${IMAGES_FILE}"
-        echo "[emit] ARTIFACT_OUTPUTS:"
-        cat "${OUTPUTS_FILE}"
-        echo
+        echo "[emit] SBOM_IMAGES:"
+        cat "${SBOM_IMAGES_FILE}"
+        echo "[emit] sbom-ARTIFACT_OUTPUTS:"
+        cat "$(results.sbom-ARTIFACT_OUTPUTS.path)"
+        echo "[emit] scanned ${COUNT} artifact(s)"
+        if [ "${COUNT}" -eq 0 ]; then
+          echo "FATAL: zero artifacts scanned (glob matched files but none survived per-entry checks)" >&2
+          exit 1
+        fi
 
     # ----------------------------------------------------------------
     # Step 3 (optional): upload
