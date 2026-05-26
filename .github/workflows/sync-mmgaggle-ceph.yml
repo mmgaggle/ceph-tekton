@@ -1,0 +1,180 @@
+# Daily fast-forward sync of mmgaggle/ceph `main` from upstream ceph/ceph `main`.
+#
+# Why this lives in `ceph-tekton` and not in `mmgaggle/ceph`:
+# the sync rewrites `mmgaggle/ceph` `main` from upstream, so any
+# workflow shipped on `mmgaggle/ceph` `main` itself would be flattened
+# on every run — and a workflow that deletes itself is a debugging
+# nightmare. Hosting the workflow here also keeps the PAT secret
+# scoped to a repo that doesn't accept arbitrary PR YAML.
+#
+# What it does:
+#   1. Bare-clones upstream ceph/ceph `main` (single-branch).
+#   2. Pushes that ref to mmgaggle/ceph `main` using a fine-grained
+#      PAT (`MMGAGGLE_CEPH_PAT`, scoped to mmgaggle/ceph only,
+#      Contents: Read & write). HITL prereq — see
+#      docs/pipelines-as-code.md "Daily sync of mmgaggle/ceph".
+#   3. (Optional) Rebases the PaC integration branch `ci-tekton`
+#      onto the new main and force-with-leases it back. Gated by
+#      `if:` so we can disable it once #68 lands and the `.tekton/`
+#      stub becomes upstream-mergeable — migration tracked in #75.
+#
+# Push transfers only the new commits since the last sync, so the
+# daily delta is small even on a multi-GB ceph tree. The clone is
+# bare + single-branch — no submodules, no working tree.
+#
+# Manual run: Actions tab -> "sync mmgaggle/ceph from upstream ceph/ceph"
+# -> "Run workflow".
+
+name: sync mmgaggle/ceph from upstream ceph/ceph
+
+on:
+  schedule:
+    # 06:00 UTC daily. Late enough that the upstream nightly bot
+    # traffic has settled; early enough that mmgaggle/ceph is fresh
+    # before US-Pacific contributors start their day.
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      rebase_ci_tekton:
+        description: 'Also rebase ci-tekton onto the new main'
+        type: boolean
+        required: false
+        default: true
+
+# Read-only at the workflow level. The actual push uses an explicit
+# PAT in the URL — we never hand `GITHUB_TOKEN` write scope.
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: mirror upstream main + rebase ci-tekton
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # Pinned versions — bump in PRs. The `env:` block is the
+    # single source of truth for upstream + downstream coordinates;
+    # the bash steps below only reference these variables.
+    env:
+      # Upstream we mirror from. `main` is the only branch we touch —
+      # release branches sync via their own mechanism (chacra/jenkins
+      # path today; tracked separately as part of phase-2).
+      UPSTREAM_URL:    https://github.com/ceph/ceph.git
+      UPSTREAM_BRANCH: main
+      # Downstream we mirror into. `mmgaggle/ceph` `main` is set as
+      # the repo default and is the merge base for PaC PRs against
+      # ci-tekton.
+      DOWNSTREAM_REPO:   mmgaggle/ceph
+      DOWNSTREAM_BRANCH: main
+      # PaC integration branch — exists solely to host
+      # `.tekton/PipelineRun-ceph-conf.yaml`. See path-(c) follow-up
+      # for when this branch can go away.
+      CI_TEKTON_BRANCH: ci-tekton
+
+    steps:
+      # ---------------------------------------------------------------
+      # 1. Bare clone of upstream main. `--single-branch` keeps the
+      # network transfer scoped to what we actually push; no tags,
+      # no other refs, no submodules.
+      # ---------------------------------------------------------------
+      - name: Clone upstream ${{ env.UPSTREAM_BRANCH }}
+        run: |
+          set -euo pipefail
+          git clone --bare --branch "${UPSTREAM_BRANCH}" --single-branch \
+            "${UPSTREAM_URL}" ceph-mirror
+          git -C ceph-mirror rev-parse "${UPSTREAM_BRANCH}"
+
+      # ---------------------------------------------------------------
+      # 2. Push upstream main -> mmgaggle/ceph main. Plain (non-force)
+      # push: if upstream ever rewrites main (it does not), we want
+      # this to fail loudly rather than silently rewriting a fork
+      # contributors are rebasing onto.
+      # ---------------------------------------------------------------
+      - name: Push to ${{ env.DOWNSTREAM_REPO }} ${{ env.DOWNSTREAM_BRANCH }}
+        env:
+          MMGAGGLE_CEPH_PAT: ${{ secrets.MMGAGGLE_CEPH_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MMGAGGLE_CEPH_PAT}" ]; then
+            echo "::error::MMGAGGLE_CEPH_PAT secret is not set on this repo."
+            echo "See docs/pipelines-as-code.md for the fine-grained PAT setup."
+            exit 1
+          fi
+          git -C ceph-mirror push \
+            "https://x-access-token:${MMGAGGLE_CEPH_PAT}@github.com/${DOWNSTREAM_REPO}.git" \
+            "${UPSTREAM_BRANCH}:refs/heads/${DOWNSTREAM_BRANCH}"
+
+      # ---------------------------------------------------------------
+      # 3. Rebase ci-tekton onto the new main.
+      #
+      # Why option (b) and not (a) drift / (c) stub-only: see issue
+      # #74's "ci-tekton lifecycle problem" section. (b) is the
+      # transitional answer until #68 lands and we can collapse
+      # ci-tekton to a stub (path (c) — tracked in #75).
+      #
+      # Gated by:
+      #   - schedule run: always rebase (the cron is the whole point).
+      #   - workflow_dispatch: respect the `rebase_ci_tekton` input
+      #     so an operator can sync main without touching ci-tekton
+      #     when the rebase is known to conflict (e.g. mid-PaC
+      #     surgery on `.tekton/`).
+      #
+      # We use `--force-with-lease=<ref>:<expected-sha>` rather than
+      # plain `--force` so a concurrent ci-tekton push from a human
+      # is not clobbered — the push will fail if the remote has
+      # moved since we fetched, and a human can re-run after
+      # resolving.
+      #
+      # Rebase conflicts fail the job. Do NOT swallow them: a
+      # mangled ci-tekton would silently break every PaC PR
+      # rebasing onto it, and that's exactly the failure mode this
+      # workflow is supposed to prevent.
+      # ---------------------------------------------------------------
+      - name: Rebase ${{ env.CI_TEKTON_BRANCH }} onto new ${{ env.DOWNSTREAM_BRANCH }}
+        if: >-
+          github.event_name == 'schedule' ||
+          (github.event_name == 'workflow_dispatch' && inputs.rebase_ci_tekton)
+        env:
+          MMGAGGLE_CEPH_PAT: ${{ secrets.MMGAGGLE_CEPH_PAT }}
+        run: |
+          set -euo pipefail
+
+          # Non-bare clone here — `git rebase` needs a working tree.
+          # We fetch only the two branches we care about.
+          git clone --no-tags --branch "${CI_TEKTON_BRANCH}" \
+            "https://x-access-token:${MMGAGGLE_CEPH_PAT}@github.com/${DOWNSTREAM_REPO}.git" \
+            ceph-ci-tekton
+          cd ceph-ci-tekton
+
+          # Identity for the rebase merge commits / reflog entries
+          # only — we are not authoring new commits, just replaying
+          # ci-tekton's own commits onto the new main.
+          git config user.name  "ceph-tekton-sync-bot"
+          git config user.email "ceph-tekton-sync-bot@users.noreply.github.com"
+
+          # Pull the freshly-pushed main from the downstream remote
+          # (we just pushed it in the previous step) and record the
+          # ci-tekton tip BEFORE rebase for --force-with-lease.
+          git fetch origin "${DOWNSTREAM_BRANCH}:${DOWNSTREAM_BRANCH}"
+          OLD_CI_TEKTON_SHA="$(git rev-parse HEAD)"
+          echo "ci-tekton tip before rebase: ${OLD_CI_TEKTON_SHA}"
+
+          # Replay ci-tekton commits onto main. If a conflict comes
+          # up (most likely on .tekton/ vs an upstream tree change),
+          # abort cleanly and fail the job so a human can untangle.
+          if ! git rebase "${DOWNSTREAM_BRANCH}"; then
+            echo "::error::Rebase of ${CI_TEKTON_BRANCH} onto ${DOWNSTREAM_BRANCH} hit conflicts."
+            echo "::error::Resolve manually:"
+            echo "::error::  git fetch origin ${CI_TEKTON_BRANCH} ${DOWNSTREAM_BRANCH}"
+            echo "::error::  git checkout ${CI_TEKTON_BRANCH}"
+            echo "::error::  git rebase ${DOWNSTREAM_BRANCH}"
+            echo "::error::  git push --force-with-lease origin ${CI_TEKTON_BRANCH}"
+            git rebase --abort || true
+            exit 1
+          fi
+
+          # --force-with-lease pins the expected remote tip — if a
+          # human pushed to ci-tekton between our clone and our
+          # push, this fails rather than overwriting their work.
+          git push --force-with-lease="${CI_TEKTON_BRANCH}:${OLD_CI_TEKTON_SHA}" \
+            origin "HEAD:${CI_TEKTON_BRANCH}"
