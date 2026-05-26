@@ -224,7 +224,14 @@ decode_attestation() {
 # decode_signature NAMESPACE TASKRUN OUTFILE
 #
 # Same as decode_attestation but pulls the signature blob (which lives
-# in a sibling annotation, signature-taskrun-<uid>).
+# in a sibling annotation, signature-taskrun-<uid>), then converts it
+# from ASN.1 DER (the format Chains 0.26 emits) into raw IEEE P1363
+# (R||S, 64 bytes for P-256). cosign 2.4 `verify-blob` requires the
+# latter and rejects DER with "ecdsa: Invalid IEEE_P1363 encoded bytes";
+# downstream `cosign verify-attestation` against an OCI ref handles
+# DER natively, but the dev assert verifies bytes directly without an
+# OCI reference, so the conversion has to happen here. See the
+# follow-up issue for migrating chains-smoke off verify-blob entirely.
 decode_signature() {
   local ns="$1" tr="$2" outfile="$3"
   local ann_key
@@ -235,10 +242,39 @@ decode_signature() {
     log::fail "no chains signature annotation on ${ns}/${tr}"
     return 1
   fi
+  local der_tmp
+  der_tmp="$(mktemp)"
   kube_ctx -n "${ns}" get taskrun "${tr}" -o json \
     | jq -r --arg k "${ann_key}" '.metadata.annotations[$k]' \
-    | base64 -d > "${outfile}"
-  log::info "decoded signature to ${outfile} ($(wc -c <"${outfile}") bytes)"
+    | base64 -d > "${der_tmp}"
+  python3 - "${der_tmp}" "${outfile}" <<'PYEOF'
+import sys
+with open(sys.argv[1], "rb") as f:
+    data = f.read()
+# SEQUENCE
+assert data[0] == 0x30, "not a DER SEQUENCE"
+# Short-form length is the common case for P-256 sigs; long-form is
+# handled defensively in case a larger curve sneaks in.
+if data[1] & 0x80:
+    pos = 2 + (data[1] & 0x7f)
+else:
+    pos = 2
+# INTEGER R
+assert data[pos] == 0x02, "expected INTEGER for R"
+r_len = data[pos + 1]
+r = int.from_bytes(data[pos + 2 : pos + 2 + r_len], "big")
+pos += 2 + r_len
+# INTEGER S
+assert data[pos] == 0x02, "expected INTEGER for S"
+s_len = data[pos + 1]
+s = int.from_bytes(data[pos + 2 : pos + 2 + s_len], "big")
+# P-256: each scalar fits in 32 bytes. P-384/P-521 would need 48/66;
+# the assert target here is the dev P-256 cosign.key only.
+with open(sys.argv[2], "wb") as f:
+    f.write(r.to_bytes(32, "big") + s.to_bytes(32, "big"))
+PYEOF
+  rm -f "${der_tmp}"
+  log::info "decoded signature to ${outfile} ($(wc -c <"${outfile}") bytes, DER -> IEEE_P1363)"
 }
 
 # fetch_cosign_pub OUTFILE
