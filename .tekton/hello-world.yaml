@@ -1,26 +1,22 @@
-# hello-world PaC entry — exercises the existing `pipelines/hello-world.yaml`
-# Pipeline + Task via PaC's remote-resolution annotations.
+# hello-world PaC entry — second smoke beyond noop-pull-request.
 #
-# Purpose vs noop-pull-request: noop has its taskSpec inlined in the
-# `.tekton/` file itself. This template proves PaC can resolve a
-# Pipeline + Task pair that lives in the repo's `pipelines/` catalog,
-# which is the pattern the rest of the smoke pipelines (chains-smoke,
-# vault-smoke, etc.) will follow as we layer them onto PaC.
+# Shape: self-contained pipelineSpec with an inline taskSpec, same
+# pattern as noop. We attempted remote-resolution against
+# `pipelines/hello-world.yaml` first, but PaC's
+# `pipelinesascode.tekton.dev/pipeline:` annotation expects the URI
+# to contain exactly one Pipeline document; our existing
+# `pipelines/hello-world.yaml` is multi-doc (Task + Pipeline) and
+# PaC's reader takes the first doc unconditionally and bails on
+# kind mismatch. Splitting into `pipelines/tasks/hello.yaml` +
+# `pipelines/pipelines/hello-world.yaml` is the cleaner long-term
+# answer; for the first PaC bring-up that's a refactor we'd rather
+# defer.
 #
-# Resolution semantics:
-#   pipelinesascode.tekton.dev/pipeline: "pipelines/hello-world.yaml"
-#     PaC fetches this file from the PR's source ref and loads every
-#     Tekton resource defined in it (here: a `Task` named `hello` and a
-#     `Pipeline` named `hello-world`). The `pipelineRef` below then
-#     resolves by name against the loaded set.
-#
-# Why this is a meaningful second smoke beyond noop:
-#   - exercises remote-resolution (file path -> loaded resources)
-#   - exercises pipelineRef + Pipeline + Task indirection (vs inline)
-#   - exercises pipeline `params` substitution (the `who` param)
-#   - the assertion harness `hack/e2e/assert-hello-world.sh` already
-#     pins the expected log substring, so we can later wire this PaC
-#     PipelineRun into a parity check against the GH-Actions e2e run.
+# Vs noop-pull-request: this template exercises one more level of
+# Tekton structure — pipelineSpec + tasks[].taskSpec rather than
+# just a single task block — plus a Pipeline-level `params` block
+# substituted into the Task. That's the same shape every smoke-test
+# PipelineRun we author in `.tekton/` next will use.
 apiVersion: tekton.dev/v1
 kind: PipelineRun
 metadata:
@@ -29,10 +25,26 @@ metadata:
     pipelinesascode.tekton.dev/on-event: "[pull_request]"
     pipelinesascode.tekton.dev/on-target-branch: "[**]"
     pipelinesascode.tekton.dev/max-keep-runs: "5"
-    pipelinesascode.tekton.dev/pipeline: "pipelines/hello-world.yaml"
 spec:
   params:
     - name: who
       value: ceph
-  pipelineRef:
-    name: hello-world
+  pipelineSpec:
+    params:
+      - name: who
+        type: string
+    tasks:
+      - name: greet
+        params:
+          - name: who
+            value: $(params.who)
+        taskSpec:
+          params:
+            - name: who
+              type: string
+          steps:
+            - name: say-hello
+              image: docker.io/library/busybox:1.36
+              script: |
+                #!/bin/sh
+                echo "hello, $(params.who) — from ceph-tekton"
