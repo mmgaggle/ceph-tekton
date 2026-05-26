@@ -1,0 +1,38 @@
+# hello-world PaC entry — exercises the existing `pipelines/hello-world.yaml`
+# Pipeline + Task via PaC's remote-resolution annotations.
+#
+# Purpose vs noop-pull-request: noop has its taskSpec inlined in the
+# `.tekton/` file itself. This template proves PaC can resolve a
+# Pipeline + Task pair that lives in the repo's `pipelines/` catalog,
+# which is the pattern the rest of the smoke pipelines (chains-smoke,
+# vault-smoke, etc.) will follow as we layer them onto PaC.
+#
+# Resolution semantics:
+#   pipelinesascode.tekton.dev/pipeline: "pipelines/hello-world.yaml"
+#     PaC fetches this file from the PR's source ref and loads every
+#     Tekton resource defined in it (here: a `Task` named `hello` and a
+#     `Pipeline` named `hello-world`). The `pipelineRef` below then
+#     resolves by name against the loaded set.
+#
+# Why this is a meaningful second smoke beyond noop:
+#   - exercises remote-resolution (file path -> loaded resources)
+#   - exercises pipelineRef + Pipeline + Task indirection (vs inline)
+#   - exercises pipeline `params` substitution (the `who` param)
+#   - the assertion harness `hack/e2e/assert-hello-world.sh` already
+#     pins the expected log substring, so we can later wire this PaC
+#     PipelineRun into a parity check against the GH-Actions e2e run.
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: hello-world-
+  annotations:
+    pipelinesascode.tekton.dev/on-event: "[pull_request]"
+    pipelinesascode.tekton.dev/on-target-branch: "[**]"
+    pipelinesascode.tekton.dev/max-keep-runs: "5"
+    pipelinesascode.tekton.dev/pipeline: "pipelines/hello-world.yaml"
+spec:
+  params:
+    - name: who
+      value: ceph
+  pipelineRef:
+    name: hello-world

@@ -26,7 +26,12 @@
 #   pipelinesascode.tekton.dev/max-keep-runs    — PaC garbage-collects
 #     completed PipelineRuns above this count per (repo, template).
 #     Keeps the dev cluster tidy without hiding recent failures.
----
+#
+# YAML shape: no leading `---` directives-end marker; the file is one
+# document. A `---` between this comment block and the resource would
+# cause PaC's multi-doc reader to validate an empty leading "doc" and
+# log "Object 'Kind' is missing" before moving on to the real one. The
+# PipelineRun still runs, but the noise is avoidable.
 apiVersion: tekton.dev/v1
 kind: PipelineRun
 metadata:
