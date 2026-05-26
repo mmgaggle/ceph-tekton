@@ -325,16 +325,22 @@ rekor_search() {
   local keyfile="$1"
   local out="${E2E_ARTIFACTS}/rekor-search.txt"
   local attempt
+  # rekor-cli ≥ 1.3 switched its `search` output from integer log indexes
+  # (one numeric line per match) to a header `Found matching entries
+  # (listed by UUID):` followed by ≥40-hex-char UUIDs. Accept either form
+  # so the helper survives the format change.
   for attempt in 1 2 3; do
     log::info "rekor-cli search (attempt ${attempt}/3)"
     if rekor-cli search \
         --public-key="${keyfile}" \
         --pki-format=x509 >"${out}" 2>&1; then
-      if grep -Eq '^[0-9]+$' "${out}"; then
-        log::pass "rekor search returned $(grep -Ec '^[0-9]+$' "${out}") log index(es)"
+      local hits
+      hits=$(grep -Ec '^([0-9]+|[0-9a-f]{40,})$' "${out}" || true)
+      if [[ "${hits}" -gt 0 ]]; then
+        log::pass "rekor search returned ${hits} entry(ies)"
         return 0
       fi
-      log::warn "rekor search returned no log indexes; output:"
+      log::warn "rekor search returned no log indexes or UUIDs; output:"
       cat "${out}" >&2
     fi
     sleep $(( attempt * 5 ))
