@@ -289,10 +289,16 @@ cosign_verify_envelope() {
   # --insecure-ignore-tlog: dev Chains doesn't push to the public Rekor;
   # the rekor_search helper below verifies Rekor presence independently
   # when the cluster's transparency: rekor option is enabled.
+  # `--type slsaprovenance1` (cosign's alias for SLSA Provenance v1.0,
+  # predicateType `https://slsa.dev/provenance/v1`). The unsuffixed
+  # `slsaprovenance` alias is SLSA v0.2; passing it against a v1 payload
+  # makes cosign reject with `invalid predicate type, expected
+  # slsaprovenance got https://slsa.dev/provenance/v1`. Chains 0.26's
+  # slsa/v2alpha4 formatter emits v1, hence v1 here.
   if cosign verify-blob-attestation \
       --key "${keyfile}" \
       --signature "${envelopefile}" \
-      --type slsaprovenance \
+      --type slsaprovenance1 \
       --check-claims=false \
       --insecure-ignore-tlog \
       "${payloadfile}" >"${out}" 2>&1; then
