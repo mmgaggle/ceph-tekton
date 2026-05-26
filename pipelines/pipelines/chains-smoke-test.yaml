@@ -1,0 +1,75 @@
+# Tekton Chains smoke-test Pipeline.
+#
+# Two Tasks pipelined together:
+#
+#   1. `chains-smoke-build` — emits IMAGE_URL + IMAGE_DIGEST Results
+#      claiming a (fake, in dev) container image. This is the existing
+#      attestation-subject path.
+#
+#   2. `chains-smoke-sbom`  — runs `syft` against a real, small public
+#      image (alpine), writes an SPDX-JSON SBOM into a shared workspace,
+#      and emits the type-hinted SBOM_URL + SBOM_DIGEST + SBOM_MEDIATYPE
+#      Results. Chains 0.26.x picks those up via its Result type-hint
+#      convention and records an SPDX descriptor under
+#      predicate.buildDefinition.resolvedDependencies in the slsa/v2alpha4
+#      attestation it then signs and logs to Rekor.
+#
+# Pairs with the two Task files in pipelines/tasks/:
+#   - chains-smoke-build.yaml
+#   - chains-smoke-sbom.yaml
+# Apply the Tasks first; the Pipeline references them by name.
+#
+# Single-resource file (no leading `---`) so PaC's remote-resolution
+# (`pipelinesascode.tekton.dev/pipeline: chains-smoke-test@URL`) succeeds.
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: chains-smoke-test
+spec:
+  description: |
+    Two-Task pipeline:
+      - `build` claims an image (fake digest, dev) — gives Chains a
+        synthetic subject.
+      - `sbom`  runs syft against a real small image, writes SPDX-JSON,
+        and emits SBOM_* type-hinted Results so Chains attaches an
+        SPDX descriptor to the slsa/v2alpha4 attestation's
+        resolvedDependencies.
+    See `docs/provenance.md` ("SBOM") for the verification walkthrough.
+  params:
+    - name: image-url
+      type: string
+      default: ghcr.io/ceph/smoke-test:dev
+    - name: image-digest
+      type: string
+      default: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    - name: sbom-target-image
+      type: string
+      description: |
+        Image the `sbom` task scans. Kept separate from the build task's
+        (fake) image so the smoke test exercises a real SPDX shape
+        against a stable, tiny public base.
+      default: docker.io/library/alpine:3.19
+  workspaces:
+    - name: sbom
+      description: |
+        Shared workspace where the SBOM lives between tasks and is
+        read back during verification. emptyDir is fine for the smoke
+        test; real builds bind a PVC.
+  tasks:
+    - name: build
+      taskRef:
+        name: chains-smoke-build
+      params:
+        - name: image-url
+          value: $(params.image-url)
+        - name: image-digest
+          value: $(params.image-digest)
+    - name: sbom
+      taskRef:
+        name: chains-smoke-sbom
+      params:
+        - name: sbom-target-image
+          value: $(params.sbom-target-image)
+      workspaces:
+        - name: sbom
+          workspace: sbom

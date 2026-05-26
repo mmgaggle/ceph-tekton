@@ -227,7 +227,7 @@ to silently paper over with the default.
 
 ## Smoke test
 
-`pipelines/compute-matrix-smoke-test.yaml` exercises the Task end-to-end
+`pipelines/pipelines/compute-matrix-smoke-test.yaml` exercises the Task end-to-end
 without depending on a real source clone. Three Tasks:
 
   1. `seed`           — writes a synthetic `matrix.yaml` (3 cells, 2
@@ -247,7 +247,7 @@ off the TaskRun from the test host and re-validates the JSON shape with
 ## See also
 
 * `tasks/compute-matrix/task.yaml`   — the Task itself, with per-step rationale.
-* `pipelines/compute-matrix-smoke-test.yaml` — the smoke pipeline.
+* `pipelines/pipelines/compute-matrix-smoke-test.yaml` — the smoke pipeline.
 * `hack/e2e/assert-compute-matrix-smoke.sh`  — the e2e assertion script.
 * `docs/architecture.md` § "Build matrix"    — high-level overview.
 * `docs/builder-images.md`                   — what each `distro` slug names.

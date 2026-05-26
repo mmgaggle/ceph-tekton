@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# assert-hello-world.sh — run pipelines/hello-world.yaml, assert
+# assert-hello-world.sh — run pipelines/pipelines/hello-world.yaml, assert
 # the PipelineRun reaches Succeeded AND the TaskRun's pod logs
 # contain the expected greeting substring.
 #
@@ -25,10 +25,14 @@ EXPECTED_SUBSTRING="hello, ceph — from ceph-tekton"
 
 log::info "=== assert-hello-world ==="
 
-# Apply the pipeline + task (idempotent). The dev-test target also
-# applies it; we re-apply to make the e2e script self-contained when
-# it's invoked outside the `make` graph.
-kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/hello-world.yaml" >/dev/null
+# Apply the Task then the Pipeline (idempotent). Issue #68 split
+# `pipelines/hello-world.yaml` (Task + Pipeline) into single-resource
+# files under `pipelines/tasks/` and `pipelines/pipelines/` so PaC
+# remote-resolution works. Apply order matters: Task before Pipeline.
+# The dev-test target also applies these; we re-apply to make the
+# e2e script self-contained when it's invoked outside the `make` graph.
+kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/tasks/hello.yaml" >/dev/null
+kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/pipelines/hello-world.yaml" >/dev/null
 
 PR="$(start_pipelinerun "${NS}" hello-world --param=who=ceph)"
 log::info "started PipelineRun: ${NS}/${PR}"

@@ -104,7 +104,7 @@ need to know what the script was checking.
 
 ### `assert-hello-world.sh`
 
-- `pipelines/hello-world.yaml` PipelineRun condition `Succeeded=True`
+- `pipelines/pipelines/hello-world.yaml` PipelineRun condition `Succeeded=True`
   within `E2E_PIPELINERUN_TIMEOUT`.
 - The `greet` TaskRun's logs contain the substring
   `hello, ceph — from ceph-tekton`.
@@ -115,7 +115,7 @@ Likely causes of failure: Tekton Pipelines controller not Ready
 
 ### `assert-chains-smoke.sh`
 
-- `pipelines/chains-smoke-test.yaml` PipelineRun reaches Succeeded.
+- `pipelines/pipelines/chains-smoke-test.yaml` PipelineRun reaches Succeeded.
 - The `sbom` TaskRun gets a `chains.tekton.dev/payload-taskrun-*`
   annotation (the in-toto Statement) AND a sibling
   `chains.tekton.dev/signature-taskrun-*` annotation within ~120s of
@@ -141,7 +141,7 @@ captured artefacts).
 
 ### `assert-vault-smoke.sh`
 
-- `pipelines/vault-smoke-test.yaml` PipelineRun reaches Succeeded,
+- `pipelines/pipelines/vault-smoke-test.yaml` PipelineRun reaches Succeeded,
   scheduled in `vault-test` ns with SA `ceph-test-signer`.
 - The `sign` TaskRun's logs contain the terminal substring
   `OK: vault verified the signature`.
@@ -153,7 +153,7 @@ namespace (must be `vault-test`).
 
 ### `assert-kyverno-smoke.sh`
 
-- `pipelines/kyverno-smoke-test.yaml` PipelineRun starts.
+- `pipelines/pipelines/kyverno-smoke-test.yaml` PipelineRun starts.
 - HARD GATE: the `reject-unsigned-ceph` TaskRun reaches Succeeded AND
   its logs include a rejection message matching
   `cosign|signature|verify-ceph-image-signatures` (proves the rejection
@@ -174,7 +174,7 @@ test image used?); rejection happened but for the wrong reason
 
 ### `assert-reproducibility-smoke.sh`
 
-Runs `pipelines/reproducibility-check.yaml` twice against the
+Runs `pipelines/pipelines/reproducibility-check.yaml` twice against the
 `tasks/reproducibility-check/examples/timestamps/` example targets:
 
 - Run #1 (`make broken`): PipelineRun Succeeds with
@@ -193,7 +193,7 @@ the env-prep stanza).
 
 ### `assert-generate-sbom-smoke.sh`
 
-- `pipelines/sbom-pkg-smoke-test.yaml` PipelineRun reaches Succeeded
+- `pipelines/pipelines/sbom-pkg-smoke-test.yaml` PipelineRun reaches Succeeded
   (the pipeline's own `assert-results` Task is what verifies the
   Chains-grammar Result shapes; we re-check the file half here).
 - Each `<basename>.cdx.json` SBOM the `generate-sbom` Task wrote into
@@ -219,7 +219,7 @@ manually).
 
 ### `assert-vuln-scan-smoke.sh`
 
-- `pipelines/vuln-scan-smoke-test.yaml` PipelineRun reaches Succeeded.
+- `pipelines/pipelines/vuln-scan-smoke-test.yaml` PipelineRun reaches Succeeded.
 - The `vuln-scan` TaskRun emits the three contract Results in the
   shapes the Chains object-Result matcher and the smoke-assert Task
   recognise:

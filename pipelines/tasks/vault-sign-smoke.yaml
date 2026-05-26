@@ -1,28 +1,17 @@
-# Vault smoke-test pipeline.
+# Vault smoke-test — `vault-sign-smoke` Task.
 #
-# Proves the dev cluster's Vault install + transit engine + Kubernetes
-# auth method are wired up correctly: a pod, running as a specific
-# ServiceAccount, can authenticate to Vault using its projected SA
-# token, sign a known payload via the transit API, and read back a
-# signature.
+# Authenticates to Vault via the projected SA token (k8s auth method),
+# signs a known payload with transit/keys/ceph-test-key, asserts the
+# response contains a `vault:v<n>:<b64>` signature, then verifies it.
 #
-# Run via:
-#   ./hack/dev-vault-up.sh    # one-time bootstrap (idempotent)
-#   kubectl apply -f pipelines/vault-smoke-test.yaml
-#   tkn pipeline start vault-smoke-test \
-#     --serviceaccount ceph-test-signer \
-#     -n vault-test \
-#     --showlog
+# Pairs with pipelines/pipelines/vault-smoke-test.yaml. The Pipeline
+# MUST run in the `vault-test` namespace with the `ceph-test-signer`
+# ServiceAccount (that pair is bound to the Vault role created by
+# hack/dev-vault-up.sh). Any other pod identity is rejected at
+# `auth/kubernetes/login`.
 #
-# The pipeline MUST run in the `vault-test` namespace with the
-# `ceph-test-signer` ServiceAccount, because that (namespace, SA) pair
-# is the one bound to the Vault role created by dev-vault-up.sh. Any
-# other pod identity will be rejected by Vault at `auth/kubernetes/login`.
-#
-# This is NOT a GPG signing test — the GPG key + publish-repo
-# integration land in issue #19. This pipeline only signs with the
-# ed25519 `ceph-test-key` to prove the trust chain end-to-end.
----
+# Single-resource file (no leading `---`) so PaC's remote-resolution
+# (`pipelinesascode.tekton.dev/task: vault-sign-smoke@URL`) succeeds.
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
@@ -161,41 +150,3 @@ spec:
           exit 1
         fi
         echo "OK: vault verified the signature — smoke test passed"
----
-apiVersion: tekton.dev/v1
-kind: Pipeline
-metadata:
-  name: vault-smoke-test
-spec:
-  description: >
-    End-to-end smoke test of the Vault install: a build-pod-class
-    workload authenticates to Vault via Kubernetes auth and signs a
-    payload through the transit engine. Fails clearly if any link in
-    the chain (SA token, k8s-auth config, role binding, transit key,
-    sign capability) is broken.
-  params:
-    - name: payload
-      type: string
-      default: "hello vault"
-    - name: vault-addr
-      type: string
-      default: "http://vault.vault.svc.cluster.local:8200"
-    - name: vault-role
-      type: string
-      default: "ceph-test-signer"
-    - name: transit-key
-      type: string
-      default: "ceph-test-key"
-  tasks:
-    - name: sign
-      taskRef:
-        name: vault-sign-smoke
-      params:
-        - name: payload
-          value: $(params.payload)
-        - name: vault-addr
-          value: $(params.vault-addr)
-        - name: vault-role
-          value: $(params.vault-role)
-        - name: transit-key
-          value: $(params.transit-key)

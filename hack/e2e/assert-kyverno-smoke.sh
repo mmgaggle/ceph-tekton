@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# assert-kyverno-smoke.sh — run pipelines/kyverno-smoke-test.yaml and
+# assert-kyverno-smoke.sh — run pipelines/pipelines/kyverno-smoke-test.yaml and
 # assert both branches landed as expected (one admit + one reject with
 # the rejection mentioning cosign/signature/our policy name).
 #
@@ -52,15 +52,24 @@ if ! kube_ctx get clusterpolicy verify-ceph-image-signatures-dev >/dev/null 2>&1
   exit 1
 fi
 
-# Apply the pipeline (which creates the kyverno-smoke namespace + SA).
+# Apply the setup (Namespace + RBAC), then the Task, then the Pipeline
+# (idempotent). Issue #68 split `pipelines/kyverno-smoke-test.yaml`
+# into single-resource files (RBAC at pipelines/setup/, Task at
+# pipelines/tasks/, Pipeline at pipelines/pipelines/) so PaC
+# remote-resolution works on the Task + Pipeline halves. The RBAC
+# stays multi-doc because Namespace/SA/Role/RoleBinding aren't
+# PaC-resolvable resources.
+#
 # `-n "${NS}"` is required for the Task and Pipeline resources, which
 # don't pin a namespace in the manifest; without it they land in the
 # kubectl context's current namespace (default) while `tkn pipeline
 # start` below looks in `${NS}` (kyverno-smoke) and fails with
-# "Pipeline name kyverno-smoke-test does not exist". The Namespace +
-# SA + Role + RoleBinding already pin `kyverno-smoke` in their
-# metadata so the `-n` here is a no-op for them.
-kube_ctx -n "${NS}" apply -f "${E2E_REPO_ROOT}/pipelines/kyverno-smoke-test.yaml" >/dev/null
+# "Pipeline name kyverno-smoke-test does not exist". The RBAC file
+# already pins `kyverno-smoke` in its metadata so the `-n` is a no-op
+# there.
+kube_ctx          apply -f "${E2E_REPO_ROOT}/pipelines/setup/kyverno-smoke-rbac.yaml"   >/dev/null
+kube_ctx -n "${NS}" apply -f "${E2E_REPO_ROOT}/pipelines/tasks/try-pod-admit.yaml"      >/dev/null
+kube_ctx -n "${NS}" apply -f "${E2E_REPO_ROOT}/pipelines/pipelines/kyverno-smoke-test.yaml" >/dev/null
 
 # The pipeline itself decides pass/fail in the try-pod-admit Task.
 # If E2E_KYVERNO_STRICT_ADMIT=false we let the admit-signed-ceph half

@@ -162,7 +162,7 @@ the smoke-test pipeline.
 make dev-test
 ```
 
-Applies `pipelines/hello-world.yaml` (a single-Task `hello-world` Pipeline)
+Applies `pipelines/tasks/hello.yaml` + `pipelines/pipelines/hello-world.yaml` (a single-Task `hello-world` Pipeline)
 and starts it. `tkn` streams the TaskRun logs until completion. You should
 see:
 
@@ -236,7 +236,7 @@ Three-bullet summary:
   via `kustomize/base/tekton-chains/`, generates a cosign keypair into
   `tekton-chains/signing-secrets` (with `COSIGN_PASSWORD=""` — dev only),
   and restarts the Chains controller to pick up the key.
-- Smoke test: `kubectl apply -f pipelines/chains-smoke-test.yaml &&
+- Smoke test: `kubectl apply -f pipelines/tasks/chains-smoke-build.yaml -f pipelines/tasks/chains-smoke-sbom.yaml -f pipelines/pipelines/chains-smoke-test.yaml &&
   tkn pipeline start chains-smoke-test --workspace name=sbom,emptyDir="" --showlog`
   builds a fake subject, runs syft for an SBOM byproduct, and Chains
   signs the resulting SLSA v1 attestation to public Rekor.
@@ -260,7 +260,7 @@ Three-bullet summary:
   storage in RAM), enables the transit secrets engine, creates an
   ed25519 key `ceph-test-key`, and wires Kubernetes auth so the
   `vault-test/ceph-test-signer` ServiceAccount can sign through it.
-- Smoke test: `kubectl apply -f pipelines/vault-smoke-test.yaml &&
+- Smoke test: `kubectl -n vault-test apply -f pipelines/tasks/vault-sign-smoke.yaml -f pipelines/pipelines/vault-smoke-test.yaml &&
   tkn pipeline start vault-smoke-test --serviceaccount ceph-test-signer
   -n vault-test --showlog` — a pod authenticates with its projected SA
   token, signs a known payload via `transit/sign/ceph-test-key`, and
@@ -286,7 +286,7 @@ Three-bullet summary:
   the `verify-ceph-image-signatures-dev` ClusterPolicy, which requires
   every Pod with a `quay.io/ceph/*` image to carry a valid cosign
   signature from that same Chains key.
-- Smoke test: `kubectl apply -f pipelines/kyverno-smoke-test.yaml &&
+- Smoke test: `kubectl apply -f pipelines/setup/kyverno-smoke-rbac.yaml -f pipelines/tasks/try-pod-admit.yaml -f pipelines/pipelines/kyverno-smoke-test.yaml &&
   tkn pipeline start kyverno-smoke-test --showlog` — one TaskRun pulls
   a signed image (admit expected), another pulls an unsigned image
   (reject expected). Confirm with `kubectl get policyreport -A`.
@@ -428,13 +428,13 @@ For the full PaC-driven loop (a personal fork of `ceph/ceph` whose
 
 | Pipeline | What it exercises | Doc |
 |---|---|---|
-| `pipelines/hello-world.yaml` | Tekton Pipelines baseline | this doc |
+| `pipelines/pipelines/hello-world.yaml` | Tekton Pipelines baseline | this doc |
 | `pipelines/noop-pull-request.yaml` | Pipelines-as-Code resolution + run | [`pipelines-as-code.md`](pipelines-as-code.md) |
-| `pipelines/chains-smoke-test.yaml` | Chains signing + Rekor + SBOM byproduct | [`provenance.md`](provenance.md) |
-| `pipelines/vault-smoke-test.yaml` | Vault transit signing via k8s auth | [`vault.md`](vault.md) |
-| `pipelines/kyverno-smoke-test.yaml` | Signed-image admit, unsigned-image reject | [`deploy-verification.md`](deploy-verification.md) |
-| `pipelines/reproducibility-check.yaml` | SOURCE_DATE_EPOCH + diffoscope, % match metric | [`reproducibility.md`](reproducibility.md) |
-| `pipelines/sbom-pkg-smoke-test.yaml` | Per-package CycloneDX SBOM generation | [`provenance.md`](provenance.md) |
+| `pipelines/pipelines/chains-smoke-test.yaml` | Chains signing + Rekor + SBOM byproduct | [`provenance.md`](provenance.md) |
+| `pipelines/pipelines/vault-smoke-test.yaml` | Vault transit signing via k8s auth | [`vault.md`](vault.md) |
+| `pipelines/pipelines/kyverno-smoke-test.yaml` | Signed-image admit, unsigned-image reject | [`deploy-verification.md`](deploy-verification.md) |
+| `pipelines/pipelines/reproducibility-check.yaml` | SOURCE_DATE_EPOCH + diffoscope, % match metric | [`reproducibility.md`](reproducibility.md) |
+| `pipelines/pipelines/sbom-pkg-smoke-test.yaml` | Per-package CycloneDX SBOM generation | [`provenance.md`](provenance.md) |
 
 ### Per-component docs
 

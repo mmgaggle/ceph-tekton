@@ -376,7 +376,7 @@ verifiers identify "this is Grype output" by the URI suffix
 
 ### Smoke pipeline
 
-`pipelines/vuln-scan-smoke-test.yaml` exercises the consumer Task
+`pipelines/pipelines/vuln-scan-smoke-test.yaml` exercises the consumer Task
 against a deterministic CycloneDX SBOM that declares
 `log4j-core@2.14.1` (Log4Shell, CVE-2021-44228). The pipeline:
 

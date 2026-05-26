@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# assert-vault-smoke.sh — run pipelines/vault-smoke-test.yaml and
+# assert-vault-smoke.sh — run pipelines/pipelines/vault-smoke-test.yaml and
 # assert the terminal "OK: vault verified the signature — smoke test
 # passed" log line appears.
 #
@@ -45,12 +45,19 @@ if ! kube_ctx -n vault get pod vault-0 >/dev/null 2>&1; then
   exit 1
 fi
 
-# Apply the pipeline (idempotent). `-n "${NS}"` is required because
-# the manifest doesn't pin a namespace; without it the Pipeline lands
-# in the kubectl context's current namespace (usually `default`) while
-# `tkn pipeline start` below looks in `${NS}` (vault-test) and fails
-# with "Pipeline name vault-smoke-test does not exist".
-kube_ctx -n "${NS}" apply -f "${E2E_REPO_ROOT}/pipelines/vault-smoke-test.yaml" >/dev/null
+# Apply the Task then the Pipeline (idempotent). Issue #68 split
+# `pipelines/vault-smoke-test.yaml` (Task + Pipeline) into
+# single-resource files under `pipelines/tasks/` and
+# `pipelines/pipelines/` so PaC remote-resolution works. Apply order
+# matters: Task before Pipeline.
+#
+# `-n "${NS}"` is required because the manifests don't pin a namespace;
+# without it the Task + Pipeline land in the kubectl context's current
+# namespace (usually `default`) while `tkn pipeline start` below looks
+# in `${NS}` (vault-test) and fails with "Pipeline name vault-smoke-test
+# does not exist".
+kube_ctx -n "${NS}" apply -f "${E2E_REPO_ROOT}/pipelines/tasks/vault-sign-smoke.yaml" >/dev/null
+kube_ctx -n "${NS}" apply -f "${E2E_REPO_ROOT}/pipelines/pipelines/vault-smoke-test.yaml" >/dev/null
 
 PR="$(start_pipelinerun "${NS}" vault-smoke-test --serviceaccount="${SA}")"
 log::info "started PipelineRun: ${NS}/${PR}"

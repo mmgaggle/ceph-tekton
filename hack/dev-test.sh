@@ -10,8 +10,10 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 kubectl config use-context "kind-$CLUSTER" >/dev/null
 
-echo "applying $REPO_ROOT/pipelines/hello-world.yaml..."
-kubectl apply -f "$REPO_ROOT/pipelines/hello-world.yaml"
+echo "applying $REPO_ROOT/pipelines/tasks/hello.yaml..."
+kubectl apply -f "$REPO_ROOT/pipelines/tasks/hello.yaml"
+echo "applying $REPO_ROOT/pipelines/pipelines/hello-world.yaml..."
+kubectl apply -f "$REPO_ROOT/pipelines/pipelines/hello-world.yaml"
 
 echo "starting hello-world pipeline..."
 tkn pipeline start hello-world \

@@ -63,7 +63,9 @@ Tekton Chains is configured.
   rekor:     https://rekor.sigstore.dev (public-good)
 
 next:
-  kubectl apply -f $REPO_ROOT/pipelines/chains-smoke-test.yaml
+  kubectl apply -f $REPO_ROOT/pipelines/tasks/chains-smoke-build.yaml
+  kubectl apply -f $REPO_ROOT/pipelines/tasks/chains-smoke-sbom.yaml
+  kubectl apply -f $REPO_ROOT/pipelines/pipelines/chains-smoke-test.yaml
   tkn pipeline start chains-smoke-test --showlog
   # then verify per docs/provenance.md
 

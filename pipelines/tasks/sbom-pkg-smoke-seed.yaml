@@ -1,0 +1,68 @@
+# sbom-pkg-smoke-test — `sbom-pkg-smoke-seed` Task.
+#
+# Stages two deterministic synthetic "package" tarballs into the shared
+# artifacts workspace, so `generate-sbom` has something to scan. Uses
+# the same deterministic-tar flags as the reproducibility-check smoke
+# pipeline (sort=name, mtime=@SOURCE_DATE_EPOCH, owner=0, numeric-owner).
+#
+# Pairs with pipelines/pipelines/sbom-pkg-smoke-test.yaml.
+#
+# Single-resource file (no leading `---`) so PaC's remote-resolution
+# (`pipelinesascode.tekton.dev/task: sbom-pkg-smoke-seed@URL`) succeeds.
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: sbom-pkg-smoke-seed
+spec:
+  description: |
+    Stage two deterministic synthetic "package" tarballs into the
+    shared artifacts workspace, so `generate-sbom` has something to
+    scan. Uses the same deterministic-tar flags as the
+    reproducibility-check smoke pipeline.
+  params:
+    - name: seed-image
+      type: string
+      default: docker.io/library/debian:bookworm-slim
+      description: |
+        Image with GNU tar (for --mtime / --sort) + coreutils.
+        Pin matches reproducibility-check.yaml so we don't pull a
+        second base layer on the same dev cluster.
+  workspaces:
+    - name: artifacts
+      mountPath: /workspace/artifacts
+  steps:
+    - name: seed
+      image: $(params.seed-image)
+      workingDir: /workspace/artifacts
+      script: |
+        #!/bin/sh
+        set -eu
+        # Fixed SOURCE_DATE_EPOCH so the tarball bytes are byte-identical
+        # across smoke runs. 1700000000 = 2023-11-14T22:13:20Z, picked
+        # purely for being a stable round number after the unix epoch.
+        export SOURCE_DATE_EPOCH=1700000000
+        export LC_ALL=C
+        export TZ=UTC
+        umask 022
+
+        mkdir -p src-a/usr/share/doc/fake-pkg-a
+        echo "fake package A v1.0"      > src-a/usr/share/doc/fake-pkg-a/README
+        echo "0123456789abcdef"         > src-a/usr/share/doc/fake-pkg-a/checksum
+        mkdir -p src-b/usr/share/doc/fake-pkg-b
+        echo "fake package B v1.0"      > src-b/usr/share/doc/fake-pkg-b/README
+        echo "fedcba9876543210"         > src-b/usr/share/doc/fake-pkg-b/checksum
+
+        for pkg in a b; do
+          tar cf "fake-pkg-${pkg}_1.0.tar" \
+            --mtime=@${SOURCE_DATE_EPOCH} \
+            --sort=name \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -C "src-${pkg}" .
+        done
+
+        rm -rf src-a src-b
+
+        echo "[seed] staged artifacts:"
+        ls -la /workspace/artifacts

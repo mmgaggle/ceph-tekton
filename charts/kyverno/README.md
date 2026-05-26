@@ -21,7 +21,7 @@ kyverno/kyverno   chart 3.3.7   (Kyverno v1.13.4 appVersion)
 
 The pin lives in `hack/dev-kyverno-up.sh` as `KYVERNO_CHART_VERSION`.
 Bump it in a PR after testing the new chart against the smoke-test
-pipeline (`pipelines/kyverno-smoke-test.yaml`).
+pipeline (`pipelines/pipelines/kyverno-smoke-test.yaml`).
 
 The Kyverno API surface this code consumes — `ClusterPolicy` with a
 `verifyImages` rule and `attestors.entries.keys` / `.keyless` — is
@@ -67,8 +67,11 @@ kubectl -n kyverno wait --for=condition=ready pod \
 # Apply the ClusterPolicies the dev cluster should enforce.
 kubectl apply -k kustomize/base/kyverno-policies/
 
-# Run the smoke test.
-kubectl apply -f pipelines/kyverno-smoke-test.yaml
+# Run the smoke test. Issue #68 split the smoke pipeline into
+# single-resource files; apply the setup, Task, then Pipeline.
+kubectl apply -f pipelines/setup/kyverno-smoke-rbac.yaml
+kubectl apply -f pipelines/tasks/try-pod-admit.yaml
+kubectl apply -f pipelines/pipelines/kyverno-smoke-test.yaml
 tkn pipeline start kyverno-smoke-test --showlog
 ```
 

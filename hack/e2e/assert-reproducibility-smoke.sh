@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# assert-reproducibility-smoke.sh — run pipelines/reproducibility-check.yaml
+# assert-reproducibility-smoke.sh — run pipelines/pipelines/reproducibility-check.yaml
 # against the timestamps `broken` AND `fixed` example targets and assert:
 #
 #   - broken: pct_match < 100   (the __DATE__/__TIME__ macros embed wall
@@ -15,7 +15,7 @@
 #
 # Prereqs:
 #   - tasks/reproducibility-check/task.yaml installed.
-#   - pipelines/reproducibility-check.yaml installed.
+#   - pipelines/pipelines/reproducibility-check.yaml installed.
 #   - The `gcc:13-bookworm` builder image is reachable (Docker Hub).
 #
 # Notes on cost: each PipelineRun does two clones + two compile-and-link
@@ -48,9 +48,14 @@ require_cmd kubectl "brew install kubectl"
 require_cmd tkn     "brew install tektoncd-cli"
 require_cmd jq      "brew install jq"
 
-# Apply the task + pipeline.
-kube_ctx apply -f "${E2E_REPO_ROOT}/tasks/reproducibility-check/task.yaml" >/dev/null
-kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/reproducibility-check.yaml" >/dev/null
+# Apply the canonical reproducibility-check Task, then the Pipeline.
+# Issue #68 moved the Pipeline from `pipelines/reproducibility-check.yaml`
+# to `pipelines/pipelines/reproducibility-check.yaml` for consistency
+# with the new single-resource-per-file layout (the Pipeline was already
+# single-doc; the Task always lived under tasks/). Apply order matters:
+# Task before Pipeline.
+kube_ctx apply -f "${E2E_REPO_ROOT}/tasks/reproducibility-check/task.yaml"      >/dev/null
+kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/pipelines/reproducibility-check.yaml" >/dev/null
 
 # ---- run #1: broken ---------------------------------------------------
 log::info "--- broken target (expect pct_match < 100) ---"
