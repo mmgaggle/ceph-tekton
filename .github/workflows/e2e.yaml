@@ -111,9 +111,9 @@ jobs:
       - name: Set up kubectl ${{ env.KUBECTL_VERSION }}
         run: |
           set -euo pipefail
-          curl -fsSLo /usr/local/bin/kubectl \
+          curl -fsSLo /tmp/kubectl \
             "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
-          chmod +x /usr/local/bin/kubectl
+          install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
           kubectl version --client
 
       - name: Set up helm ${{ env.HELM_VERSION }}
@@ -141,9 +141,9 @@ jobs:
       - name: Set up rekor-cli ${{ env.REKOR_CLI_VERSION }}
         run: |
           set -euo pipefail
-          curl -fsSLo /usr/local/bin/rekor-cli \
+          curl -fsSLo /tmp/rekor-cli \
             "https://github.com/sigstore/rekor/releases/download/${REKOR_CLI_VERSION}/rekor-cli-linux-amd64"
-          chmod +x /usr/local/bin/rekor-cli
+          install -m 0755 /tmp/rekor-cli /usr/local/bin/rekor-cli
           rekor-cli version || rekor-cli --version || true
 
       - name: Set up syft ${{ env.SYFT_VERSION }}
@@ -156,9 +156,9 @@ jobs:
       - name: Set up kind ${{ env.KIND_VERSION }}
         run: |
           set -euo pipefail
-          curl -fsSLo /usr/local/bin/kind \
+          curl -fsSLo /tmp/kind \
             "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
-          chmod +x /usr/local/bin/kind
+          install -m 0755 /tmp/kind /usr/local/bin/kind
           kind version
 
       - name: Show jq version
