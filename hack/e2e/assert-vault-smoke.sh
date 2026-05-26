@@ -45,8 +45,12 @@ if ! kube_ctx -n vault get pod vault-0 >/dev/null 2>&1; then
   exit 1
 fi
 
-# Apply the pipeline (idempotent).
-kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/vault-smoke-test.yaml" >/dev/null
+# Apply the pipeline (idempotent). `-n "${NS}"` is required because
+# the manifest doesn't pin a namespace; without it the Pipeline lands
+# in the kubectl context's current namespace (usually `default`) while
+# `tkn pipeline start` below looks in `${NS}` (vault-test) and fails
+# with "Pipeline name vault-smoke-test does not exist".
+kube_ctx -n "${NS}" apply -f "${E2E_REPO_ROOT}/pipelines/vault-smoke-test.yaml" >/dev/null
 
 PR="$(start_pipelinerun "${NS}" vault-smoke-test --serviceaccount="${SA}")"
 log::info "started PipelineRun: ${NS}/${PR}"
