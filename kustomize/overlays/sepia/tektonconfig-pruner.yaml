@@ -1,0 +1,98 @@
+# TektonConfig — pruner configuration for Sepia.
+#
+# Closes mmgaggle/ceph-tekton#60.
+#
+# WHY THIS FILE NOW EXISTS
+# ------------------------
+# Before this commit, ceph-tekton did not manage a TektonConfig
+# object at all. The dev overlays (dev-local, dev-kind) install
+# Tekton Pipelines directly via `release.yaml` from the
+# tekton-releases bucket — there is no tektoncd-operator in the
+# loop, so there is no TektonConfig to patch.
+#
+# Sepia is different: Sepia is OpenShift, and OpenShift Pipelines
+# ships the operator as the supported install path. The operator
+# owns a singleton `TektonConfig` named `config` (cluster-scoped)
+# that drives every Tekton component (pipelines, triggers, chains,
+# pac) AND the pruner CronJob the operator creates for us.
+#
+# We are therefore taking ownership of the `config` TektonConfig
+# starting with this manifest. Today it only carries the pruner
+# block (the focused scope of issue #60). Future PRs will move
+# the chains-config overrides and any other operator-driven
+# settings into this same object — see the comment in
+# kustomize/overlays/sepia/kustomization.yaml about where
+# follow-up patches land.
+#
+# SCHEMA SOURCE
+# -------------
+# Field names below come from the upstream tektoncd/operator API
+# (`TektonConfig.spec.pruner`) which is the same API the OpenShift
+# Pipelines operator exposes. See:
+#   - OpenShift Pipelines 1.12 docs (Automatic pruning of
+#     TaskRun/PipelineRun) — linked in issue #60.
+#   - Upstream operator API:
+#     https://github.com/tektoncd/operator/blob/main/pkg/apis/operator/v1alpha1/tektonconfig_types.go
+#
+# Fields used:
+#   spec.pruner.disabled  (bool)    — false enables the pruner.
+#   spec.pruner.schedule  (cron)    — CronJob schedule.
+#   spec.pruner.keep      (int)     — keep the N most-recent runs
+#                                     per (namespace, pipeline/task
+#                                     label). Count-based retention.
+#   spec.pruner.resources ([]string)— which Tekton resources the
+#                                     pruner sweeps. Allowed values
+#                                     are "pipelinerun" and "taskrun"
+#                                     in the upstream API.
+#
+# NOT used here (deliberate):
+#   spec.pruner.keep-since (int, minutes) — time-based retention.
+#     The upstream API only supports ONE retention dimension at a
+#     time per TektonConfig (keep XOR keep-since), and it does not
+#     differentiate by completion status (success vs failed). The
+#     "7 days successful / 30 days failed" framing some readers
+#     might expect is NOT expressible in this object — it would
+#     require a custom CronJob or per-namespace pruner overrides
+#     (spec.pruner.namespaces[]). Issue #60 is scoped to the
+#     simple cluster-wide knob; per-Pipeline / per-status tuning
+#     is the deliberately-deferred follow-up the issue calls out.
+#
+# RETENTION CHOICE
+# ----------------
+# `keep: 100` and `schedule: "0 */6 * * *"` come straight from
+# issue #60's "What to build" block. Rationale: every 6 hours
+# (4x the operator default of daily) keeps etcd object count
+# bounded against the per-PR validation pipelines that produce
+# the highest volume; keeping 100 per (namespace, pipeline label)
+# preserves enough recent history for an operator to triage a
+# regression without needing to fall back to Tekton Results
+# (#59, deployed) for every recent run.
+#
+# Safe to land NOW because #59 (Tekton Results on Sepia) is
+# closed — Results catches the archived PipelineRun/TaskRun data
+# before this pruner deletes the live objects, so the historical
+# context survives. Do not enable this on a cluster that does
+# not have Results catching its data first.
+apiVersion: operator.tekton.dev/v1alpha1
+kind: TektonConfig
+metadata:
+  # The OpenShift Pipelines operator reconciles a singleton named
+  # `config`; any other name is ignored. Cluster-scoped — no
+  # namespace.
+  name: config
+spec:
+  # `targetNamespace` is required by the operator. Sepia uses the
+  # default OpenShift Pipelines install namespace.
+  targetNamespace: openshift-pipelines
+  pruner:
+    disabled: false
+    # Every 6h, not the operator default of once-daily. The Red
+    # Hat "Operating Tekton at scale" post (linked in #60) calls
+    # out daily as too slow for high-cadence PR validation
+    # pipelines.
+    schedule: "0 */6 * * *"
+    # Count-based retention per (namespace, pipeline label).
+    keep: 100
+    resources:
+      - pipelinerun
+      - taskrun
