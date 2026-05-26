@@ -44,6 +44,7 @@ ASSERTIONS=(
   kyverno-smoke
   reproducibility-smoke
   generate-sbom-smoke
+  vuln-scan-smoke
 )
 
 SKIP="${E2E_SKIP:-}"

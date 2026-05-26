@@ -217,6 +217,44 @@ for `Pending` events on the PVC); syft format-detection broke (the
 SBOM bytes won't round-trip — capture the file and run `syft scan`
 manually).
 
+### `assert-vuln-scan-smoke.sh`
+
+- `pipelines/vuln-scan-smoke-test.yaml` PipelineRun reaches Succeeded.
+- The `vuln-scan` TaskRun emits the three contract Results in the
+  shapes the Chains object-Result matcher and the smoke-assert Task
+  recognise:
+  - `vuln-summary` carries all six severity tokens with `critical >= 1`
+    (Log4Shell on log4j-core 2.14.1).
+  - `findings-count` parses as a positive integer.
+  - `findings-ARTIFACT_OUTPUTS` is a `{uri, digest, isBuildArtifact}`
+    object with `isBuildArtifact == "false"`.
+
+To exercise the real producer/consumer flow without depending on
+`artifacts.ceph.com` reachability from kind, the script stands up a
+tiny in-cluster `vuln-scan-test-db` Pod (busybox httpd) and seeds it
+locally on the test host: `grype db update`, `tar | zstd`,
+`cosign sign-blob`, then `kubectl cp` the four resulting files into
+the Pod's emptyDir. The smoke pipeline gets `db-pointer-url` pointed
+at the Pod's Service. This deliberately mirrors what
+`build-grype-db` Pipeline does in production — same on-the-wire
+shape, same cosign-verify gate — minus the heavy `vunnel run` +
+`grype-db build` (which need API keys + hours; covered by the
+production producer, not the smoke).
+
+**Tooling cost vs other asserts:** this is the heaviest assert in
+the suite. Running `grype db update` pulls ~190 MB; the local
+producer prep adds ~30 s wall time before the PipelineRun starts.
+Local re-runs reuse the same `~/.cache/grype/db/6/` so the second
+run is fast. Required tools on the test host: `grype`, `cosign`,
+`zstd` (in addition to the kubectl/tkn/jq the other asserts
+require).
+
+Likely causes of failure: the test-db Pod's `kubectl cp` timing out
+(retry with a longer `wait --for=condition=Ready` budget); cosign
+signature shape changed (re-pin `cosign verify-blob` step image);
+grype DB schema bumped (`SCHEMA=7 ./assert-vuln-scan-smoke.sh` to
+test the schema-version-scoped path).
+
 ## Failure artefact bundle
 
 On any assertion failure the workflow uploads a directory containing:

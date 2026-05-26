@@ -1,0 +1,787 @@
+# build-grype-db — produce + sign + publish a Grype vulnerability DB snapshot.
+#
+# Tekton-ification of hack/grype-db/prototype.sh, with one HARD DELTA: this
+# Task does the REAL DB build (vunnel + grype-db) rather than re-fetching
+# anchore's pre-built artefact via `grype db update`. The prototype shortcut
+# was deliberately for the prototype only (see prototype.sh header §
+# "INTENTIONALLY deferred"). The producer/consumer contract — the on-disk
+# tarball layout, the cosign bundle, the `latest.json` pointer schema —
+# is unchanged from the prototype so the consumer Task (#56 vuln-scan)
+# matches.
+#
+# ARCHITECTURE
+#
+# The Task is a 6-step pipeline inside one TaskRun pod, mirroring the
+# numbered banners in prototype.sh (steps 1-6 of the producer half):
+#
+#   1. pull          → vunnel pulls upstream CVE feeds into the `state`
+#                      workspace's vunnel-cache/.
+#   2. build         → grype-db builds the SQLite DB into state/build/
+#                      with top-level `<schema>/vulnerability.db`.
+#   3. package       → tar + zstd from state/build/ into state/out/
+#                      vulnerability.db.tar.zst (top-level dir is the
+#                      schema version, matching prototype.sh L122-127).
+#   4. sign          → cosign sign-blob with the key on the cosign-key
+#                      workspace, producing the .cosign.bundle.
+#   5. publish       → aws s3 cp the tarball + bundle + public key under
+#                      grype-db/<schema>/<date>/.
+#   6. update-latest → write + PUT latest.json atomically (single PUT
+#                      against S3 is atomic; readers either see the old
+#                      object or the new one, never a partial). Emit all
+#                      Tekton Results.
+#
+# WHY MULTIPLE IMAGES IN ONE TASK (not multiple Tasks pipelined):
+# Steps share an attached workspace PVC for the multi-GB intermediate
+# state (vunnel cache, raw DB, tarball). Splitting across Tasks would
+# either require declaring the same workspace on each Task or shoving
+# the state out to S3 between stages — neither is worth the complexity
+# for a single-purpose producer. See `tasks/reproducibility-check/task.yaml`
+# for the same monolithic-Task-with-many-images pattern.
+#
+# WHY VUNNEL+GRYPE-DB INSTALLED AT RUNTIME (not baked into a custom image):
+# Bootstrapping a vunnel-baked image into the repo adds a whole new
+# OCI-build path (Dockerfile, build pipeline, registry credentials,
+# image-pinning hygiene) before we know how often vunnel itself needs
+# pinned-version bumps. Phase 1 favours runtime install — pip + a single
+# GitHub-releases curl — same posture the user's "start simple, layer
+# complexity" feedback called out. Once the cadence is understood the
+# image can be baked (issue #57's followup, not blocking #56).
+#
+# CHAINS GRAMMAR (Chains 0.26)
+# Per the commit 4bf0b80 / docs/provenance.md walk-through, Chains 0.26
+# ONLY recognizes:
+#   *IMAGE_URL / *IMAGE_DIGEST
+#   IMAGES                                  ← multi-subject
+#   *ARTIFACT_URI / *ARTIFACT_DIGEST
+#   *ARTIFACT_OUTPUTS {uri, digest, isBuildArtifact}
+# No SBOM_*, no nested `sbom` block, no mediaType inside ARTIFACT_OUTPUTS.
+# So we emit:
+#   - `IMAGES`           : "<subject-prefix>@sha256:<hex>" (single line,
+#                          but Chains' multi-subject matcher handles
+#                          one-line just as well as N-line).
+#   - `ARTIFACT_OUTPUTS` : JSON object {uri, digest, isBuildArtifact:"true"}
+#                          The DB snapshot IS a build artefact (the thing
+#                          this Pipeline produces), so isBuildArtifact is
+#                          "true" — Chains will promote it to a subject
+#                          rather than file it under runDetails.byproducts.
+#   - contract-level: db-url, db-digest, db-bundle-url, db-schema-version.
+#     These are what direct consumers (the vuln-scan Task, manual `aws s3
+#     cp` users, dashboards) read by name.
+#
+# KEYLESS-COSIGN ESCAPE HATCH
+# Phase 1 ships key-based cosign sign-blob (signing key on the cosign-key
+# workspace from a Secret). The sign step contains a `cosign-key empty`
+# branch that prepares for the future keyless-Fulcio path — when the
+# Sepia overlay drops the key Secret and instead mounts a projected SA
+# token + sets AWS_ROLE_ARN-style env, the step will run keyless. NOT
+# wired yet (no Fulcio identity policy, no Rekor verify on the consumer);
+# the branch is a clear hook only.
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: build-grype-db
+spec:
+  description: |
+    Build a Grype vulnerability DB from upstream feeds (via vunnel +
+    grype-db), tar+zstd it, cosign-sign the tarball, publish to S3
+    under the documented `grype-db/<schema>/<date>/...` layout, and
+    atomically update `grype-db/<schema>/latest.json`. Emits the
+    Chains-grammar Results (IMAGES, ARTIFACT_OUTPUTS) and the
+    contract-level pointers (db-url, db-digest, db-bundle-url,
+    db-schema-version) the vuln-scan consumer Task reads.
+  params:
+    - name: schema-version
+      type: string
+      default: "6"
+      description: |
+        Grype DB schema version. v6 is the current generation
+        (grype 0.112+, grype-db 0.53+). The schema number appears
+          - inside the tarball as the top-level directory name
+          - in the S3 key prefix as `grype-db/<schema>/...`
+          - in the latest.json `schema` field.
+        Older consumers pinned to schema 5 read a different
+        latest.json under `grype-db/5/latest.json`; the producer
+        emits one schema per Pipeline run.
+    - name: providers
+      type: array
+      default: ["nvd"]
+      description: |
+        Vunnel providers to pull and feed into grype-db. Default
+        `["nvd"]` for fast iteration (NVD-only DB builds in ~minutes
+        and needs no extra credentials). The full Anchore upstream
+        set is roughly:
+          alpine, amazon, chainguard, debian, github, mariner, nvd,
+          oracle, redhat, sles, ubuntu, wolfi
+        Pulling all of them is hours of work, some need API keys
+        (github needs GITHUB_TOKEN), and the resulting DB is ~600MB
+        zstd-compressed. The CronJob that drives this Pipeline in
+        Sepia will use the full set; PR-triggered smoke runs use
+        `["nvd"]` to keep iteration cheap.
+    - name: bucket
+      type: string
+      default: ceph-grype-db
+      description: |
+        S3 bucket to publish under. Matches the bucket name in
+        terraform/modules/s3-buckets (the `ceph-grype-db` bucket,
+        public-read, 30d lifecycle expiry, no versioning). In dev
+        the Sepia overlay would pass `vstart-ceph-grype-db` instead.
+    - name: s3-endpoint
+      type: string
+      default: ""
+      description: |
+        Optional S3 endpoint URL (for Sepia RGW or MinIO). Empty =
+        AWS S3 default. Passed as `--endpoint-url`. Same pattern as
+        the generate-sbom Task's S3 step.
+    - name: subject-prefix
+      type: string
+      default: https://artifacts.ceph.com/ceph-grype-db/
+      description: |
+        Canonical public URL prefix prepended to the published DB
+        path to form the Chains attestation subject. The Chains
+        subject IS the public URL where the DB tarball lives, so
+        verifiers fetching the attestation can independently
+        resolve the artefact. Empty would make the subject the
+        bare S3 key, which is a less-useful subject for off-cluster
+        verifiers.
+    - name: python-image
+      type: string
+      default: docker.io/library/python:3.12-slim
+      description: |
+        Image used for the `pull` step (vunnel via pip). Pinned
+        major.minor for build determinism; bumping is a deliberate
+        supply-chain decision (same posture as syft-image in
+        generate-sbom).
+    - name: vunnel-version
+      type: string
+      default: "0.31.0"
+      description: |
+        Pinned vunnel pip version. Bumping requires checking that
+        vunnel's output schema is still consumable by the pinned
+        grype-db version — vunnel's intermediate format is NOT
+        versioned, breaking changes have happened (e.g. vunnel
+        0.29 -> 0.30 NVD provider rework). Test on the EC2 build
+        host before raising the floor here.
+    - name: builder-image
+      type: string
+      default: docker.io/library/debian:bookworm-slim
+      description: |
+        Image used for the `build` step. Needs curl/tar/coreutils
+        to fetch the grype-db binary from GitHub releases and to
+        run it. Debian-slim is the same pin reproducibility-check
+        uses so the layer is already cached on dev clusters.
+    - name: grype-db-version
+      type: string
+      default: "v0.53.0"
+      description: |
+        Pinned grype-db release tag. Matches the schema-version
+        default (v0.53.x emits schema 6). Bumping needs both
+        compatibility with the pinned vunnel-version and with the
+        consumer grype binary the vuln-scan Task uses.
+    - name: tools-image
+      type: string
+      default: docker.io/library/busybox:1.36
+      description: |
+        Pinned busybox for tar/zstd, sha256sum, sed, awk. Same
+        pin as generate-sbom + chains-smoke-test. Note that busybox
+        1.36 ships zstd built in, so we don't need a separate
+        zstd-capable image for the `package` step.
+    - name: cosign-image
+      type: string
+      default: ghcr.io/sigstore/cosign/cosign:v2.4.1
+      description: |
+        Pinned cosign release image. v2.4.x deprecates the legacy
+        `--output-signature` / `--output-certificate` flags in
+        favour of the sigstore bundle format (`--bundle`) used
+        here. Same image is used in dev-chains-setup.sh.
+    - name: uploader-image
+      type: string
+      default: docker.io/amazon/aws-cli:2.17.0
+      description: |
+        Pinned AWS CLI for the `publish` + `update-latest` steps.
+        Same pin generate-sbom uses; chosen for the STS-OIDC
+        AssumeRoleWithWebIdentity path the Sepia overlay needs.
+  results:
+    # --- Chains 0.26 grammar -----------------------------------------
+    - name: IMAGES
+      type: string
+      description: |
+        `<subject-url>@sha256:<digest>` for the published DB tarball.
+        Chains 0.26 multi-subject matcher promotes this to the
+        attestation `subject[]`. Single line — the producer emits one
+        DB per Pipeline run. The URL is the canonical https path under
+        `subject-prefix`, not the s3:// URL, so verifiers can fetch
+        without S3 creds.
+    - name: ARTIFACT_OUTPUTS
+      type: string
+      description: |
+        Chains-grammar object Result. Shape:
+            {"uri":"<subject-url>","digest":"sha256:<hex>","isBuildArtifact":"true"}
+        With `isBuildArtifact:"true"` Chains promotes this to a
+        subject in the slsa/v2alpha4 attestation (vs the
+        byproducts[] placement that "false" would give). The DB
+        snapshot IS the build artefact of this Pipeline.
+    # --- Contract-level direct-consumer Results ----------------------
+    - name: db-url
+      type: string
+      description: |
+        Canonical https URL of the published DB tarball. The
+        vuln-scan consumer Task can fetch this directly (or, more
+        commonly, fetch latest.json + tarball-via-the-pointer).
+    - name: db-digest
+      type: string
+      description: |
+        sha256:<hex> of the tarball bytes. Same value that lands in
+        latest.json's `digest` field and in IMAGES / ARTIFACT_OUTPUTS.
+    - name: db-bundle-url
+      type: string
+      description: |
+        Canonical https URL of the cosign sigstore bundle for the
+        tarball. Consumer verifies with `cosign verify-blob --bundle`.
+    - name: db-schema-version
+      type: string
+      description: |
+        DB schema version (e.g. `6`). Echoed from the input param so
+        downstream consumers see the same schema number in latest.json
+        and in Tekton Results without needing to refetch the JSON.
+    - name: db-latest-url
+      type: string
+      description: |
+        Canonical https URL of the latest.json pointer for this
+        schema. Consumers HEAD/GET this to discover the current
+        published DB without a full S3 LIST.
+  workspaces:
+    - name: state
+      description: |
+        Scratch workspace for the multi-GB intermediates:
+            state/vunnel-cache/   ← `vunnel run` output (per-provider)
+            state/build/          ← grype-db build output (the SQLite DB)
+            state/out/            ← tarball + bundle + latest.json
+        Sized per-run — no cross-run reuse (see issue brief: "Don't
+        add a db-cache PVC across runs"). The CronJob's volumeClaimTemplate
+        provisions a fresh PVC each run; this Task picks it up here.
+      mountPath: /workspace/state
+    - name: cosign-key
+      description: |
+        Optional. If mounted, expected to contain `cosign.key`,
+        `cosign.pub`, and optionally `cosign.password` (one secret
+        value per file, same shape as `cosign generate-key-pair`
+        produces). For dev / Phase 1 this is a Secret-backed
+        workspace.
+
+        When NOT mounted AND env AWS_ROLE_ARN is set + a SA token
+        is projected at the standard path, the sign step is
+        expected to fall through to a future keyless-Fulcio path.
+        That path is NOT implemented yet — leaving the workspace
+        optional + the env hook in place is the structural prep
+        for issue #57's followup. Today the absent-workspace branch
+        just fails clearly so misconfigurations don't silently
+        produce unsigned artefacts.
+      optional: true
+    - name: s3-credentials
+      description: |
+        Optional. Same shape as the generate-sbom Task uses (one
+        secret value per file). In Sepia the calling Pipeline
+        leaves this empty and binds a projected SA token; the
+        upload steps mint short-lived creds via
+        `aws sts assume-role-with-web-identity`. In kind/dev with
+        no S3 (s3-endpoint empty + bucket empty would short-circuit
+        publish), the workspace is unused.
+      optional: true
+  steps:
+    # ----------------------------------------------------------------
+    # Step 1: pull — `vunnel run` per provider.
+    #
+    # python:3.12-slim is a Debian-slim base with cpython + pip.
+    # We pip-install vunnel at runtime (see file header for why) and
+    # run one `vunnel run <provider>` invocation per provider in the
+    # `providers` array.
+    #
+    # VUNNEL_CONFIG_DIR / XDG_CACHE_HOME are pointed at the workspace
+    # so the multi-GB feed cache survives the next step (grype-db
+    # `--vunnel-root` reads it back).
+    #
+    # `providers` is a Tekton array param. Tekton expands
+    # `$(params.providers[*])` into the args list with each element
+    # as a separate argument; we iterate inside the shell after the
+    # interpreter starts.
+    # ----------------------------------------------------------------
+    - name: pull
+      image: $(params.python-image)
+      workingDir: /workspace/state
+      env:
+        - name: VUNNEL_VERSION
+          value: $(params.vunnel-version)
+        - name: XDG_CACHE_HOME
+          # vunnel writes its provider feeds under XDG_CACHE_HOME/vunnel
+          # by default; pinning it inside the workspace keeps the cache
+          # on the PVC instead of the pod's writable layer.
+          value: /workspace/state/cache
+        - name: VUNNEL_CONFIG_DIR
+          value: /workspace/state/vunnel-config
+      args: ["$(params.providers[*])"]
+      script: |
+        #!/bin/sh
+        set -eu
+
+        echo "[pull] vunnel ${VUNNEL_VERSION}, providers: $*"
+        mkdir -p "${XDG_CACHE_HOME}" "${VUNNEL_CONFIG_DIR}"
+
+        # Quiet pip's "you're running pip as root in a container" warning
+        # — this IS a container by design. --no-cache-dir keeps the
+        # pod's writable layer small (the wheels are tiny vs the
+        # provider cache).
+        pip install --quiet --no-cache-dir --root-user-action ignore \
+          "vunnel==${VUNNEL_VERSION}"
+        vunnel --version
+
+        if [ "$#" -eq 0 ]; then
+          echo "[pull] FATAL: no providers passed" >&2
+          exit 1
+        fi
+
+        # One `vunnel run` per provider. Failures abort the Task —
+        # producing a DB missing one provider silently would let
+        # the consumer scan with stale data.
+        for prov in "$@"; do
+          echo
+          echo "[pull] === vunnel run ${prov} ==="
+          vunnel run "${prov}"
+        done
+
+        echo
+        echo "[pull] vunnel cache contents:"
+        du -sh "${XDG_CACHE_HOME}"/vunnel/* 2>/dev/null || ls -la "${XDG_CACHE_HOME}"
+
+    # ----------------------------------------------------------------
+    # Step 2: build — grype-db build → state/build/<schema>/vulnerability.db
+    #
+    # grype-db is a single Go static binary distributed via GitHub
+    # releases. We curl the tarball, untar, and exec the binary.
+    # SHA256 verification is left as a TODO — the issue brief is
+    # "make it work first"; pinning version + checksum is a separate
+    # supply-chain hygiene PR.
+    #
+    # `--generate-providers-from-vunnel` tells grype-db to point at
+    # the vunnel cache populated by the previous step (via the
+    # VUNNEL_ROOT env or the `--vunnel-root` flag — grype-db reads
+    # both, env wins).
+    # ----------------------------------------------------------------
+    - name: build
+      image: $(params.builder-image)
+      workingDir: /workspace/state
+      env:
+        - name: GRYPE_DB_VERSION
+          value: $(params.grype-db-version)
+        - name: SCHEMA
+          value: $(params.schema-version)
+        - name: VUNNEL_ROOT
+          # Must match the pull step's XDG_CACHE_HOME/vunnel target.
+          value: /workspace/state/cache/vunnel
+      args: ["$(params.providers[*])"]
+      script: |
+        #!/bin/sh
+        set -eu
+
+        # debian-slim doesn't ship curl by default — install just-in-time.
+        # The dpkg DB is read-only on some k8s nodes' overlayfs in dev,
+        # but `apt-get install -y --no-install-recommends curl` is a
+        # rare hot-path; if it's a problem on a specific cluster the
+        # builder-image param can be swapped for `curlimages/curl:8` +
+        # a shell variant.
+        if ! command -v curl >/dev/null 2>&1; then
+          apt-get update -qq
+          apt-get install -y --no-install-recommends -qq curl ca-certificates
+        fi
+
+        ARCH="$(uname -m)"
+        case "${ARCH}" in
+          x86_64)  GD_ARCH=amd64 ;;
+          aarch64) GD_ARCH=arm64 ;;
+          *)       echo "[build] FATAL: unsupported arch ${ARCH}" >&2; exit 1 ;;
+        esac
+
+        # GitHub-releases tarball naming: grype-db_<version-no-v>_linux_amd64.tar.gz
+        GD_VER_NOV="${GRYPE_DB_VERSION#v}"
+        GD_TAR="grype-db_${GD_VER_NOV}_linux_${GD_ARCH}.tar.gz"
+        GD_URL="https://github.com/anchore/grype-db/releases/download/${GRYPE_DB_VERSION}/${GD_TAR}"
+
+        echo "[build] fetching ${GD_URL}"
+        mkdir -p /workspace/state/bin
+        curl --silent --show-error --location --fail \
+             --output "/workspace/state/${GD_TAR}" \
+             "${GD_URL}"
+        tar -xzf "/workspace/state/${GD_TAR}" -C /workspace/state/bin
+        # TODO(#56-followup): verify upstream-published checksum here.
+        # The anchore release attaches checksums.txt — fetch + grep + sha256sum -c.
+        rm -f "/workspace/state/${GD_TAR}"
+
+        export PATH="/workspace/state/bin:${PATH}"
+        grype-db version
+
+        # Argument list (PROVIDERS) — same expansion pattern as the pull step.
+        if [ "$#" -eq 0 ]; then
+          echo "[build] FATAL: no providers passed" >&2
+          exit 1
+        fi
+
+        # grype-db wants providers as a comma-separated string for
+        # `--provider-name` on some subcommands and as repeated flags
+        # on others. The `build` subcommand reads them via
+        # `--generate-providers-from-vunnel` which scans VUNNEL_ROOT for
+        # the populated provider dirs, so we don't need to pass the
+        # list again here — but we log it for traceability.
+        echo "[build] providers from vunnel root: $*"
+
+        BUILD_DIR=/workspace/state/build
+        rm -rf "${BUILD_DIR}"
+        mkdir -p "${BUILD_DIR}"
+
+        # `grype-db build` writes <BUILD_DIR>/<schema>/vulnerability.db
+        # + <BUILD_DIR>/<schema>/import.json (build metadata).
+        grype-db build \
+          --schema "${SCHEMA}" \
+          --dir "${BUILD_DIR}" \
+          --generate-providers-from-vunnel \
+          --vunnel-root "${VUNNEL_ROOT}"
+
+        if [ ! -f "${BUILD_DIR}/${SCHEMA}/vulnerability.db" ]; then
+          echo "[build] FATAL: expected ${BUILD_DIR}/${SCHEMA}/vulnerability.db" >&2
+          ls -la "${BUILD_DIR}" >&2 || true
+          exit 1
+        fi
+        echo "[build] DB: $(du -sh "${BUILD_DIR}/${SCHEMA}/vulnerability.db" | awk '{print $1}')"
+        ls -la "${BUILD_DIR}/${SCHEMA}"
+
+    # ----------------------------------------------------------------
+    # Step 3: package — tar + zstd (busybox).
+    #
+    # Mirrors prototype.sh L120-129: tar from the parent so the
+    # archive's top-level dir is the schema version. zstd -19 is the
+    # prototype pin; -T0 lets it use all available cores.
+    # The output also writes the sha256 digest as a sidecar file the
+    # next steps read (the digest needs to flow through sign + publish
+    # + Results without re-hashing the tarball).
+    # ----------------------------------------------------------------
+    - name: package
+      image: $(params.tools-image)
+      workingDir: /workspace/state
+      env:
+        - name: SCHEMA
+          value: $(params.schema-version)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        BUILD_DIR=/workspace/state/build
+        OUT_DIR=/workspace/state/out
+        mkdir -p "${OUT_DIR}"
+
+        TARBALL="${OUT_DIR}/vulnerability.db.tar.zst"
+        # busybox tar supports --use-compress-program? On 1.36 yes via
+        # `-I`, which is the canonical short form. But to keep parity
+        # with prototype.sh and avoid the busybox quirk, we pipe.
+        tar -cf - -C "${BUILD_DIR}" "${SCHEMA}" \
+          | zstd -T0 -19 -q -o "${TARBALL}"
+
+        TARBALL_SHA="sha256:$(sha256sum "${TARBALL}" | awk '{print $1}')"
+
+        # Sidecar files the later steps read. We use plain files
+        # under state/out/ instead of step-shared env vars because
+        # Tekton steps don't share env (each step is a separate
+        # container) — files on the workspace are the cross-step
+        # carrier.
+        printf '%s' "${TARBALL_SHA}"             > "${OUT_DIR}/tarball.sha256"
+        date -u +%Y-%m-%d                        > "${OUT_DIR}/date.txt"
+
+        echo "[package] tarball:  ${TARBALL} ($(wc -c < "${TARBALL}") bytes)"
+        echo "[package] digest:   ${TARBALL_SHA}"
+        echo "[package] date-tag: $(cat "${OUT_DIR}/date.txt")"
+
+    # ----------------------------------------------------------------
+    # Step 4: sign — cosign sign-blob (key-based, sigstore bundle).
+    #
+    # The sigstore image is distroless (cosign + ca-certs only),
+    # same posture as the syft image generate-sbom uses. We use
+    # `command:` + `args:` rather than `script:` — no shell.
+    #
+    # Today the only path is key-based, with the key on the
+    # cosign-key workspace. The keyless-Fulcio path is structurally
+    # ready (cosign-key workspace is optional) but the cosign-key
+    # ABSENT branch isn't wired here — see file header
+    # "KEYLESS-COSIGN ESCAPE HATCH". The pre-step shell below
+    # asserts the workspace is present and fails clearly if not.
+    # ----------------------------------------------------------------
+    - name: sign-precheck
+      image: $(params.tools-image)
+      script: |
+        #!/bin/sh
+        set -eu
+        KEY_DIR="$(workspaces.cosign-key.path)"
+        if [ ! -d "${KEY_DIR}" ] || [ ! -f "${KEY_DIR}/cosign.key" ]; then
+          # TODO(#57-followup): implement keyless-Fulcio path here.
+          # Detect AWS_ROLE_ARN + projected SA token; if present, set
+          # COSIGN_EXPERIMENTAL=1 and skip the --key arg in the sign
+          # step. For now, key-based is the only supported path and
+          # missing key is a fatal misconfiguration.
+          echo "[sign-precheck] FATAL: cosign-key workspace not mounted or missing cosign.key" >&2
+          echo "[sign-precheck]        Mount a Secret with cosign.key + cosign.pub" >&2
+          echo "[sign-precheck]        (keyless-Fulcio path not yet implemented)" >&2
+          exit 1
+        fi
+        # Copy the pubkey into the output dir so the publish step
+        # uploads it alongside the tarball + bundle. We don't copy
+        # the private key anywhere — it stays projected on the
+        # cosign-key workspace only.
+        cp "${KEY_DIR}/cosign.pub" /workspace/state/out/cosign.pub
+        echo "[sign-precheck] cosign.pub staged for publish"
+    - name: sign
+      image: $(params.cosign-image)
+      env:
+        # cosign reads the key password from this env var. The
+        # cosign-key Secret may include a `cosign.password` file
+        # (set by `cosign generate-key-pair` interactively) OR be
+        # passwordless (COSIGN_PASSWORD=""). We read the password
+        # from the workspace if the file exists, else default to
+        # empty string in the sign-pwprep shell step above.
+        - name: COSIGN_PASSWORD
+          value: ""
+        - name: COSIGN_YES
+          # `--yes` skips the interactive Rekor-upload prompt; needed
+          # for non-interactive Tekton step execution.
+          value: "true"
+      # cosign distroless image has no /bin/sh. We invoke the cosign
+      # binary directly via command/args. The Tekton variable
+      # substitutions resolve before the container starts, so the
+      # workspace path expansion is fine here.
+      command: ["cosign"]
+      args:
+        - sign-blob
+        - --key
+        - $(workspaces.cosign-key.path)/cosign.key
+        - --bundle
+        - /workspace/state/out/vulnerability.db.tar.zst.cosign.bundle
+        - --yes
+        - /workspace/state/out/vulnerability.db.tar.zst
+
+    # ----------------------------------------------------------------
+    # Step 5: publish — aws s3 cp tarball + bundle + pubkey.
+    #
+    # Credentials precedence matches generate-sbom:
+    #   1. s3-credentials workspace files (dev / smoke).
+    #   2. STS AssumeRoleWithWebIdentity via projected SA token
+    #      (Sepia production overlay).
+    #
+    # The bucket lifecycle (terraform) handles old-snapshot expiry —
+    # this step does no cleanup. Each run lands under a fresh
+    # `grype-db/<schema>/<date>/` prefix, so re-running on the same
+    # date overwrites that day's snapshot (idempotent by design).
+    # ----------------------------------------------------------------
+    - name: publish
+      image: $(params.uploader-image)
+      workingDir: /workspace/state/out
+      env:
+        - name: BUCKET
+          value: $(params.bucket)
+        - name: S3_ENDPOINT
+          value: $(params.s3-endpoint)
+        - name: SCHEMA
+          value: $(params.schema-version)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        if [ -z "${BUCKET}" ]; then
+          echo "[publish] bucket empty; refusing to publish (no destination)" >&2
+          exit 1
+        fi
+
+        # Load static creds from the workspace if present.
+        CRED_DIR="$(workspaces.s3-credentials.path)"
+        if [ -d "${CRED_DIR}" ]; then
+          for k in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN; do
+            if [ -f "${CRED_DIR}/${k}" ]; then
+              export "${k}=$(cat "${CRED_DIR}/${k}")"
+            fi
+          done
+        fi
+
+        # STS-OIDC fallback (Sepia production path) — same logic as
+        # generate-sbom's upload step.
+        SA_TOKEN_FILE="${AWS_WEB_IDENTITY_TOKEN_FILE:-/var/run/secrets/openshift/serviceaccount/token}"
+        if [ -z "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_ROLE_ARN:-}" ] && [ -f "${SA_TOKEN_FILE}" ]; then
+          echo "[publish] minting STS creds via AssumeRoleWithWebIdentity (role=${AWS_ROLE_ARN})"
+          ENDPOINT_ARG=""
+          [ -n "${S3_ENDPOINT}" ] && ENDPOINT_ARG="--endpoint-url ${S3_ENDPOINT}"
+          # shellcheck disable=SC2086
+          CREDS_JSON=$(aws sts assume-role-with-web-identity \
+            --role-arn "${AWS_ROLE_ARN}" \
+            --role-session-name "tekton-build-grype-db" \
+            --web-identity-token "$(cat "${SA_TOKEN_FILE}")" \
+            ${ENDPOINT_ARG})
+          export AWS_ACCESS_KEY_ID=$(echo "${CREDS_JSON}"     | sed -n 's/.*"AccessKeyId": *"\([^"]*\)".*/\1/p')
+          export AWS_SECRET_ACCESS_KEY=$(echo "${CREDS_JSON}" | sed -n 's/.*"SecretAccessKey": *"\([^"]*\)".*/\1/p')
+          export AWS_SESSION_TOKEN=$(echo "${CREDS_JSON}"     | sed -n 's/.*"SessionToken": *"\([^"]*\)".*/\1/p')
+        fi
+
+        DATE_TAG=$(cat /workspace/state/out/date.txt)
+        S3_PREFIX="grype-db/${SCHEMA}/${DATE_TAG}"
+        ENDPOINT_ARG=""
+        [ -n "${S3_ENDPOINT}" ] && ENDPOINT_ARG="--endpoint-url ${S3_ENDPOINT}"
+
+        echo "[publish] target: s3://${BUCKET}/${S3_PREFIX}/"
+        # shellcheck disable=SC2086
+        aws s3 cp vulnerability.db.tar.zst \
+          "s3://${BUCKET}/${S3_PREFIX}/vulnerability.db.tar.zst" ${ENDPOINT_ARG}
+        # shellcheck disable=SC2086
+        aws s3 cp vulnerability.db.tar.zst.cosign.bundle \
+          "s3://${BUCKET}/${S3_PREFIX}/vulnerability.db.tar.zst.cosign.bundle" ${ENDPOINT_ARG}
+        # shellcheck disable=SC2086
+        aws s3 cp cosign.pub \
+          "s3://${BUCKET}/${S3_PREFIX}/cosign.pub" ${ENDPOINT_ARG}
+        echo "[publish] uploaded 3 objects"
+
+    # ----------------------------------------------------------------
+    # Step 6: update-latest — write latest.json, atomic single-PUT,
+    #         emit Tekton Results.
+    #
+    # The latest.json shape MUST match the contract documented in the
+    # issue brief and in docs/vuln-scanning.md (sibling task in
+    # parallel; don't edit, but keep the format in lockstep):
+    #
+    #   { "schema":N, "date":"YYYY-MM-DD",
+    #     "tarball":"grype-db/N/YYYY-MM-DD/vulnerability.db.tar.zst",
+    #     "bundle":"grype-db/N/YYYY-MM-DD/vulnerability.db.tar.zst.cosign.bundle",
+    #     "pubkey": "grype-db/N/YYYY-MM-DD/cosign.pub",
+    #     "digest": "sha256:<hex>" }
+    #
+    # Parseable without jq — the consumer Task uses busybox + sed,
+    # matching prototype.sh L191-194. Field order is fixed so future
+    # tooling can rely on byte-position; new fields go at the end.
+    #
+    # S3 PUT is atomic (single PUT = single object version). Readers
+    # either get the prior latest.json or the new one — never a
+    # partial. This is the same atomicity guarantee chacra/shaman
+    # relied on, with no extra coordination needed.
+    # ----------------------------------------------------------------
+    - name: update-latest
+      image: $(params.uploader-image)
+      workingDir: /workspace/state/out
+      env:
+        - name: BUCKET
+          value: $(params.bucket)
+        - name: S3_ENDPOINT
+          value: $(params.s3-endpoint)
+        - name: SCHEMA
+          value: $(params.schema-version)
+        - name: SUBJECT_PREFIX
+          value: $(params.subject-prefix)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        # Same creds-loading dance as the publish step. We could
+        # have hoisted credentials into a single helper script
+        # shared across steps; Tekton's step model makes that
+        # awkward (each step is a fresh container), so we duplicate.
+        CRED_DIR="$(workspaces.s3-credentials.path)"
+        if [ -d "${CRED_DIR}" ]; then
+          for k in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN; do
+            if [ -f "${CRED_DIR}/${k}" ]; then
+              export "${k}=$(cat "${CRED_DIR}/${k}")"
+            fi
+          done
+        fi
+        SA_TOKEN_FILE="${AWS_WEB_IDENTITY_TOKEN_FILE:-/var/run/secrets/openshift/serviceaccount/token}"
+        if [ -z "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_ROLE_ARN:-}" ] && [ -f "${SA_TOKEN_FILE}" ]; then
+          ENDPOINT_ARG=""
+          [ -n "${S3_ENDPOINT}" ] && ENDPOINT_ARG="--endpoint-url ${S3_ENDPOINT}"
+          # shellcheck disable=SC2086
+          CREDS_JSON=$(aws sts assume-role-with-web-identity \
+            --role-arn "${AWS_ROLE_ARN}" \
+            --role-session-name "tekton-build-grype-db-latest" \
+            --web-identity-token "$(cat "${SA_TOKEN_FILE}")" \
+            ${ENDPOINT_ARG})
+          export AWS_ACCESS_KEY_ID=$(echo "${CREDS_JSON}"     | sed -n 's/.*"AccessKeyId": *"\([^"]*\)".*/\1/p')
+          export AWS_SECRET_ACCESS_KEY=$(echo "${CREDS_JSON}" | sed -n 's/.*"SecretAccessKey": *"\([^"]*\)".*/\1/p')
+          export AWS_SESSION_TOKEN=$(echo "${CREDS_JSON}"     | sed -n 's/.*"SessionToken": *"\([^"]*\)".*/\1/p')
+        fi
+
+        DATE_TAG=$(cat /workspace/state/out/date.txt)
+        TARBALL_SHA=$(cat /workspace/state/out/tarball.sha256)
+        S3_PREFIX="grype-db/${SCHEMA}/${DATE_TAG}"
+        LATEST_KEY="grype-db/${SCHEMA}/latest.json"
+
+        TARBALL_KEY="${S3_PREFIX}/vulnerability.db.tar.zst"
+        BUNDLE_KEY="${S3_PREFIX}/vulnerability.db.tar.zst.cosign.bundle"
+        PUBKEY_KEY="${S3_PREFIX}/cosign.pub"
+
+        # Write latest.json. Indented form mirrors prototype.sh — the
+        # sed parsers on the consumer side tolerate any whitespace
+        # between key + value, but the field shape is fixed.
+        cat > latest.json <<EOF
+        {
+          "schema":   ${SCHEMA},
+          "date":     "${DATE_TAG}",
+          "tarball":  "${TARBALL_KEY}",
+          "bundle":   "${BUNDLE_KEY}",
+          "pubkey":   "${PUBKEY_KEY}",
+          "digest":   "${TARBALL_SHA}"
+        }
+        EOF
+
+        ENDPOINT_ARG=""
+        [ -n "${S3_ENDPOINT}" ] && ENDPOINT_ARG="--endpoint-url ${S3_ENDPOINT}"
+
+        # Single PUT = atomic pointer flip.
+        # shellcheck disable=SC2086
+        aws s3 cp latest.json \
+          "s3://${BUCKET}/${LATEST_KEY}" \
+          --content-type application/json \
+          ${ENDPOINT_ARG}
+
+        echo "[update-latest] published s3://${BUCKET}/${LATEST_KEY}"
+        cat latest.json
+
+        # ------------------------------------------------------------
+        # Emit Tekton Results.
+        #
+        # Subject URL — `subject-prefix` + key. Trailing-slash-tolerant
+        # by trimming + re-appending.
+        # ------------------------------------------------------------
+        PREFIX="${SUBJECT_PREFIX%/}"
+        if [ -n "${PREFIX}" ]; then
+          DB_URL="${PREFIX}/${TARBALL_KEY}"
+          BUNDLE_URL="${PREFIX}/${BUNDLE_KEY}"
+          LATEST_URL="${PREFIX}/${LATEST_KEY}"
+        else
+          # No subject-prefix — fall back to s3:// URLs (less useful
+          # for off-cluster verifiers but unambiguous).
+          DB_URL="s3://${BUCKET}/${TARBALL_KEY}"
+          BUNDLE_URL="s3://${BUCKET}/${BUNDLE_KEY}"
+          LATEST_URL="s3://${BUCKET}/${LATEST_KEY}"
+        fi
+
+        # Chains 0.26 grammar Results. Trailing newline on IMAGES
+        # matches the generate-sbom Task's convention — Chains' line
+        # parser is tolerant, but consistency keeps the assertion
+        # tooling simple.
+        printf '%s@%s\n' "${DB_URL}" "${TARBALL_SHA}" > "$(results.IMAGES.path)"
+        printf '{"uri":"%s","digest":"%s","isBuildArtifact":"true"}' \
+          "${DB_URL}" "${TARBALL_SHA}" \
+          > "$(results.ARTIFACT_OUTPUTS.path)"
+
+        # Contract-level direct-consumer Results.
+        printf '%s' "${DB_URL}"        > "$(results.db-url.path)"
+        printf '%s' "${TARBALL_SHA}"   > "$(results.db-digest.path)"
+        printf '%s' "${BUNDLE_URL}"    > "$(results.db-bundle-url.path)"
+        printf '%s' "${SCHEMA}"        > "$(results.db-schema-version.path)"
+        printf '%s' "${LATEST_URL}"    > "$(results.db-latest-url.path)"
+
+        echo
+        echo "[results] IMAGES=${DB_URL}@${TARBALL_SHA}"
+        echo "[results] db-url=${DB_URL}"
+        echo "[results] db-digest=${TARBALL_SHA}"
+        echo "[results] db-bundle-url=${BUNDLE_URL}"
+        echo "[results] db-schema-version=${SCHEMA}"
+        echo "[results] db-latest-url=${LATEST_URL}"

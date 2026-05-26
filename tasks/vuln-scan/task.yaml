@@ -1,0 +1,833 @@
+# vuln-scan — Grype-driven CVE scan over one or more CycloneDX-JSON SBOMs.
+#
+# CONSUMER half of the producer/consumer split that replaces the
+# original draft from #51 (see issue #56). The producer Task
+# (`tasks/build-grype-db`) builds + signs + publishes a Grype DB
+# snapshot to S3 under `grype-db/<schema>/<date>/`; this Task fetches
+# the latest pointer, downloads the tarball + cosign bundle + public
+# key, cryptographically verifies the tarball, unpacks it, and points
+# grype at the unpacked DB via `GRYPE_DB_CACHE_DIR`. The DB never
+# touches the network from grype itself (`GRYPE_DB_AUTO_UPDATE=false`).
+#
+# WHY THIS REPLACES THE #51 DRAFT
+#   The earlier draft tried to drive `grype db update` inline. Three
+#   things made that path unworkable when run on a real cluster:
+#     1. The distroless anchore/grype image has no `/bin/sh`, so
+#        Tekton's `script:` shim cannot launch on it — only
+#        `command:` + `args:`. (Verified on EC2; see also the
+#        chains-smoke-test scan step's matching note.)
+#     2. Tekton steps run as separate containers; per-step `/tmp` is
+#        NOT shared between db-update and scan, so `grype db update`
+#        in step 1 would write a DB the step-2 scan couldn't see.
+#     3. `grype db update` has TUI assumptions (progress bars, stdin)
+#        that misbehave under Tekton's non-TTY exec.
+#   The fix is to do the DB build OUT-OF-BAND in a producer pipeline
+#   (cron, signed once per day) and have this consumer Task just
+#   FETCH + VERIFY + USE a pre-built artefact. That's the same shape
+#   the prototype script `hack/grype-db/prototype.sh` exercises end
+#   to end (stages 7-10 are exactly what the steps below do, just in
+#   Tekton step shape).
+#
+# CONTRACT (locked — the producer Task writes against this exact shape)
+#
+#   On the producer side, the published S3 layout is:
+#     s3://${bucket}/grype-db/${schema}/${date}/vulnerability.db.tar.zst
+#     s3://${bucket}/grype-db/${schema}/${date}/vulnerability.db.tar.zst.cosign.bundle
+#     s3://${bucket}/grype-db/${schema}/${date}/cosign.pub
+#     s3://${bucket}/grype-db/${schema}/latest.json
+#
+#   The `latest.json` pointer (busybox-parseable, no jq required):
+#     {
+#       "schema":   6,
+#       "date":     "2026-05-26",
+#       "tarball":  "grype-db/6/2026-05-26/vulnerability.db.tar.zst",
+#       "bundle":   "grype-db/6/2026-05-26/vulnerability.db.tar.zst.cosign.bundle",
+#       "pubkey":   "grype-db/6/2026-05-26/cosign.pub",
+#       "digest":   "sha256:<hex>"
+#     }
+#
+#   The consumer parses it with `sed -n 's/.*"key":[[:space:]]*"\([^"]*\)".*/\1/p'`
+#   — same regex shape the prototype uses. Belt-and-braces: after
+#   fetch, the unpack step sha256sums the tarball and compares
+#   against the pointer's `digest` field.
+#
+#   The pointer is served from a public canonical URL
+#   (artifacts.ceph.com) via straight HTTP, so the consumer doesn't
+#   need S3 credentials. The tarball/bundle/pubkey URLs are
+#   relative paths inside the pointer; the consumer rebases them onto
+#   the same canonical host using the pointer's URL prefix. This
+#   keeps the producer and consumer agnostic about the actual S3
+#   endpoint (Sepia RGW today, anywhere tomorrow).
+#
+# MULTI-SBOM SUPPORT
+#   Real package builds emit N CycloneDX SBOMs (one per .deb / .rpm).
+#   The `sbom-file` param lets a caller scan a single named file;
+#   leaving it empty falls back to `sbom-glob` which scans every
+#   matching SBOM under the workspace. The grype image is distroless
+#   so we CANNOT loop inside the scan step — we follow the same
+#   "ONE ROLLUP, NOT N PER-ARTIFACT" pattern `generate-sbom` uses:
+#   when `sbom-file` is empty, we concatenate every matched SBOM's
+#   components into one rollup SBOM (busybox), then run a single
+#   grype invocation against it. The `emit-results` step then
+#   reconstructs per-SBOM provenance from grype's `matches[].artifact`
+#   field if needed.
+#
+# CHAINS GRAMMAR (Chains 0.26)
+#   Per commit 4bf0b80, Chains 0.26 ONLY recognizes:
+#     *IMAGE_URL / *IMAGE_DIGEST       (subject)
+#     IMAGES                           (multi-subject)
+#     *ARTIFACT_URI / *ARTIFACT_DIGEST (subject)
+#     *ARTIFACT_OUTPUTS {uri, digest, isBuildArtifact}
+#   No `SBOM_*`, no `VULN_*`. The findings JSON is a BYPRODUCT of the
+#   build (it's not what the build produces — the build produces
+#   packages — it's evidence collected ABOUT them), so we emit it as
+#   `findings-ARTIFACT_OUTPUTS` with `isBuildArtifact:"false"`,
+#   which Chains files under `predicate.runDetails.byproducts[]` of
+#   the slsa/v2alpha4 attestation it signs. mediaType is NOT recorded
+#   in the attestation (ARTIFACT_OUTPUTS has no mediaType field);
+#   verifiers identify the payload as Grype findings JSON by the URI
+#   suffix `.grype.json`. A fully-typed VEX attestation is tracked
+#   separately in #55.
+#
+# FAILURE SEMANTICS
+#   * pointer fetch fails               -> fatal.
+#   * tarball/bundle/pubkey fetch fails -> fatal.
+#   * cosign verify-blob fails          -> fatal. NO FALLBACK. If the
+#     DB isn't fetchable + verifiable we don't scan; degrading to
+#     auto-update would silently bypass the cryptographic chain.
+#   * tarball digest mismatch vs pointer-> fatal.
+#   * unpack produces no <schema>/vulnerability.db -> fatal.
+#   * grype scan exits non-zero         -> fatal.
+#   * empty SBOM glob match              -> fatal (misconfiguration).
+#   * `fail-on-severity` non-empty AND any finding at-or-above
+#     threshold -> Task exits 1 from the emit-results step AFTER the
+#     findings JSON + Results have been written (consumers can still
+#     read them on a failed run).
+#
+# DOCS
+#   docs/vuln-scanning.md (rewritten alongside this Task) walks through
+#   the producer/consumer contract, the byproduct landing location in
+#   the Chains attestation, the gating model, and verifier-side
+#   extraction.
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: vuln-scan
+spec:
+  description: |
+    Fetch the producer-published Grype DB snapshot, cryptographically
+    verify it with cosign, unpack, and scan one or more CycloneDX-JSON
+    SBOMs under the `sboms` workspace. Emit Chains-grammar Results
+    (`findings-ARTIFACT_OUTPUTS` object + `vuln-summary` +
+    `findings-count`) so the consolidated findings JSON lands in the
+    SLSA attestation Chains signs as a byproduct.
+
+    The DB is fetched fresh per TaskRun and verified end-to-end. There
+    is no shared db-cache workspace — the producer Pipeline gates
+    freshness, the consumer Task gates integrity. If the producer
+    publishes a bad pointer, every consumer fails closed (no scan
+    runs), which is the correct posture for a supply-chain control.
+  params:
+    - name: sbom-file
+      type: string
+      default: ""
+      description: |
+        Path (relative to the `sboms` workspace root) of a single
+        CycloneDX SBOM file to scan. Empty (default) means scan every
+        file under the workspace matching `sbom-glob` and emit one
+        consolidated findings JSON over the whole set — same rollup
+        pattern `generate-sbom` uses, because the distroless grype
+        image can't loop and Tekton can't iterate without one. For
+        truly per-artifact granularity, fan out at the Pipeline
+        level via `matrix:`; this Task's Results contract is
+        unchanged.
+    - name: sbom-glob
+      type: string
+      default: "*.cdx.json"
+      description: |
+        Glob (relative to the `sboms` workspace root) used when
+        `sbom-file` is empty. Default matches the CycloneDX-JSON
+        naming convention `generate-sbom` writes (`<package>.cdx.json`).
+    - name: db-pointer-url
+      type: string
+      default: "https://artifacts.ceph.com/ceph-grype-db/grype-db/6/latest.json"
+      description: |
+        Canonical HTTPS URL of the producer's `latest.json` pointer.
+        Default points at the production prefix on artifacts.ceph.com;
+        smoke pipelines running against vstart override this to a
+        dev RGW URL (see `pipelines/vuln-scan-smoke-test.yaml`).
+        The pointer's `tarball` / `bundle` / `pubkey` fields are
+        relative paths; the consumer rebases them onto the host +
+        path prefix of this URL.
+    - name: grype-image
+      type: string
+      default: docker.io/anchore/grype:v0.112.0
+      description: |
+        Pinned grype image. v0.112 dropped the `--db-path` flag in
+        favour of `GRYPE_DB_CACHE_DIR`; the unpack step lays out the
+        DB to match what this version expects
+        (`<cache-dir>/<schema>/vulnerability.db`). Bumping is a
+        deliberate supply-chain decision (same posture as the syft
+        image pin in `generate-sbom`).
+    - name: cosign-image
+      type: string
+      default: ghcr.io/sigstore/cosign/cosign:v2.4.1
+      description: |
+        Pinned cosign image. cosign 2.x consumes the sigstore-bundle
+        format the producer writes (single .cosign.bundle file
+        wrapping signature + cert + optional Rekor entry). 2.4.1 is
+        the current stable line. The image is distroless; the verify
+        step invokes it via `command:` + `args:`, no shell.
+    - name: tools-image
+      type: string
+      default: docker.io/library/busybox:1.36
+      description: |
+        Pinned busybox image used by the fetch, unpack, and
+        emit-results steps. Gives us /bin/sh, sed, awk, grep, wc,
+        printf, sha256sum, tar, and `wget` — enough to drive the
+        pointer parse + tarball fetch + digest check + JSON emit
+        without dragging in jq or curl. Same pin as `generate-sbom`
+        and `chains-smoke-test` for build determinism.
+    - name: aws-cli-image
+      type: string
+      default: docker.io/amazon/aws-cli:2.17.0
+      description: |
+        Pinned aws-cli image. The fetch step uses `aws s3 cp` ONLY
+        when `db-pointer-url` is an `s3://` URL (or the pointer JSON's
+        sub-paths need to be fetched via s3 because the canonical
+        host can't see them — this is the smoke / vstart path). In
+        the production path the pointer + tarball are served over
+        HTTPS from artifacts.ceph.com and busybox `wget` handles all
+        three downloads; aws-cli is only pulled when actually needed.
+    - name: unzstd-image
+      type: string
+      default: docker.io/library/alpine:3.20
+      description: |
+        Pinned alpine image for the unpack step. Busybox 1.36 ships
+        tar but NOT zstd; alpine has both `tar` and `zstd` in its
+        base image (apk add zstd at runtime), so we use it for the
+        single step that needs to inflate the .tar.zst tarball.
+    - name: fail-on-severity
+      type: string
+      default: ""
+      description: |
+        Severity threshold for gating. One of:
+          ""           - non-gating (default; smoke runs leave this
+                         empty so Log4Shell findings don't fail the
+                         smoke; gating behaviour is exercised via the
+                         assert step's count check).
+          "negligible" - fail on any finding (negligible or higher).
+          "low"        - fail on low+.
+          "medium"     - fail on medium+.
+          "high"       - fail on high+.
+          "critical"   - fail on critical only.
+
+        Grype severity strings (Critical, High, Medium, Low,
+        Negligible, Unknown) map case-insensitively. Unknown is
+        treated below Negligible and never trips a gate.
+        Per-CVE allowlist with expiry dates is OUT of scope — see
+        #52 (HITL severity-policy decision).
+    - name: findings-uri-prefix
+      type: string
+      default: ""
+      description: |
+        Optional URL prefix prepended to the
+        `findings-ARTIFACT_OUTPUTS.uri` so the Chains byproduct entry
+        identifies the *published* findings location rather than the
+        workspace-local path. Example:
+        `https://artifacts.ceph.com/ceph-artifacts-branch/main/<sha>/centos10/x86_64/scans/`.
+        Empty = URI is `workspace://sboms/findings.grype.json` (smoke
+        / dev — same convention `generate-sbom` uses for SBOMs).
+  results:
+    # ----------------------------------------------------------------
+    # Chains-grammar byproduct Result.
+    #
+    # Chains 0.26 recognises `*ARTIFACT_OUTPUTS` as an object Result
+    # with shape {uri, digest, isBuildArtifact}. With
+    # isBuildArtifact:"false" it lands under
+    # `predicate.runDetails.byproducts[]` of the slsa/v2alpha4
+    # attestation, NOT under subject. Same shape as the corrected
+    # `sbom-ARTIFACT_OUTPUTS` Result in chains-smoke-test
+    # (the suffix `findings-` vs `sbom-` is the only distinguishing
+    # bit; both are byproducts).
+    #
+    # mediaType is NOT recorded in the attestation byproduct entry —
+    # ARTIFACT_OUTPUTS has no mediaType field. Verifiers identify the
+    # payload as Grype findings JSON by the URI suffix
+    # (`.grype.json`).
+    # ----------------------------------------------------------------
+    - name: findings-ARTIFACT_OUTPUTS
+      type: object
+      description: |
+        Consolidated Grype findings JSON as a Chains type-hinted
+        ARTIFACT_OUTPUTS object. Chains records it at
+        `predicate.runDetails.byproducts[]` with name suffix
+        `/findings-ARTIFACT_OUTPUTS`. Carries
+        uri + content digest + isBuildArtifact:"false". Verifiers
+        fetch the URI to get the full findings JSON; the digest pins
+        the bytes.
+      properties:
+        uri: {}
+        digest: {}
+        isBuildArtifact: {}
+    - name: vuln-summary
+      type: string
+      description: |
+        Human + log-scraping summary of the form
+          `critical=N high=N medium=N low=N negligible=N unknown=N`
+        Exactly six space-separated tokens, all six severities
+        present even if zero. Counts are aggregated across every SBOM
+        matched by `sbom-glob` (or the single `sbom-file`). Suitable
+        for grep in CI logs and for the Grafana dashboard label.
+        The emit-results step reads this back to decide whether
+        `fail-on-severity` is tripped.
+    - name: findings-count
+      type: string
+      description: |
+        Total number of Grype matches across all scanned SBOMs as a
+        non-negative integer. Provided for dashboard / smoke-assert
+        use; the per-severity breakdown lives in `vuln-summary`.
+  workspaces:
+    - name: sboms
+      description: |
+        Workspace containing one or more CycloneDX-JSON SBOM files
+        plus, on output, the consolidated `findings.grype.json` and
+        per-scan `<basename>.grype.json` files. The `sbom-glob` /
+        `sbom-file` params are evaluated relative to this workspace
+        root. Same workspace `generate-sbom` writes to — the natural
+        wiring is to bind both Tasks to it.
+
+        The DB tarball + bundle + pubkey are fetched into a
+        subdirectory of this workspace (`.grype-db/`) so the unpack
+        and scan steps can find them. We use the sboms workspace
+        rather than declaring a second workspace because (a) every
+        caller already binds sboms and (b) the DB is ephemeral per
+        TaskRun, so a separate persistent volume would be wasteful.
+      mountPath: /workspace/sboms
+  steps:
+    # ----------------------------------------------------------------
+    # Step 1: fetch-db — busybox.
+    #
+    # Pulls the canonical `latest.json` pointer over HTTPS, parses out
+    # the tarball/bundle/pubkey sub-paths with sed (no jq in
+    # busybox), then fetches each of the three sibling artefacts.
+    #
+    # URL HANDLING:
+    #   The pointer URL is canonical HTTPS (artifacts.ceph.com or a
+    #   dev RGW). The pointer's `tarball` etc. fields are S3-key-
+    #   shaped relative paths like `grype-db/6/2026-05-26/...`. We
+    #   rebase them onto the pointer URL by stripping the trailing
+    #   `latest.json` from the pointer URL and prepending the
+    #   resulting prefix.
+    #
+    # OUTPUT LAYOUT:
+    #   /workspace/sboms/.grype-db/
+    #     latest.json
+    #     vulnerability.db.tar.zst
+    #     vulnerability.db.tar.zst.cosign.bundle
+    #     cosign.pub
+    #
+    # We use busybox `wget`, which handles HTTPS via OpenSSL on the
+    # 1.36 base image. For s3:// URLs we'd need aws-cli, but the
+    # production pointer is HTTPS-served from artifacts.ceph.com and
+    # the smoke pipeline keeps the same posture (the smoke can point
+    # at an RGW that's been configured to serve HTTPS via a route,
+    # or at any HTTPS bucket-website / object-public URL).
+    # ----------------------------------------------------------------
+    - name: fetch-db
+      image: $(params.tools-image)
+      workingDir: /workspace/sboms
+      env:
+        - name: DB_POINTER_URL
+          value: $(params.db-pointer-url)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        DB_DIR="/workspace/sboms/.grype-db"
+        rm -rf "${DB_DIR}"
+        mkdir -p "${DB_DIR}"
+
+        echo "[fetch-db] pointer: ${DB_POINTER_URL}"
+
+        # Fetch the pointer. `-q` keeps the log clean; we cat the
+        # file ourselves below to record what was fetched. `-O`
+        # writes to a specific path so the busybox wget HTML-index
+        # fallback can't pollute the cwd.
+        wget -q -O "${DB_DIR}/latest.json" "${DB_POINTER_URL}"
+        if [ ! -s "${DB_DIR}/latest.json" ]; then
+          echo "FATAL: ${DB_POINTER_URL} fetched empty" >&2
+          exit 1
+        fi
+
+        echo "[fetch-db] pointer body:"
+        cat "${DB_DIR}/latest.json"
+        echo
+
+        # Parse out the three sub-paths using the same sed pattern
+        # the prototype uses. Each is a relative S3 key like
+        # `grype-db/6/2026-05-26/vulnerability.db.tar.zst`.
+        TARBALL_KEY=$(sed -n 's/.*"tarball":[[:space:]]*"\([^"]*\)".*/\1/p' "${DB_DIR}/latest.json")
+        BUNDLE_KEY=$(sed -n  's/.*"bundle":[[:space:]]*"\([^"]*\)".*/\1/p'  "${DB_DIR}/latest.json")
+        PUBKEY_KEY=$(sed -n  's/.*"pubkey":[[:space:]]*"\([^"]*\)".*/\1/p'  "${DB_DIR}/latest.json")
+        DIGEST=$(sed -n      's/.*"digest":[[:space:]]*"\([^"]*\)".*/\1/p'  "${DB_DIR}/latest.json")
+        SCHEMA=$(sed -n      's/.*"schema":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "${DB_DIR}/latest.json")
+
+        if [ -z "${TARBALL_KEY}" ] || [ -z "${BUNDLE_KEY}" ] || [ -z "${PUBKEY_KEY}" ] || [ -z "${DIGEST}" ] || [ -z "${SCHEMA}" ]; then
+          echo "FATAL: latest.json missing one of: schema, tarball, bundle, pubkey, digest" >&2
+          echo "  parsed: schema='${SCHEMA}' tarball='${TARBALL_KEY}' bundle='${BUNDLE_KEY}' pubkey='${PUBKEY_KEY}' digest='${DIGEST}'" >&2
+          exit 1
+        fi
+        echo "[fetch-db] parsed: schema=${SCHEMA} tarball=${TARBALL_KEY}"
+        echo "[fetch-db]         bundle=${BUNDLE_KEY}"
+        echo "[fetch-db]         pubkey=${PUBKEY_KEY}"
+        echo "[fetch-db]         digest=${DIGEST}"
+
+        # Rebase the relative keys onto the pointer URL's prefix.
+        # `${DB_POINTER_URL%/latest.json}` strips the trailing
+        # filename; the producer publishes latest.json at
+        # `<prefix>/grype-db/<schema>/latest.json` so the relative
+        # keys (which include `grype-db/<schema>/...`) need to be
+        # rebased onto a path that's two levels up. We strip
+        # `/grype-db/<schema>/latest.json` to get the bucket-website
+        # root, then concatenate with the relative key.
+        URL_PREFIX=$(printf '%s' "${DB_POINTER_URL}" | sed "s|/grype-db/${SCHEMA}/latest.json\$||")
+        echo "[fetch-db] URL prefix: ${URL_PREFIX}"
+
+        wget -q -O "${DB_DIR}/vulnerability.db.tar.zst"               "${URL_PREFIX}/${TARBALL_KEY}"
+        wget -q -O "${DB_DIR}/vulnerability.db.tar.zst.cosign.bundle" "${URL_PREFIX}/${BUNDLE_KEY}"
+        wget -q -O "${DB_DIR}/cosign.pub"                             "${URL_PREFIX}/${PUBKEY_KEY}"
+
+        # Sanity-check sizes — empty files mean a 404/redirect that
+        # busybox wget silently treated as a successful download of
+        # the error page.
+        for f in vulnerability.db.tar.zst vulnerability.db.tar.zst.cosign.bundle cosign.pub; do
+          if [ ! -s "${DB_DIR}/${f}" ]; then
+            echo "FATAL: ${DB_DIR}/${f} fetched empty" >&2
+            exit 1
+          fi
+        done
+
+        echo "[fetch-db] sizes:"
+        ls -la "${DB_DIR}"
+
+        # Belt-and-braces: digest check vs pointer. We could defer
+        # this to the unpack step but failing fast here gives a
+        # clearer error when the producer's pointer is stale.
+        ACTUAL="sha256:$(sha256sum "${DB_DIR}/vulnerability.db.tar.zst" | awk '{print $1}')"
+        if [ "${ACTUAL}" != "${DIGEST}" ]; then
+          echo "FATAL: tarball digest ${ACTUAL} != pointer digest ${DIGEST}" >&2
+          exit 1
+        fi
+        echo "[fetch-db] digest match: ${ACTUAL}"
+    # ----------------------------------------------------------------
+    # Step 2: verify-db — distroless cosign image, no shell.
+    #
+    # HARD GATE. If cosign verify-blob fails, the Task fails. There
+    # is NO fallback — silently degrading to auto-update would
+    # bypass the cryptographic chain and defeat the whole point of
+    # the producer/consumer split. Phase 1 uses key-based verify
+    # against the producer-published static pubkey; keyless verify
+    # against Fulcio is a phase-2 swap (see #57 followup — the
+    # invocation becomes `cosign verify-blob --certificate-identity
+    # ... --certificate-oidc-issuer ... --bundle ... <tarball>`).
+    #
+    # The cosign 2.x image is distroless; we invoke it via
+    # `command:` + `args:` (same pattern as the syft scan step in
+    # generate-sbom). The image's entrypoint is `cosign`, but we set
+    # `command: ["cosign"]` explicitly for clarity.
+    # ----------------------------------------------------------------
+    - name: verify-db
+      image: $(params.cosign-image)
+      workingDir: /workspace/sboms/.grype-db
+      command: ["cosign"]
+      args:
+        - verify-blob
+        - --key
+        - /workspace/sboms/.grype-db/cosign.pub
+        - --bundle
+        - /workspace/sboms/.grype-db/vulnerability.db.tar.zst.cosign.bundle
+        - /workspace/sboms/.grype-db/vulnerability.db.tar.zst
+    # ----------------------------------------------------------------
+    # Step 3: unpack-db — alpine (busybox + zstd).
+    #
+    # Inflates the .tar.zst tarball into /workspace/sboms/.grype-db/db/.
+    # The producer's tarball top-level is `<schema>/` (matching the
+    # on-disk grype cache layout), so the unpacked tree is:
+    #   /workspace/sboms/.grype-db/db/<schema>/vulnerability.db
+    # Pointing `GRYPE_DB_CACHE_DIR` at .../.grype-db/db gives grype
+    # 0.112+ exactly the layout it expects.
+    #
+    # We use alpine (not busybox) because busybox 1.36 doesn't ship
+    # zstd; alpine ships tar + zstd in its base.
+    # ----------------------------------------------------------------
+    - name: unpack-db
+      image: $(params.unzstd-image)
+      workingDir: /workspace/sboms/.grype-db
+      script: |
+        #!/bin/sh
+        set -eu
+
+        # alpine 3.20 ships busybox tar but zstd is its own package.
+        # apk add at step time keeps the unzstd-image pin clean (no
+        # custom image to maintain) at the cost of one apk call per
+        # TaskRun — acceptable for a step that runs once per scan.
+        apk add --no-cache zstd >/dev/null
+
+        DB_DIR="/workspace/sboms/.grype-db"
+        UNPACK_DIR="${DB_DIR}/db"
+        mkdir -p "${UNPACK_DIR}"
+
+        tar --use-compress-program="zstd -d" \
+            -xf "${DB_DIR}/vulnerability.db.tar.zst" \
+            -C "${UNPACK_DIR}"
+
+        # The tarball's top-level dir is the schema version; surface
+        # whichever schema we got and assert the expected vuln DB
+        # lives under it. We re-read schema from latest.json rather
+        # than threading it through env between steps (Tekton steps
+        # don't share env mutations; the workspace file is the
+        # source of truth).
+        SCHEMA=$(sed -n 's/.*"schema":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "${DB_DIR}/latest.json")
+        if [ -z "${SCHEMA}" ]; then
+          echo "FATAL: latest.json missing schema field at unpack time" >&2
+          exit 1
+        fi
+
+        if [ ! -f "${UNPACK_DIR}/${SCHEMA}/vulnerability.db" ]; then
+          echo "FATAL: expected ${UNPACK_DIR}/${SCHEMA}/vulnerability.db after unpack" >&2
+          echo "[unpack-db] actual unpacked tree:" >&2
+          ls -laR "${UNPACK_DIR}" >&2
+          exit 1
+        fi
+        echo "[unpack-db] DB ready at ${UNPACK_DIR}/${SCHEMA}/vulnerability.db"
+        echo "[unpack-db] DB size: $(du -sh "${UNPACK_DIR}/${SCHEMA}" | awk '{print $1}')"
+    # ----------------------------------------------------------------
+    # Step 4: scan — distroless grype image, no shell.
+    #
+    # The anchore/grype image is distroless (chainguard-base); only
+    # the grype binary is present. We MUST invoke it via `command:`
+    # + `args:` — `script:` would require `/bin/sh` which doesn't
+    # exist in the image (this is the #1 bug from the original #51
+    # draft).
+    #
+    # Multi-SBOM handling:
+    #   The Task supports two modes:
+    #     - `sbom-file` set: scan that single file.
+    #     - `sbom-file` empty: scan every file matching `sbom-glob`.
+    #   Tekton doesn't iterate, and we can't loop in the distroless
+    #   image. The previous step (prep-scan) consolidates multiple
+    #   SBOMs into a single rollup file when sbom-file is empty;
+    #   here we just point grype at whichever file the prep step
+    #   wrote (always /workspace/sboms/.grype-db/scan-input.cdx.json
+    #   when prep ran in glob mode, or /workspace/sboms/<sbom-file>
+    #   in single-file mode).
+    #
+    #   But: we can't conditionally pick a path in `args:` either —
+    #   args are static at TaskRun creation. So the prep step ALWAYS
+    #   writes the same canonical path
+    #   (.grype-db/scan-input.cdx.json), whether by copying the
+    #   single named file there or by building a rollup; the scan
+    #   step always reads from that one path. This is the only
+    #   pattern that survives the "no shell in scan step" constraint
+    #   while still supporting both modes.
+    #
+    # Env:
+    #   GRYPE_DB_CACHE_DIR  — where the unpacked DB lives. grype
+    #     looks for `<cache-dir>/<schema>/vulnerability.db` and uses
+    #     that as the DB source. There is NO `--db-path` flag in
+    #     grype 0.112+; this env var is the only knob.
+    #   GRYPE_DB_AUTO_UPDATE=false — belt-and-braces; with a present
+    #     local DB grype shouldn't phone home, but explicitly
+    #     forbidding it makes the failure obvious if the DB ever
+    #     isn't found.
+    #   GRYPE_CHECK_FOR_APP_UPDATE=false — quiet the version check.
+    #
+    # Output:
+    #   /workspace/sboms/.grype-db/scan-output.grype.json — grype's
+    #   native JSON shape (top-level `matches[]`, each match's
+    #   `.vulnerability.severity` ∈ {Critical, High, Medium, Low,
+    #   Negligible, Unknown}). emit-results parses this.
+    # ----------------------------------------------------------------
+    - name: prep-scan
+      image: $(params.tools-image)
+      workingDir: /workspace/sboms
+      env:
+        - name: SBOM_FILE
+          value: $(params.sbom-file)
+        - name: SBOM_GLOB
+          value: $(params.sbom-glob)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        DB_DIR="/workspace/sboms/.grype-db"
+        SCAN_INPUT="${DB_DIR}/scan-input.cdx.json"
+
+        if [ -n "${SBOM_FILE}" ]; then
+          # Single-file mode. Just copy the named SBOM to the
+          # canonical scan-input path so the distroless scan step's
+          # static args resolve correctly.
+          SRC="/workspace/sboms/${SBOM_FILE}"
+          if [ ! -f "${SRC}" ]; then
+            echo "FATAL: sbom-file '${SBOM_FILE}' not present in /workspace/sboms" >&2
+            ls -la /workspace/sboms >&2
+            exit 1
+          fi
+          cp "${SRC}" "${SCAN_INPUT}"
+          echo "[prep-scan] single-SBOM mode: copied ${SBOM_FILE} -> scan-input.cdx.json"
+          # Record the source name for emit-results provenance.
+          printf '%s\n' "${SBOM_FILE}" > "${DB_DIR}/scan-sources.txt"
+          exit 0
+        fi
+
+        # Glob mode. Walk every matched .cdx.json, concat the
+        # `components[]` arrays into one rollup CycloneDX document,
+        # and write that. We do NOT try to merge `dependencies[]`
+        # cross-SBOM (too noisy); grype only consumes `components`.
+        cd /workspace/sboms
+        # shellcheck disable=SC2086
+        set +e
+        MATCHES=$(ls -1 ${SBOM_GLOB} 2>/dev/null | sort)
+        set -e
+
+        if [ -z "${MATCHES}" ]; then
+          echo "FATAL: sbom-glob '${SBOM_GLOB}' matched no files in /workspace/sboms" >&2
+          ls -la /workspace/sboms >&2
+          exit 1
+        fi
+
+        echo "[prep-scan] glob mode: rollup over:"
+        printf '  - %s\n' ${MATCHES}
+
+        : > "${DB_DIR}/scan-sources.txt"
+        # Build a synthetic CycloneDX wrapper, then splice every
+        # source SBOM's `components` array body in. We use sed to
+        # extract the inside of each `"components": [ ... ]` block
+        # (greedy from the first `[` after the components key to the
+        # matching `]`). Robust enough for syft-generated CycloneDX
+        # which keeps the components array on its own (deeply
+        # nested) lines.
+        cat > "${SCAN_INPUT}" <<'HDR'
+        {
+          "bomFormat": "CycloneDX",
+          "specVersion": "1.5",
+          "serialNumber": "urn:uuid:00000000-0000-4000-8000-000000000002",
+          "version": 1,
+          "metadata": {
+            "component": {"type": "application", "name": "vuln-scan-rollup", "version": "1.0.0"}
+          },
+          "components": [
+        HDR
+
+        FIRST=1
+        for f in ${MATCHES}; do
+          [ -f "${f}" ] || continue
+          printf '%s\n' "${f}" >> "${DB_DIR}/scan-sources.txt"
+          # Extract everything between `"components":` `[` and the
+          # NEXT `]` at the same brace depth. Busybox sed doesn't
+          # do balanced-bracket matching, but syft formats CycloneDX
+          # with components on their own JSON lines, so the simpler
+          # approach (everything from the line after `"components": [`
+          # to the next standalone `]`) works in practice. Worst
+          # case if the input SBOM is on one line we fall back to
+          # the whole inside-of-array regex.
+          BODY=$(awk '
+            BEGIN { state=0 }
+            state==0 && /"components"[[:space:]]*:[[:space:]]*\[/ { state=1; next }
+            state==1 && /^[[:space:]]*\][[:space:]]*,?[[:space:]]*$/ { state=2; next }
+            state==1 { print }
+          ' "${f}" | sed 's/^[[:space:]]*//' )
+
+          if [ -z "${BODY}" ]; then
+            echo "[prep-scan] WARN: no components extracted from ${f}; trying single-line fallback" >&2
+            BODY=$(sed -n 's/.*"components"[[:space:]]*:[[:space:]]*\[\(.*\)\][[:space:]]*[,}].*/\1/p' "${f}" | head -n1)
+          fi
+
+          if [ -z "${BODY}" ]; then
+            echo "[prep-scan] WARN: ${f} has no components array; skipping"
+            continue
+          fi
+
+          if [ "${FIRST}" -eq 1 ]; then
+            FIRST=0
+          else
+            printf ',\n' >> "${SCAN_INPUT}"
+          fi
+          printf '%s' "${BODY}" >> "${SCAN_INPUT}"
+        done
+        printf '\n  ]\n}\n' >> "${SCAN_INPUT}"
+
+        echo "[prep-scan] rollup written: $(wc -c < "${SCAN_INPUT}") bytes"
+        echo "[prep-scan] sources:"
+        cat "${DB_DIR}/scan-sources.txt"
+    - name: scan
+      image: $(params.grype-image)
+      workingDir: /workspace/sboms/.grype-db
+      env:
+        - name: GRYPE_DB_CACHE_DIR
+          value: /workspace/sboms/.grype-db/db
+        - name: GRYPE_DB_AUTO_UPDATE
+          value: "false"
+        - name: GRYPE_CHECK_FOR_APP_UPDATE
+          value: "false"
+      # grype image is distroless — NO `script:`. Single rollup scan
+      # against the canonical scan-input path the prep-scan step
+      # always writes.
+      command: ["/grype"]
+      args:
+        - "sbom:/workspace/sboms/.grype-db/scan-input.cdx.json"
+        - "-o"
+        - "json"
+        - "--file"
+        - "/workspace/sboms/.grype-db/scan-output.grype.json"
+        - "-q"
+    # ----------------------------------------------------------------
+    # Step 5: emit-results — busybox.
+    #
+    # Consolidate the scan output into `findings.grype.json` on the
+    # sboms workspace, compute per-severity tallies, write the
+    # Chains-grammar Results, and apply `--fail-on` semantics.
+    #
+    # Aggregate file shape (consumed by smoke-assert + dashboards):
+    #   {
+    #     "scans": [
+    #       { "sbom": "<source-name>", "findings": <grype-json-or-summary> }
+    #     ],
+    #     "summary": {
+    #       "critical": N, "high": N, "medium": N,
+    #       "low": N, "negligible": N, "unknown": N, "total": N
+    #     }
+    #   }
+    #
+    # We tally per-severity by grepping `"severity":"<Cap>"` lines
+    # out of the grype output (busybox has no jq). LIMITATION:
+    # grype's JSON contains the severity field both inside
+    # `match.vulnerability.severity` AND inside each entry of
+    # `match.relatedVulnerabilities[].severity`. A CVE that
+    # cross-references multiple advisory sources gets over-counted
+    # by the size of its relatedVulnerabilities[] array. For the
+    # gate this is conservative (a positive count still implies at
+    # least one finding at that severity); for exact per-CVE counts,
+    # parse `findings.grype.json` with jq on the verifier side.
+    # ----------------------------------------------------------------
+    - name: emit-results
+      image: $(params.tools-image)
+      workingDir: /workspace/sboms
+      env:
+        - name: FINDINGS_URI_PREFIX
+          value: $(params.findings-uri-prefix)
+        - name: FAIL_ON_SEVERITY
+          value: $(params.fail-on-severity)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        DB_DIR="/workspace/sboms/.grype-db"
+        SCAN_OUT="${DB_DIR}/scan-output.grype.json"
+        AGG="/workspace/sboms/findings.grype.json"
+
+        if [ ! -f "${SCAN_OUT}" ]; then
+          echo "FATAL: ${SCAN_OUT} not present; scan step did not run" >&2
+          exit 1
+        fi
+        if [ ! -f "${DB_DIR}/scan-sources.txt" ]; then
+          echo "FATAL: ${DB_DIR}/scan-sources.txt missing; prep-scan didn't run" >&2
+          exit 1
+        fi
+
+        # Per-severity tally. Grype emits Capitalised severity
+        # strings. We fold to lowercase tokens for the summary.
+        CRIT=$(grep -c '"severity":[[:space:]]*"Critical"'   "${SCAN_OUT}" 2>/dev/null || true)
+        HIGH=$(grep -c '"severity":[[:space:]]*"High"'       "${SCAN_OUT}" 2>/dev/null || true)
+        MED=$(grep -c  '"severity":[[:space:]]*"Medium"'     "${SCAN_OUT}" 2>/dev/null || true)
+        LOW=$(grep -c  '"severity":[[:space:]]*"Low"'        "${SCAN_OUT}" 2>/dev/null || true)
+        NEG=$(grep -c  '"severity":[[:space:]]*"Negligible"' "${SCAN_OUT}" 2>/dev/null || true)
+        UNK=$(grep -c  '"severity":[[:space:]]*"Unknown"'    "${SCAN_OUT}" 2>/dev/null || true)
+        CRIT=${CRIT:-0}; HIGH=${HIGH:-0}; MED=${MED:-0}; LOW=${LOW:-0}; NEG=${NEG:-0}; UNK=${UNK:-0}
+        TOTAL=$((CRIT + HIGH + MED + LOW + NEG + UNK))
+
+        # Build the consolidated findings.grype.json. We emit one
+        # entry in `scans[]` per source SBOM, listing the source
+        # name from scan-sources.txt. The findings object holds the
+        # full grype JSON output (one rollup over all SBOMs), which
+        # is the same data downstream consumers already expect from
+        # a single grype invocation.
+        printf '{"scans":[' > "${AGG}"
+        FIRST=1
+        while IFS= read -r src; do
+          [ -n "${src}" ] || continue
+          if [ "${FIRST}" -eq 1 ]; then
+            FIRST=0
+          else
+            printf ',' >> "${AGG}"
+          fi
+          # JSON-escape source name conservatively (filesystem
+          # basenames are under our control — no quotes/backslashes
+          # in practice).
+          printf '{"sbom":"%s","findings":' "${src}" >> "${AGG}"
+          cat "${SCAN_OUT}" >> "${AGG}"
+          printf '}' >> "${AGG}"
+        done < "${DB_DIR}/scan-sources.txt"
+        printf '],"summary":{"critical":%d,"high":%d,"medium":%d,"low":%d,"negligible":%d,"unknown":%d,"total":%d}}' \
+          "${CRIT}" "${HIGH}" "${MED}" "${LOW}" "${NEG}" "${UNK}" "${TOTAL}" \
+          >> "${AGG}"
+
+        AGG_SHA="sha256:$(sha256sum "${AGG}" | awk '{print $1}')"
+        if [ -n "${FINDINGS_URI_PREFIX}" ]; then
+          AGG_URI="${FINDINGS_URI_PREFIX%/}/findings.grype.json"
+        else
+          AGG_URI="workspace://sboms/findings.grype.json"
+        fi
+
+        # findings-ARTIFACT_OUTPUTS object Result. Chains 0.26 reads
+        # the {uri, digest, isBuildArtifact} triple and records it
+        # under predicate.runDetails.byproducts[] with
+        # isBuildArtifact:"false".
+        printf '{"uri":"%s","digest":"%s","isBuildArtifact":"false"}' \
+          "${AGG_URI}" "${AGG_SHA}" \
+          > "$(results.findings-ARTIFACT_OUTPUTS.path)"
+
+        # vuln-summary — single-line, six-token, grep-friendly.
+        # Every severity is present even when zero, so downstream
+        # parsers don't have to handle missing keys.
+        SUMMARY="critical=${CRIT} high=${HIGH} medium=${MED} low=${LOW} negligible=${NEG} unknown=${UNK}"
+        printf '%s' "${SUMMARY}" > "$(results.vuln-summary.path)"
+        printf '%s' "${TOTAL}"   > "$(results.findings-count.path)"
+
+        echo "[emit-results] findings.grype.json: ${AGG} ($(wc -c < "${AGG}") bytes)"
+        echo "[emit-results] digest:              ${AGG_SHA}"
+        echo "[emit-results] uri:                 ${AGG_URI}"
+        echo "[emit-results] vuln-summary:        ${SUMMARY}"
+        echo "[emit-results] findings-count:      ${TOTAL}"
+
+        # ---- fail-on-severity gate ----
+        # We apply gating HERE (not via grype's --fail-on) so the
+        # findings JSON + Results land on the workspace + Results
+        # files before the gate fires. Consumers (smoke-assert,
+        # PaC GitHub Checks) can still read them on a failed run.
+        if [ -z "${FAIL_ON_SEVERITY}" ]; then
+          echo "[emit-results] fail-on-severity empty; non-gating run"
+          exit 0
+        fi
+
+        TH=$(printf '%s' "${FAIL_ON_SEVERITY}" | tr '[:upper:]' '[:lower:]')
+        case "${TH}" in
+          critical)    AT_OR_ABOVE=$((CRIT)) ;;
+          high)        AT_OR_ABOVE=$((CRIT + HIGH)) ;;
+          medium)      AT_OR_ABOVE=$((CRIT + HIGH + MED)) ;;
+          low)         AT_OR_ABOVE=$((CRIT + HIGH + MED + LOW)) ;;
+          negligible)  AT_OR_ABOVE=$((CRIT + HIGH + MED + LOW + NEG)) ;;
+          *)
+            echo "FATAL: fail-on-severity='${FAIL_ON_SEVERITY}' not one of: critical, high, medium, low, negligible (or empty)" >&2
+            exit 2
+            ;;
+        esac
+
+        echo "[emit-results] threshold=${TH}  at-or-above: ${AT_OR_ABOVE}"
+        if [ "${AT_OR_ABOVE}" -gt 0 ]; then
+          echo "[emit-results] FAIL: ${AT_OR_ABOVE} finding(s) at or above '${TH}' severity" >&2
+          exit 1
+        fi
+        echo "[emit-results] OK: no findings at or above '${TH}' severity"

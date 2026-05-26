@@ -1,0 +1,325 @@
+# build-grype-db — daily producer Pipeline for the self-hosted Grype DB.
+#
+# Wires the build-grype-db Task into a one-task Pipeline so:
+#   - PipelineRun is the kubectl object operators reach for (rather than
+#     a free-floating TaskRun), giving us the usual `tkn pipeline start`
+#     ergonomics + log streaming.
+#   - Pipeline-level Results re-expose the Task's Chains-grammar Results,
+#     so a PipelineRun-level Chains attestation (with
+#     artifacts.pipelinerun.enable-deep-inspection: "true" — same
+#     ConfigMap docs/provenance.md walks through) sees the same subject
+#     grammar the TaskRun exposes.
+#
+# WHY NOT just a Task-driven PipelineRun: when phase-2 lands the consumer
+# Task (vuln-scan) directly downstream — same Pipeline file, runAfter:
+# [build] — we want the structure already in place. Cheap to add now,
+# expensive to refactor later. See PLAN.md for the producer/consumer
+# split (#56) + downstream attestation flow.
+#
+# CRON TRIGGER: plain Kubernetes CronJob.
+#
+# We deliberately use a vanilla `batch/v1.CronJob` that shells out to
+# `tkn pipeline start build-grype-db ...` rather than a Pipelines-as-Code
+# `on-cron` trigger. PaC's deep-inspection ConfigMap + GitHub-App-bound
+# event polling is fragile for unattended jobs that don't originate from
+# a git push (see PaC issues #1547, #1612 on the on-cron event
+# generation gotcha — events get suppressed if the watched repo has no
+# recent activity). A k8s CronJob:
+#   - is a single-purpose primitive every k8s operator already understands
+#   - has crystal-clear failure semantics (succeeded/failed Job, kept
+#     N runs visible via successfulJobsHistoryLimit)
+#   - does not depend on the PaC controller being healthy
+# Trade-off: we lose PaC's inline status reporting in GitHub Checks, but
+# this Pipeline isn't gated on a PR — it's a scheduled maintenance job.
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: build-grype-db
+spec:
+  description: |
+    Produce + sign + publish a Grype vulnerability DB snapshot to
+    the `ceph-grype-db` S3 bucket. Driven by the `build-grype-db-cron`
+    CronJob (this file) once daily, or invoked ad-hoc with
+    `tkn pipeline start build-grype-db ...`.
+
+    Single Task today (the heavy lifter `build-grype-db`); the slot
+    is shaped so a downstream `vuln-scan-smoke` Task can be wired
+    runAfter: [build] in a follow-up without reshuffling the
+    Pipeline-level Results contract.
+  params:
+    - name: schema-version
+      type: string
+      default: "6"
+      description: |
+        Grype DB schema. v6 = current generation (grype 0.112+).
+        Threaded through to the Task; also used in the S3 key prefix
+        + latest.json `schema` field.
+    - name: providers
+      type: array
+      default: ["nvd"]
+      description: |
+        Vunnel providers to pull. Default `["nvd"]` for fast
+        iteration (≈minutes); production CronJob overrides this
+        via the args block in the CronJob spec below to the full
+        anchore upstream set.
+    - name: bucket
+      type: string
+      default: ceph-grype-db
+      description: |
+        S3 bucket name (matches the `ceph-grype-db` bucket in
+        terraform/modules/s3-buckets).
+    - name: s3-endpoint
+      type: string
+      default: ""
+      description: |
+        Optional `--endpoint-url`. Empty = AWS default. Sepia
+        overlay sets this to the RGW endpoint.
+    - name: subject-prefix
+      type: string
+      default: https://artifacts.ceph.com/ceph-grype-db/
+      description: |
+        Canonical public URL prefix for the published DB. Used as
+        the Chains attestation subject so verifiers can resolve the
+        artefact off-cluster without S3 creds. Trailing slash is
+        optional — the Task trims and re-appends.
+    - name: cosign-key-secret
+      type: string
+      default: cosign-signing-key
+      description: |
+        Name of the Secret backing the `cosign-key` workspace —
+        threaded into the binding below. The Secret must contain
+        keys `cosign.key` and `cosign.pub` (the shape that
+        `cosign generate-key-pair k8s://NAMESPACE/NAME` produces).
+        See hack/dev-chains-setup.sh for the dev bootstrap.
+    - name: s3-credentials-secret
+      type: string
+      default: ""
+      description: |
+        Optional. Name of the Secret backing the `s3-credentials`
+        workspace (one secret value per key: AWS_ACCESS_KEY_ID,
+        AWS_SECRET_ACCESS_KEY, optionally AWS_SESSION_TOKEN). Leave
+        empty in Sepia where STS-OIDC mints creds via the projected
+        SA token — the Task falls through to that branch when the
+        workspace is empty.
+        Currently unwired (the workspace binding below is static);
+        threading this requires turning the Pipeline-level workspace
+        into a workspaceBindings inline construct done at the
+        PipelineRun level. Operators typically pin the Secret name
+        per-environment via a kustomize overlay rather than
+        per-PipelineRun, so leaving it as overlay-time config is fine.
+  workspaces:
+    - name: state
+      description: |
+        Scratch workspace for vunnel cache + grype-db build output
+        + tarball. The CronJob's PipelineRun binds this to a
+        volumeClaimTemplate (a fresh PVC per run); ad-hoc
+        invocations can bind an emptyDir for small `providers=[nvd]`
+        runs that fit in memory + tmpfs.
+    - name: cosign-key
+      description: |
+        Cosign signing key Secret. Phase 1 requires this. Once
+        keyless-Fulcio lands (issue #57 followup) this workspace
+        becomes optional and the Task switches paths based on
+        AWS_ROLE_ARN + SA-token-file presence.
+    - name: s3-credentials
+      description: |
+        S3 upload credentials. Empty in Sepia (Task uses STS-OIDC
+        via projected SA token), Secret-backed in dev / non-Sepia.
+      optional: true
+  results:
+    # Re-expose the Task's Results at the Pipeline level so a
+    # PipelineRun-level Chains attestation (deep-inspection) sees
+    # the same subject grammar. Same pattern as
+    # sbom-pkg-smoke-test.yaml's Pipeline-level results block.
+    - name: IMAGES
+      description: |
+        `<subject-url>@sha256:<digest>` for the published DB.
+        Chains multi-subject matcher attaches this to the
+        slsa/v2alpha4 attestation's subject[].
+      value: $(tasks.build.results.IMAGES)
+    - name: ARTIFACT_OUTPUTS
+      description: |
+        Chains ARTIFACT_OUTPUTS object Result —
+        {uri, digest, isBuildArtifact:"true"}. isBuildArtifact "true"
+        promotes this to a subject (vs byproduct).
+      value: $(tasks.build.results.ARTIFACT_OUTPUTS)
+    - name: db-url
+      description: Canonical https URL of the published DB tarball.
+      value: $(tasks.build.results.db-url)
+    - name: db-digest
+      description: sha256 digest of the tarball.
+      value: $(tasks.build.results.db-digest)
+    - name: db-bundle-url
+      description: Canonical https URL of the cosign sigstore bundle.
+      value: $(tasks.build.results.db-bundle-url)
+    - name: db-schema-version
+      description: Schema version echoed from the input param.
+      value: $(tasks.build.results.db-schema-version)
+    - name: db-latest-url
+      description: |
+        Canonical https URL of the latest.json pointer for this
+        schema. Consumers HEAD/GET this to discover the current DB.
+      value: $(tasks.build.results.db-latest-url)
+  tasks:
+    - name: build
+      taskRef:
+        name: build-grype-db
+      params:
+        - name: schema-version
+          value: $(params.schema-version)
+        - name: providers
+          # Array passthrough needs the [*] expansion form — bare
+          # `$(params.providers)` would be a single-string ref. The
+          # list/array shape is preserved across this expansion.
+          value:
+            - $(params.providers[*])
+        - name: bucket
+          value: $(params.bucket)
+        - name: s3-endpoint
+          value: $(params.s3-endpoint)
+        - name: subject-prefix
+          value: $(params.subject-prefix)
+      workspaces:
+        - name: state
+          workspace: state
+        - name: cosign-key
+          workspace: cosign-key
+        - name: s3-credentials
+          workspace: s3-credentials
+---
+# ============================================================================
+# CronJob — schedules a daily PipelineRun.
+#
+# We launch a PipelineRun by `kubectl apply`-ing a YAML manifest (with
+# generateName for uniqueness), rather than running `tkn pipeline start`.
+# Reasons:
+#   - tkn is a separate binary in the cron pod, bloating the image.
+#   - `kubectl apply` + generateName is the same flow PaC uses under the
+#     hood; behaves identically + has no extra failure mode.
+#   - The PipelineRun spec is right there in the CronJob — operators see
+#     the workspace bindings + provider list inline, no indirection.
+#
+# THE PROVIDER LIST: production
+# Override `providers` here for production runs. The full anchore upstream
+# set is ~12 providers, total runtime 1-3h, ~600MB compressed DB. Some
+# providers want API keys (GitHub: GITHUB_TOKEN); thread those via
+# env-from-secret on the build Task when scheduling those providers.
+# ============================================================================
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: build-grype-db-cron
+  labels:
+    app.kubernetes.io/name: build-grype-db
+    app.kubernetes.io/component: cron-driver
+spec:
+  # Daily at 03:17 UTC. Off-the-hour to avoid clustering with every
+  # other "daily" cron on the same cluster. The DB feeds are updated
+  # by the upstream providers at varying cadences (NVD is hourly,
+  # ubuntu is several times daily, debian is weekly); 03:17 UTC
+  # catches "yesterday's" NVD additions in time for downstream PR
+  # scans during US/EU working hours.
+  schedule: "17 3 * * *"
+
+  # Skip the run if the previous one is still going. The full-providers
+  # build can take 1-3h; if it ever runs over 24h we have bigger problems.
+  concurrencyPolicy: Forbid
+
+  # Keep recent history visible in `kubectl get jobs` for triage; cleanup
+  # is hands-off otherwise.
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 7
+
+  # Don't drift more than 1h if the controller was down at the
+  # scheduled time — past that, skip rather than catch up (we'd
+  # rather miss a day than queue four catch-up runs).
+  startingDeadlineSeconds: 3600
+
+  jobTemplate:
+    spec:
+      # Each kubectl apply is idempotent on the PipelineRun manifest's
+      # generateName (kube creates a new object). The Job pod itself
+      # exits as soon as the apply succeeds — we don't wait for the
+      # PipelineRun to complete (Tekton's controller takes over from
+      # there). Job success = PipelineRun was successfully *submitted*,
+      # not that it succeeded. Downstream observability comes from
+      # Tekton's own status surfaces (`tkn pipelinerun list`).
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          # Tekton Pipelines installs a `pipeline` SA by default, but
+          # the apply needs RBAC to create PipelineRuns. The
+          # `build-grype-db-cron` SA + Role is provisioned by the
+          # kustomize overlay (kustomize/base/build-grype-db/ — created
+          # alongside this manifest in a follow-up commit).
+          serviceAccountName: build-grype-db-cron
+          containers:
+            - name: kubectl
+              # bitnami/kubectl is a small, well-maintained image with
+              # just the kubectl binary + a shell. Pinned to a minor
+              # for build determinism.
+              image: docker.io/bitnami/kubectl:1.30
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  cat <<'YAML' | kubectl create -f -
+                  apiVersion: tekton.dev/v1
+                  kind: PipelineRun
+                  metadata:
+                    generateName: build-grype-db-
+                    labels:
+                      app.kubernetes.io/name: build-grype-db
+                      app.kubernetes.io/component: scheduled-run
+                  spec:
+                    pipelineRef:
+                      name: build-grype-db
+                    params:
+                      - name: schema-version
+                        value: "6"
+                      # Production override: full anchore upstream set.
+                      # Comment to fall back to the [nvd]-only default
+                      # while iterating.
+                      - name: providers
+                        value:
+                          - alpine
+                          - amazon
+                          - chainguard
+                          - debian
+                          - github
+                          - mariner
+                          - nvd
+                          - oracle
+                          - redhat
+                          - sles
+                          - ubuntu
+                          - wolfi
+                      - name: bucket
+                        value: ceph-grype-db
+                      - name: subject-prefix
+                        value: https://artifacts.ceph.com/ceph-grype-db/
+                    workspaces:
+                      - name: state
+                        # Fresh PVC per run — ~10GB headroom for the
+                        # full-provider vunnel cache + uncompressed DB.
+                        # storageClassName left unset = cluster default.
+                        volumeClaimTemplate:
+                          spec:
+                            accessModes: ["ReadWriteOnce"]
+                            resources:
+                              requests:
+                                storage: 10Gi
+                      - name: cosign-key
+                        secret:
+                          # Same Secret name as the Pipeline-level
+                          # default param `cosign-key-secret`.
+                          secretName: cosign-signing-key
+                      - name: s3-credentials
+                        # Sepia uses STS-OIDC via projected SA token —
+                        # the cosign workspace short-circuits when this
+                        # is an emptyDir. For non-Sepia envs the
+                        # kustomize overlay swaps this for a Secret.
+                        emptyDir: {}
+                  YAML
