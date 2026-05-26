@@ -1,0 +1,97 @@
+# vuln-scan-smoke-test — `vuln-scan-smoke-seed` Task.
+#
+# Stages one deterministic synthetic CycloneDX-JSON SBOM into the shared
+# sboms workspace, declaring a single component that Grype knows has
+# Critical CVEs (log4j-core 2.14.1 — Log4Shell).
+#
+# The SBOM bytes are written verbatim from a heredoc so the smoke test
+# is byte-stable across runs and doesn't depend on syft or any other
+# SBOM generator.
+#
+# Pairs with pipelines/pipelines/vuln-scan-smoke-test.yaml.
+#
+# Single-resource file (no leading `---`) so PaC's remote-resolution
+# (`pipelinesascode.tekton.dev/task: vuln-scan-smoke-seed@URL`) succeeds.
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: vuln-scan-smoke-seed
+spec:
+  description: |
+    Stage one deterministic synthetic CycloneDX-JSON SBOM into the
+    shared sboms workspace, declaring a single component that Grype
+    knows has Critical CVEs (log4j-core 2.14.1 — Log4Shell).
+
+    The SBOM bytes are written verbatim from a heredoc so the smoke
+    test is byte-stable across runs and doesn't depend on syft or
+    any other SBOM generator.
+  params:
+    - name: tools-image
+      type: string
+      default: docker.io/library/busybox:1.36
+      description: |
+        Pinned busybox image. Same pin as the other smoke tests in
+        this repo for build determinism.
+  workspaces:
+    - name: sboms
+      mountPath: /workspace/sboms
+  steps:
+    - name: seed
+      image: $(params.tools-image)
+      workingDir: /workspace/sboms
+      script: |
+        #!/bin/sh
+        set -eu
+
+        # CycloneDX 1.5 JSON for a single vulnerable component.
+        # `purl` is the key field Grype matches against the
+        # vulnerability DB; the human-readable name+version is a
+        # convenience for log inspection.
+        #
+        # Log4Shell (CVE-2021-44228) on log4j-core 2.14.1 is one of
+        # the most stably-indexed CVEs across grype's DB releases —
+        # if a future grype version stops finding this we have
+        # bigger problems than the smoke test.
+        cat > log4j-shell.cdx.json <<'EOF'
+        {
+          "bomFormat": "CycloneDX",
+          "specVersion": "1.5",
+          "serialNumber": "urn:uuid:00000000-0000-4000-8000-000000000001",
+          "version": 1,
+          "metadata": {
+            "timestamp": "2023-11-14T22:13:20Z",
+            "tools": {
+              "components": [
+                {
+                  "type": "application",
+                  "name": "vuln-scan-smoke-seed",
+                  "version": "1.0.0"
+                }
+              ]
+            },
+            "component": {
+              "bom-ref": "pkg:generic/vuln-scan-smoke@1.0.0",
+              "type": "application",
+              "name": "vuln-scan-smoke",
+              "version": "1.0.0"
+            }
+          },
+          "components": [
+            {
+              "bom-ref": "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1",
+              "type": "library",
+              "group": "org.apache.logging.log4j",
+              "name": "log4j-core",
+              "version": "2.14.1",
+              "purl": "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1"
+            }
+          ]
+        }
+        EOF
+
+        echo "[seed] staged SBOMs:"
+        ls -la /workspace/sboms
+        echo
+        echo "[seed] log4j-shell.cdx.json head:"
+        head -c 200 log4j-shell.cdx.json
+        echo

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# assert-compute-matrix-smoke.sh — run pipelines/compute-matrix-smoke-test.yaml
+# assert-compute-matrix-smoke.sh — run pipelines/pipelines/compute-matrix-smoke-test.yaml
 # and assert:
 #
 #   1. The PipelineRun reaches Succeeded (the in-cluster `assert-results`
@@ -13,8 +13,8 @@
 #      consumer Task reading it.
 #
 # Prereqs:
-#   - tasks/compute-matrix/task.yaml + pipelines/compute-matrix-smoke-test.yaml
-#     installed.
+#   - tasks/compute-matrix/task.yaml + pipelines/tasks/compute-matrix-smoke-{seed,assert}.yaml
+#     + pipelines/pipelines/compute-matrix-smoke-test.yaml installed.
 #   - jq on PATH (used to re-parse the JSON array out of band).
 #
 # Mechanism for fetching the Result bytes out of the cluster:
@@ -36,9 +36,16 @@ require_cmd kubectl "brew install kubectl"
 require_cmd tkn     "brew install tektoncd-cli"
 require_cmd jq      "brew install jq"
 
-# Apply the task + pipeline.
-kube_ctx apply -f "${E2E_REPO_ROOT}/tasks/compute-matrix/task.yaml" >/dev/null
-kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/compute-matrix-smoke-test.yaml" >/dev/null
+# Apply the canonical compute-matrix Task, the smoke-only seed +
+# assert Tasks, then the Pipeline. Issue #68 split the smoke
+# pipeline's embedded Tasks (compute-matrix-smoke-seed +
+# compute-matrix-smoke-assert) into single-resource files under
+# `pipelines/tasks/`; the Pipeline moved to `pipelines/pipelines/`.
+# Apply order matters: Tasks before Pipeline.
+kube_ctx apply -f "${E2E_REPO_ROOT}/tasks/compute-matrix/task.yaml"                  >/dev/null
+kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/tasks/compute-matrix-smoke-seed.yaml"   >/dev/null
+kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/tasks/compute-matrix-smoke-assert.yaml" >/dev/null
+kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/pipelines/compute-matrix-smoke-test.yaml" >/dev/null
 
 # Source workspace is emptyDir — the seed Task writes matrix.yaml into
 # it inside the PipelineRun and compute-matrix reads from it. No PVC

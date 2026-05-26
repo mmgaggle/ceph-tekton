@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# assert-chains-smoke.sh — run pipelines/chains-smoke-test.yaml and
+# assert-chains-smoke.sh — run pipelines/pipelines/chains-smoke-test.yaml and
 # assert the full Chains -> cosign -> Rekor chain works end-to-end.
 #
 # Pass criteria:
@@ -48,8 +48,14 @@ require_cmd jq        "brew install jq"
 COSIGN_PUB="${E2E_ARTIFACTS}/cosign.pub"
 fetch_cosign_pub "${COSIGN_PUB}"
 
-# Apply the pipeline (idempotent).
-kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/chains-smoke-test.yaml" >/dev/null
+# Apply the Tasks then the Pipeline (idempotent). Issue #68 split
+# `pipelines/chains-smoke-test.yaml` (2 Tasks + Pipeline) into
+# single-resource files under `pipelines/tasks/` and
+# `pipelines/pipelines/` so PaC remote-resolution works. Apply order
+# matters: Tasks before Pipeline.
+kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/tasks/chains-smoke-build.yaml" >/dev/null
+kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/tasks/chains-smoke-sbom.yaml"  >/dev/null
+kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/pipelines/chains-smoke-test.yaml" >/dev/null
 
 # Start the pipeline. The sbom Task needs a workspace; use emptyDir.
 PR="$(start_pipelinerun "${NS}" chains-smoke-test \

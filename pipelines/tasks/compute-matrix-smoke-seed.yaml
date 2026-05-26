@@ -1,0 +1,74 @@
+# compute-matrix-smoke-test — `compute-matrix-smoke-seed` Task.
+#
+# Stages a deterministic synthetic matrix.yaml in the shared source
+# workspace so `compute-matrix` has something to read. Three cells with
+# a mix of gating=true and gating=false, so the assert step has signal
+# on both code paths.
+#
+# Pairs with pipelines/pipelines/compute-matrix-smoke-test.yaml.
+#
+# Single-resource file (no leading `---`) so PaC's remote-resolution
+# (`pipelinesascode.tekton.dev/task: compute-matrix-smoke-seed@URL`) succeeds.
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: compute-matrix-smoke-seed
+spec:
+  description: |
+    Stage a deterministic synthetic matrix.yaml in the shared source
+    workspace so `compute-matrix` has something to read. Three cells
+    with a mix of gating=true and gating=false, so the assert step
+    has signal on both code paths.
+  params:
+    - name: tools-image
+      type: string
+      default: docker.io/library/busybox:1.36
+      description: |
+        Pinned busybox image. Same pin as the other smoke tests in
+        this repo for build determinism.
+    - name: matrix-file
+      type: string
+      default: matrix.yaml
+      description: |
+        Path (relative to the source workspace) to write the synthetic
+        matrix.yaml at. Must match the `matrix-file` param threaded to
+        the `compute-matrix` Task downstream.
+  workspaces:
+    - name: source
+      mountPath: /workspace/source
+  steps:
+    - name: seed
+      image: $(params.tools-image)
+      workingDir: /workspace/source
+      env:
+        - name: MATRIX_FILE
+          value: $(params.matrix-file)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        # Three cells: two gating, one non-gating. The non-gating cell
+        # exercises the `gating: false` → "false" string-coercion path.
+        # Kept tiny on purpose — the smoke is about the Task's parse +
+        # emit path, not about exercising the real production matrix.
+        cat > "${MATRIX_FILE}" <<'EOF'
+        # Synthetic matrix.yaml for compute-matrix-smoke-test.
+        # Real source trees ship this at the repo root; see
+        # docs/build-matrix.md for the schema.
+        cells:
+          - distro: centos10
+            arch: x86_64
+            gating: true
+          - distro: ubuntu-noble
+            arch: aarch64
+            gating: true
+          - distro: fedora-rawhide
+            arch: x86_64
+            gating: false
+        EOF
+
+        echo "[seed] staged source workspace:"
+        ls -la /workspace/source
+        echo
+        echo "[seed] ${MATRIX_FILE} contents:"
+        cat "${MATRIX_FILE}"

@@ -21,7 +21,7 @@ hashicorp/vault   chart 0.28.1   (Vault 1.17.2 appVersion)
 
 The pin lives in `hack/dev-vault-up.sh` as `VAULT_CHART_VERSION`.
 Bump it in a PR after testing the new chart against the smoke-test
-pipeline (`pipelines/vault-smoke-test.yaml`).
+pipeline (`pipelines/pipelines/vault-smoke-test.yaml`).
 
 ## Install (dev)
 

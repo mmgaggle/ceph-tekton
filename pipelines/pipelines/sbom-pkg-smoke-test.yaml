@@ -1,0 +1,167 @@
+# sbom-pkg-smoke-test — smoke Pipeline for the `generate-sbom` Task.
+#
+# Wires `generate-sbom` against the cheapest possible "package" artifacts
+# that still prove the Task end-to-end:
+#
+#   - A `sbom-pkg-smoke-seed` Task creates two deterministic .tar files
+#     ("fake-pkg-a_1.0.tar", "fake-pkg-b_1.0.tar") in the shared
+#     artifacts workspace. Same deterministic-tar pattern as
+#     pipelines/pipelines/reproducibility-check.yaml — same flags, same intent
+#     (sort=name, mtime=@SOURCE_DATE_EPOCH, owner=0, numeric-owner).
+#
+#   - `generate-sbom` scans them with syft, writes one
+#     <basename>.cdx.json per artifact into the sboms workspace, and
+#     emits the Chains-grammar plural Results (`IMAGES`,
+#     `ARTIFACT_OUTPUTS`) plus the contract-level index Results
+#     (`SBOM_NAMES`, `SBOM_COUNT`, `SBOM_MEDIATYPE`).
+#
+#   - `sbom-pkg-smoke-assert` greps every Result for shape conformance:
+#     IMAGES has one `<url>@sha256:<hex>` line per seeded artifact,
+#     ARTIFACT_OUTPUTS is a JSON array with one entry per artifact each
+#     embedding the CycloneDX mediaType, and SBOM_NAMES contains both
+#     expected per-artifact slugs (FAKE_PKG_A + FAKE_PKG_B). If any
+#     shape check fails, the PipelineRun fails — the smoke test exists
+#     to catch silent regressions in the Chains-grammar contract.
+#
+# Pairs with:
+#   - pipelines/tasks/sbom-pkg-smoke-seed.yaml
+#   - pipelines/tasks/sbom-pkg-smoke-assert.yaml
+#   - tasks/generate-sbom/task.yaml  (the canonical `generate-sbom` Task)
+# Apply all three Tasks before this Pipeline.
+#
+# Why .tar instead of real .deb / .rpm:
+#   - .deb / .rpm need apt/yum + signing keys + a real package source
+#     tree just to produce one valid artefact. That's the build-package
+#     Task's job (#16), not this Task's. `generate-sbom` only cares
+#     that there are FILES; syft happily produces a CycloneDX SBOM
+#     against an arbitrary directory.
+#   - When #16 lands, this smoke pipeline stays as-is and a sibling
+#     "real" pipeline does `build-package` -> `generate-sbom` against
+#     actual .deb / .rpm output.
+#
+# The pipeline runs entirely offline-friendly: no S3 upload, no
+# registry pulls beyond syft + busybox + debian-slim (all already
+# cached by the other smoke tests).
+#
+# Single-resource file (no leading `---`) so PaC's remote-resolution
+# (`pipelinesascode.tekton.dev/pipeline: sbom-pkg-smoke-test@URL`) succeeds.
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: sbom-pkg-smoke-test
+spec:
+  description: |
+    Three-Task pipeline:
+      1. `seed`           — stage two deterministic .tar files into
+                            the artifacts workspace.
+      2. `generate-sbom`  — produce one CycloneDX SBOM per tarball,
+                            emit the Chains-grammar plural Results
+                            (`IMAGES`, `ARTIFACT_OUTPUTS`) plus the
+                            contract-level index Results
+                            (`SBOM_NAMES`, `SBOM_COUNT`,
+                             `SBOM_MEDIATYPE`).
+      3. `assert-results` — verify each Result is shape-correct (one
+                            IMAGES line + one ARTIFACT_OUTPUTS entry
+                            per seeded artifact, both per-artifact
+                            slugs present in SBOM_NAMES, the right
+                            CycloneDX mediaType). Fails the
+                            PipelineRun on any mismatch.
+
+    See docs/provenance.md ("Per-build package SBOMs") for the
+    walkthrough on extracting a specific package's SBOM from the
+    Chains-signed attestation once it lands.
+  params:
+    - name: artifact-glob
+      type: string
+      default: "*.tar"
+      description: |
+        Glob the generate-sbom Task evaluates against the artifacts
+        workspace. Smoke seed produces .tar files; real package
+        pipelines use `*.deb` or `*.rpm`.
+    - name: syft-image
+      type: string
+      default: docker.io/anchore/syft:v1.18.0
+    - name: tools-image
+      type: string
+      default: docker.io/library/busybox:1.36
+  workspaces:
+    - name: artifacts
+      description: |
+        Shared workspace where the seed Task drops .tar files and the
+        generate-sbom Task reads from. emptyDir is fine for smoke;
+        real pipelines bind the build-output PVC from `build-package`.
+    - name: sboms
+      description: |
+        Shared workspace where per-artifact `<basename>.cdx.json`
+        SBOMs are written. May be the same workspace as `artifacts`
+        in real pipelines so publish-repo picks them up alongside the
+        .deb / .rpm.
+  tasks:
+    - name: seed
+      taskRef:
+        name: sbom-pkg-smoke-seed
+      workspaces:
+        - name: artifacts
+          workspace: artifacts
+    - name: generate-sbom
+      runAfter: [seed]
+      taskRef:
+        name: generate-sbom
+      params:
+        - name: artifact-glob
+          value: $(params.artifact-glob)
+        - name: syft-image
+          value: $(params.syft-image)
+        - name: tools-image
+          value: $(params.tools-image)
+        # Smoke runs offline — no S3 upload.
+        - name: s3-bucket
+          value: ""
+      workspaces:
+        - name: artifacts
+          workspace: artifacts
+        - name: sboms
+          workspace: sboms
+    - name: assert-results
+      runAfter: [generate-sbom]
+      taskRef:
+        name: sbom-pkg-smoke-assert
+      params:
+        - name: images
+          value: $(tasks.generate-sbom.results.IMAGES)
+        - name: artifact-outputs
+          value: $(tasks.generate-sbom.results.ARTIFACT_OUTPUTS)
+        - name: sbom-names
+          value: $(tasks.generate-sbom.results.SBOM_NAMES)
+        - name: sbom-count
+          value: $(tasks.generate-sbom.results.SBOM_COUNT)
+        - name: sbom-mediatype
+          value: $(tasks.generate-sbom.results.SBOM_MEDIATYPE)
+        - name: tools-image
+          value: $(params.tools-image)
+  results:
+    # Re-expose the generate-sbom Task's Results at the Pipeline level
+    # so a PipelineRun-level Chains attestation (deep-inspection enabled
+    # or not) sees the same multi-subject grammar that the TaskRun
+    # exposes. IMAGES + ARTIFACT_OUTPUTS are the Chains-grammar
+    # Results; the SBOM_* triplet is the contract-level index.
+    - name: IMAGES
+      description: |
+        Newline-separated `<url>@sha256:<digest>` pairs, one per
+        scanned artifact. Chains promotes each pair to a subject.
+      value: $(tasks.generate-sbom.results.IMAGES)
+    - name: ARTIFACT_OUTPUTS
+      description: |
+        JSON array of per-artifact descriptors with nested SBOM
+        block. Chains 0.20+ uses the nested `sbom` to populate
+        `predicate.buildDefinition.resolvedDependencies[]`.
+      value: $(tasks.generate-sbom.results.ARTIFACT_OUTPUTS)
+    - name: sbom-count
+      description: Number of per-artifact CycloneDX SBOMs emitted.
+      value: $(tasks.generate-sbom.results.SBOM_COUNT)
+    - name: sbom-names
+      description: Newline-separated list of per-artifact slugs.
+      value: $(tasks.generate-sbom.results.SBOM_NAMES)
+    - name: sbom-mediatype
+      description: application/vnd.cyclonedx+json.
+      value: $(tasks.generate-sbom.results.SBOM_MEDIATYPE)

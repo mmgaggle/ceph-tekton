@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# assert-generate-sbom-smoke.sh — run pipelines/sbom-pkg-smoke-test.yaml
+# assert-generate-sbom-smoke.sh — run pipelines/pipelines/sbom-pkg-smoke-test.yaml
 # and assert:
 #
 #   1. The PipelineRun reaches Succeeded.
@@ -48,9 +48,15 @@ require_cmd tkn     "brew install tektoncd-cli"
 require_cmd jq      "brew install jq"
 require_cmd syft    "brew install syft"
 
-# Apply the task + pipeline.
-kube_ctx apply -f "${E2E_REPO_ROOT}/tasks/generate-sbom/task.yaml" >/dev/null
-kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/sbom-pkg-smoke-test.yaml" >/dev/null
+# Apply the canonical generate-sbom Task, the smoke-only seed + assert
+# Tasks, then the Pipeline. Issue #68 split the smoke pipeline's
+# embedded Tasks (sbom-pkg-smoke-seed + sbom-pkg-smoke-assert) into
+# single-resource files under `pipelines/tasks/`; the Pipeline moved
+# to `pipelines/pipelines/`. Apply order matters: Tasks before Pipeline.
+kube_ctx apply -f "${E2E_REPO_ROOT}/tasks/generate-sbom/task.yaml"            >/dev/null
+kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/tasks/sbom-pkg-smoke-seed.yaml"   >/dev/null
+kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/tasks/sbom-pkg-smoke-assert.yaml" >/dev/null
+kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/pipelines/sbom-pkg-smoke-test.yaml" >/dev/null
 
 # Use a NAMED PVC for the sboms workspace so we can re-mount it in a
 # follow-up debug Pod and read the SBOM bytes out. The artifacts

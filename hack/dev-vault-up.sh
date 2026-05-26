@@ -159,7 +159,8 @@ transit configured:
 next:
   # run the smoke-test pipeline — authenticates via SA token, signs
   # a known payload, asserts the response contains a signature.
-  kubectl apply -f pipelines/vault-smoke-test.yaml
+  kubectl -n $VAULT_TEST_NAMESPACE apply -f pipelines/tasks/vault-sign-smoke.yaml
+  kubectl -n $VAULT_TEST_NAMESPACE apply -f pipelines/pipelines/vault-smoke-test.yaml
   tkn pipeline start vault-smoke-test \\
     --serviceaccount $VAULT_TEST_SA \\
     -n $VAULT_TEST_NAMESPACE \\

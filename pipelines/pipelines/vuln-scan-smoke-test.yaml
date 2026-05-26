@@ -1,0 +1,223 @@
+# vuln-scan-smoke-test — smoke Pipeline for the `vuln-scan` Task.
+#
+# Wires `vuln-scan` against the cheapest possible vulnerable input that
+# still proves the Task end-to-end:
+#
+#   - A `vuln-scan-smoke-seed` Task writes a deterministic synthetic
+#     CycloneDX-JSON SBOM into the shared `sboms` workspace. The SBOM
+#     declares a single deliberately-vulnerable component (`log4j-core`
+#     at 2.14.1 — Log4Shell, CVE-2021-44228 + CVE-2021-45046 + others,
+#     ranked Critical by Grype). This avoids depending on `generate-sbom`
+#     and lets the smoke run fast: no syft, no real package payload, no
+#     .tar files to scan.
+#
+#   - `vuln-scan` fetches the producer-published Grype DB from the URL
+#     passed in via `db-pointer-url` (default points at the prod
+#     artifacts.ceph.com canonical URL; smoke runs against vstart
+#     override this to a dev RGW HTTPS endpoint), cosign-verifies it,
+#     unpacks it, runs grype against the seeded SBOM with
+#     `fail-on-severity=""` (non-gating), and emits the Chains-grammar
+#     Results.
+#
+#   - `vuln-scan-smoke-assert` greps every Result for shape conformance:
+#       * `vuln-summary` includes the expected `critical=` / `high=` /
+#         `medium=` tokens, with the critical+high tally > 0 (Log4Shell
+#         is Critical; the chain of dependent CVEs pulls in High as well).
+#       * `findings-ARTIFACT_OUTPUTS` is a JSON object with the expected
+#         three keys (uri, digest, isBuildArtifact) — the exact wire
+#         format Chains' object-Result matcher consumes.
+#       * `findings-count` is a positive integer.
+#       * The consolidated `findings.grype.json` in the sboms workspace
+#         parses as JSON (lightweight shape check; the smoke runs offline
+#         so no jq, only busybox grep).
+#
+# Pairs with:
+#   - pipelines/tasks/vuln-scan-smoke-seed.yaml
+#   - pipelines/tasks/vuln-scan-smoke-assert.yaml
+#   - tasks/vuln-scan/task.yaml  (the canonical `vuln-scan` Task)
+# Apply all three Tasks before this Pipeline.
+#
+# Why a synthetic SBOM instead of `generate-sbom -> vuln-scan`:
+#   Composing the two Tasks IS the production wiring (see
+#   docs/vuln-scanning.md "Wiring into a real build pipeline"), but
+#   it means the smoke run depends on syft + a fake package payload
+#   + the generate-sbom Task being deployed — every dependency adds
+#   a way for the smoke to false-negative on a `vuln-scan` bug. A
+#   hand-crafted SBOM with a known-vulnerable component is the
+#   minimal input that proves the fetch + verify + unpack + scan +
+#   emit path.
+#
+# DB DELIVERY MODEL:
+#   The new vuln-scan Task fetches the Grype DB OUT OF BAND from
+#   the producer Pipeline (`pipelines/build-grype-db.yaml` + Task
+#   `tasks/build-grype-db`). There is no `db-update` step inside
+#   the consumer Task — that step was the runtime-bug source in the
+#   original #51 draft (distroless grype + TUI assumptions + per-
+#   step /tmp not shared between db-update and scan). The smoke
+#   pipeline therefore has NO `db-cache` workspace; the consumer
+#   Task fetches a fresh DB tarball into its own `.grype-db/`
+#   subdirectory of the sboms workspace per TaskRun.
+#
+# Single-resource file (no leading `---`) so PaC's remote-resolution
+# (`pipelinesascode.tekton.dev/pipeline: vuln-scan-smoke-test@URL`) succeeds.
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: vuln-scan-smoke-test
+spec:
+  description: |
+    Three-Task pipeline:
+      1. `seed`              — stage one deterministic synthetic
+                               CycloneDX SBOM declaring log4j-core
+                               2.14.1 (Log4Shell, CVE-2021-44228 et
+                               al.) into the sboms workspace.
+      2. `vuln-scan`         — fetch the producer-published Grype DB
+                               from `db-pointer-url`, cosign-verify
+                               it, unpack, scan the seeded SBOM with
+                               `fail-on-severity=""` so the smoke is
+                               non-gating. Emits the Chains-grammar
+                               Results.
+      3. `assert-results`    — verify each Result is shape-correct
+                               (critical findings > 0,
+                               findings-ARTIFACT_OUTPUTS carries
+                               the uri/digest/isBuildArtifact triple
+                               with isBuildArtifact:"false", the
+                               consolidated findings JSON exists
+                               and parses). Fails the PipelineRun
+                               on any mismatch.
+
+    See docs/vuln-scanning.md for the verifier-side walkthrough
+    (how to extract the findings JSON from the Chains attestation
+    and re-parse with grype / jq) and for the producer/consumer
+    contract this pipeline exercises end-to-end.
+  params:
+    - name: grype-image
+      type: string
+      default: docker.io/anchore/grype:v0.112.0
+    - name: cosign-image
+      type: string
+      default: ghcr.io/sigstore/cosign/cosign:v2.4.1
+    - name: tools-image
+      type: string
+      default: docker.io/library/busybox:1.36
+    - name: sbom-file
+      type: string
+      default: "log4j-shell.cdx.json"
+      description: |
+        Single CycloneDX SBOM file (relative to the sboms workspace)
+        for the vuln-scan Task to scan. Smoke seed writes this name
+        by default; real pipelines bind the build-output workspace
+        `generate-sbom` writes to and fan out per-artifact via
+        Pipeline-level `matrix:` (see docs/vuln-scanning.md).
+    - name: fail-on-severity
+      type: string
+      default: ""
+      description: |
+        Threshold for gating. Default empty = non-gating (matches
+        the #51 issue body's default). The smoke pipeline leaves
+        this empty so the Log4Shell finding does NOT fail the run —
+        the gating behaviour is exercised via the assert step's
+        per-severity counts check rather than by letting the gate
+        fire.
+    - name: db-pointer-url
+      type: string
+      default: "https://artifacts.ceph.com/ceph-grype-db/grype-db/6/latest.json"
+      description: |
+        Canonical HTTPS URL of the producer's `latest.json` pointer.
+        Default points at the production prefix on artifacts.ceph.com
+        so the smoke pipeline works against a real cluster with no
+        per-environment overrides. Smoke runs against vstart override
+        this to a dev RGW HTTPS endpoint (e.g.
+        `http://localhost:18000/vstart-ceph-grype-db/grype-db/6/latest.json`
+        when the prototype script has just run end-to-end). The
+        producer Pipeline `pipelines/build-grype-db.yaml` writes the
+        pointer + sibling artefacts.
+  workspaces:
+    - name: sboms
+      description: |
+        Shared workspace where the seed Task drops the SBOM and the
+        vuln-scan Task writes per-scan output + consolidated
+        `findings.grype.json`. emptyDir is fine for smoke; real
+        pipelines bind the build-output PVC from `generate-sbom`.
+
+        The vuln-scan Task also fetches the producer DB tarball +
+        bundle + pubkey into a `.grype-db/` subdirectory of this
+        workspace — no separate db-cache workspace is needed (the
+        new producer/consumer model fetches fresh per TaskRun).
+  tasks:
+    - name: seed
+      taskRef:
+        name: vuln-scan-smoke-seed
+      params:
+        - name: tools-image
+          value: $(params.tools-image)
+      workspaces:
+        - name: sboms
+          workspace: sboms
+    - name: vuln-scan
+      runAfter: [seed]
+      taskRef:
+        name: vuln-scan
+      params:
+        - name: sbom-file
+          value: $(params.sbom-file)
+        - name: db-pointer-url
+          value: $(params.db-pointer-url)
+        - name: grype-image
+          value: $(params.grype-image)
+        - name: cosign-image
+          value: $(params.cosign-image)
+        - name: tools-image
+          value: $(params.tools-image)
+        - name: fail-on-severity
+          value: $(params.fail-on-severity)
+      workspaces:
+        - name: sboms
+          workspace: sboms
+    - name: assert-results
+      runAfter: [vuln-scan]
+      taskRef:
+        name: vuln-scan-smoke-assert
+      params:
+        # Per-key object Result references — Tekton's documented
+        # syntax for object Results.
+        - name: findings-uri
+          value: $(tasks.vuln-scan.results.findings-ARTIFACT_OUTPUTS.uri)
+        - name: findings-digest
+          value: $(tasks.vuln-scan.results.findings-ARTIFACT_OUTPUTS.digest)
+        - name: findings-is-build-artifact
+          value: $(tasks.vuln-scan.results.findings-ARTIFACT_OUTPUTS.isBuildArtifact)
+        - name: vuln-summary
+          value: $(tasks.vuln-scan.results.vuln-summary)
+        - name: findings-count
+          value: $(tasks.vuln-scan.results.findings-count)
+        - name: tools-image
+          value: $(params.tools-image)
+      workspaces:
+        - name: sboms
+          workspace: sboms
+  results:
+    # Re-expose the vuln-scan Task's Results at the Pipeline level
+    # so a PipelineRun-level Chains attestation (deep-inspection on
+    # or off) sees the same byproduct grammar that the TaskRun
+    # exposes. vuln-summary + findings-count are contract-level
+    # convenience surfaces for dashboards and the smoke assert.
+    #
+    # `findings-ARTIFACT_OUTPUTS` itself is the Chains-grammar
+    # object Result. With Chains 0.26's
+    # `artifacts.pipelinerun.enable-deep-inspection: "true"` ConfigMap
+    # flag (set by the chains-smoke-test setup the rest of the repo
+    # depends on), Chains walks child TaskRun Results and rolls them
+    # up into the PipelineRun-level attestation — so re-exposing the
+    # OBJECT at the Pipeline level is unnecessary for the
+    # attestation. We do re-expose the scalar Results so PaC GitHub
+    # Checks / the ceph-builds-api shim can read them without
+    # following the child-TaskRun pointer.
+    - name: vuln-summary
+      description: |
+        Per-severity tally: `critical=N high=N medium=N low=N
+        negligible=N unknown=N`.
+      value: $(tasks.vuln-scan.results.vuln-summary)
+    - name: findings-count
+      description: Total grype matches across all scanned SBOMs.
+      value: $(tasks.vuln-scan.results.findings-count)

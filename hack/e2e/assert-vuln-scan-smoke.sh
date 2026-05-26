@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# assert-vuln-scan-smoke.sh — run pipelines/vuln-scan-smoke-test.yaml
+# assert-vuln-scan-smoke.sh — run pipelines/pipelines/vuln-scan-smoke-test.yaml
 # and assert the producer/consumer flow that #56 introduced.
 #
 # Pass criteria:
@@ -194,9 +194,16 @@ log::info "db-pointer-url: ${DB_POINTER_URL}"
 # Apply the Task + Pipeline + sub-task manifests
 # ---------------------------------------------------------------------
 
-log::info "applying tasks/vuln-scan/ + pipelines/vuln-scan-smoke-test.yaml ..."
-kube_ctx apply -f "${E2E_REPO_ROOT}/tasks/vuln-scan/task.yaml"             >/dev/null
-kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/vuln-scan-smoke-test.yaml"   >/dev/null
+# Apply the canonical vuln-scan Task, the smoke-only seed + assert
+# Tasks, then the Pipeline. Issue #68 split the smoke pipeline's
+# embedded Tasks (vuln-scan-smoke-seed + vuln-scan-smoke-assert) into
+# single-resource files under `pipelines/tasks/`; the Pipeline moved
+# to `pipelines/pipelines/`. Apply order matters: Tasks before Pipeline.
+log::info "applying tasks/vuln-scan/ + pipelines/tasks/vuln-scan-smoke-* + pipelines/pipelines/vuln-scan-smoke-test.yaml ..."
+kube_ctx apply -f "${E2E_REPO_ROOT}/tasks/vuln-scan/task.yaml"                   >/dev/null
+kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/tasks/vuln-scan-smoke-seed.yaml"   >/dev/null
+kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/tasks/vuln-scan-smoke-assert.yaml" >/dev/null
+kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/pipelines/vuln-scan-smoke-test.yaml" >/dev/null
 
 # ---------------------------------------------------------------------
 # Run the smoke pipeline

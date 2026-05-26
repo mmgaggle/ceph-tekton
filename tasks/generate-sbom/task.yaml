@@ -69,7 +69,7 @@ spec:
       description: |
         Pinned syft image. Bumping this is a deliberate supply-chain
         decision (same posture as the chains-smoke-test sbom step,
-        pipelines/chains-smoke-test.yaml). v1.18.0 is the current
+        pipelines/pipelines/chains-smoke-test.yaml). v1.18.0 is the current
         stable line that emits CycloneDX 1.6 JSON cleanly and handles
         .deb / .rpm cataloguer outputs without warnings.
     - name: tools-image

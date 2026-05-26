@@ -1,0 +1,128 @@
+# Kyverno smoke-test — `try-pod-admit` Task.
+#
+# Generic helper Task that attempts to create a Pod with a given image
+# and asserts that admission either succeeded or failed in the
+# expected direction. Used by both branches of the kyverno-smoke-test
+# pipeline (pipelines/pipelines/kyverno-smoke-test.yaml).
+#
+# Two params do most of the work:
+#   - `image`: the image reference to bake into the test Pod.
+#   - `expect`: "admit" or "reject". The Task's exit code maps to
+#     whether the expectation matched.
+#
+# When `expect=reject`, the Task ADDITIONALLY asserts that the
+# kubectl error message mentions cosign/signature so we know the
+# rejection came from our ClusterPolicy and not (say) a kubelet
+# image-pull failure or a different admission controller.
+#
+# Single-resource file (no leading `---`) so PaC's remote-resolution
+# (`pipelinesascode.tekton.dev/task: try-pod-admit@URL`) succeeds.
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: try-pod-admit
+spec:
+  description: >
+    Try to create a Pod with the given image; assert admission outcome.
+    Asserts the rejection reason on `expect=reject` to confirm Kyverno
+    was the rejecter.
+  params:
+    - name: image
+      type: string
+      description: Image reference to bake into the test pod.
+    - name: expect
+      type: string
+      description: "'admit' or 'reject'."
+    - name: pod-name
+      type: string
+      description: Name to give the test pod (must be unique within the namespace).
+    - name: namespace
+      type: string
+      default: kyverno-smoke
+    - name: kubectl-image
+      type: string
+      default: "docker.io/bitnami/kubectl:1.30"
+      description: Image providing the `kubectl` CLI for the test step.
+  steps:
+    - name: try-create
+      image: $(params.kubectl-image)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        EXPECT="$(params.expect)"
+        IMG="$(params.image)"
+        POD="$(params.pod-name)"
+        NS="$(params.namespace)"
+
+        case "$EXPECT" in
+          admit|reject) ;;
+          *) echo "FAIL: bad expect value '$EXPECT' (want admit|reject)"; exit 2 ;;
+        esac
+
+        # Best-effort cleanup from a prior run.
+        kubectl -n "$NS" delete pod "$POD" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+
+        echo "==> creating pod $NS/$POD with image $IMG (expecting: $EXPECT)"
+
+        # Apply via stdin manifest. --dry-run=server runs the admission
+        # webhooks but does NOT persist the Pod (no kubelet pull, no
+        # scheduling) — so the test is hermetic. Kyverno's
+        # verifyImages rule runs on server-side dry-run apply.
+        OUT=$(mktemp)
+        RC=0
+        kubectl -n "$NS" apply --dry-run=server -f - <<EOF >"$OUT" 2>&1 || RC=$?
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: ${POD}
+          namespace: ${NS}
+          labels:
+            ceph-tekton.io/test: kyverno-smoke
+        spec:
+          # never-restart + pause image inside the spec just exists so
+          # the Pod is syntactically valid for kubelet should the test
+          # later remove --dry-run=server. The admission decision is
+          # based on the .spec.containers[].image we want to test.
+          restartPolicy: Never
+          containers:
+            - name: target
+              image: ${IMG}
+              command: ["/bin/sh", "-c", "sleep 5"]
+        EOF
+
+        echo "---- kubectl output ----"
+        cat "$OUT"
+        echo "---- exit code: $RC ----"
+
+        if [ "$EXPECT" = "admit" ]; then
+          if [ "$RC" -eq 0 ]; then
+            echo "OK: pod was admitted as expected"
+            exit 0
+          fi
+          echo "FAIL: pod was rejected but admission was expected"
+          exit 1
+        fi
+
+        # expect=reject
+        if [ "$RC" -eq 0 ]; then
+          echo "FAIL: pod was admitted but rejection was expected"
+          echo "      (the policy did not fire — image glob mismatch, or"
+          echo "       the policy is not in Enforce mode in this namespace)"
+          exit 1
+        fi
+
+        # Rejection happened — confirm it came from our ClusterPolicy
+        # and not some other admission controller. Kyverno's verifyImages
+        # error message includes either "cosign" or "signature" verbatim;
+        # ClusterPolicy name shows up too. Grep case-insensitively for
+        # any of those markers.
+        if grep -Eqi 'cosign|signature|verify-ceph-image-signatures' "$OUT"; then
+          echo "OK: rejection reason mentions cosign/signature/policy name"
+          exit 0
+        fi
+
+        echo "FAIL: pod was rejected but the reason does not mention"
+        echo "      cosign / signature / our policy name — something"
+        echo "      other than Kyverno blocked the create. See output above."
+        exit 1

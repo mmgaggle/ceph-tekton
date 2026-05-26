@@ -1,0 +1,68 @@
+# Vault smoke-test Pipeline.
+#
+# Proves the dev cluster's Vault install + transit engine + Kubernetes
+# auth method are wired up correctly: a pod, running as a specific
+# ServiceAccount, can authenticate to Vault using its projected SA
+# token, sign a known payload via the transit API, and read back a
+# signature.
+#
+# Pairs with pipelines/tasks/vault-sign-smoke.yaml. Apply the Task
+# first; the Pipeline references it by name.
+#
+# Run via:
+#   ./hack/dev-vault-up.sh    # one-time bootstrap (idempotent)
+#   kubectl -n vault-test apply -f pipelines/tasks/vault-sign-smoke.yaml
+#   kubectl -n vault-test apply -f pipelines/pipelines/vault-smoke-test.yaml
+#   tkn pipeline start vault-smoke-test \
+#     --serviceaccount ceph-test-signer \
+#     -n vault-test \
+#     --showlog
+#
+# The pipeline MUST run in the `vault-test` namespace with the
+# `ceph-test-signer` ServiceAccount, because that (namespace, SA) pair
+# is the one bound to the Vault role created by dev-vault-up.sh. Any
+# other pod identity will be rejected by Vault at `auth/kubernetes/login`.
+#
+# This is NOT a GPG signing test — the GPG key + publish-repo
+# integration land in issue #19. This pipeline only signs with the
+# ed25519 `ceph-test-key` to prove the trust chain end-to-end.
+#
+# Single-resource file (no leading `---`) so PaC's remote-resolution
+# (`pipelinesascode.tekton.dev/pipeline: vault-smoke-test@URL`) succeeds.
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: vault-smoke-test
+spec:
+  description: >
+    End-to-end smoke test of the Vault install: a build-pod-class
+    workload authenticates to Vault via Kubernetes auth and signs a
+    payload through the transit engine. Fails clearly if any link in
+    the chain (SA token, k8s-auth config, role binding, transit key,
+    sign capability) is broken.
+  params:
+    - name: payload
+      type: string
+      default: "hello vault"
+    - name: vault-addr
+      type: string
+      default: "http://vault.vault.svc.cluster.local:8200"
+    - name: vault-role
+      type: string
+      default: "ceph-test-signer"
+    - name: transit-key
+      type: string
+      default: "ceph-test-key"
+  tasks:
+    - name: sign
+      taskRef:
+        name: vault-sign-smoke
+      params:
+        - name: payload
+          value: $(params.payload)
+        - name: vault-addr
+          value: $(params.vault-addr)
+        - name: vault-role
+          value: $(params.vault-role)
+        - name: transit-key
+          value: $(params.transit-key)

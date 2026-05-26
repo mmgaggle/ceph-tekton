@@ -58,7 +58,10 @@ state. If the Secret already has a `cosign.key`, it isn't regenerated.
 ## Smoke test
 
 ```sh
-kubectl apply -f pipelines/chains-smoke-test.yaml
+# Issue #68: single-resource files. Apply Tasks first, then the Pipeline.
+kubectl apply -f pipelines/tasks/chains-smoke-build.yaml
+kubectl apply -f pipelines/tasks/chains-smoke-sbom.yaml
+kubectl apply -f pipelines/pipelines/chains-smoke-test.yaml
 tkn pipeline start chains-smoke-test \
   --workspace name=sbom,emptyDir="" \
   --showlog
@@ -550,8 +553,11 @@ params switch from smoke defaults to real values.
 ### Smoke test
 
 ```sh
+# Issue #68: single-resource files. Apply Tasks first, then the Pipeline.
 kubectl apply -f tasks/generate-sbom/task.yaml
-kubectl apply -f pipelines/sbom-pkg-smoke-test.yaml
+kubectl apply -f pipelines/tasks/sbom-pkg-smoke-seed.yaml
+kubectl apply -f pipelines/tasks/sbom-pkg-smoke-assert.yaml
+kubectl apply -f pipelines/pipelines/sbom-pkg-smoke-test.yaml
 tkn pipeline start sbom-pkg-smoke-test \
   --workspace name=artifacts,emptyDir="" \
   --workspace name=sboms,emptyDir="" \
