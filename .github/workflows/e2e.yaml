@@ -229,6 +229,10 @@ jobs:
           E2E_KUBE_CONTEXT:        ${{ env.E2E_KUBE_CONTEXT }}
           E2E_ARTIFACTS:           ${{ github.workspace }}/e2e-artifacts
           E2E_PIPELINERUN_TIMEOUT: ${{ env.E2E_PIPELINERUN_TIMEOUT }}
+          # Skip reproducibility-smoke pending #67: step-build-a's script
+          # fails with `getcwd: cannot access parent directories` +
+          # `PWD: unbound variable`. Remove this line when #67 lands.
+          E2E_SKIP:                reproducibility-smoke
         run: |
           set -euo pipefail
           mkdir -p "${E2E_ARTIFACTS}"
