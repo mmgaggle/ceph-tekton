@@ -1,0 +1,50 @@
+# hello-world PaC entry — second smoke beyond noop-pull-request.
+#
+# Shape: self-contained pipelineSpec with an inline taskSpec, same
+# pattern as noop. We attempted remote-resolution against
+# `pipelines/hello-world.yaml` first, but PaC's
+# `pipelinesascode.tekton.dev/pipeline:` annotation expects the URI
+# to contain exactly one Pipeline document; our existing
+# `pipelines/hello-world.yaml` is multi-doc (Task + Pipeline) and
+# PaC's reader takes the first doc unconditionally and bails on
+# kind mismatch. Splitting into `pipelines/tasks/hello.yaml` +
+# `pipelines/pipelines/hello-world.yaml` is the cleaner long-term
+# answer; for the first PaC bring-up that's a refactor we'd rather
+# defer.
+#
+# Vs noop-pull-request: this template exercises one more level of
+# Tekton structure — pipelineSpec + tasks[].taskSpec rather than
+# just a single task block — plus a Pipeline-level `params` block
+# substituted into the Task. That's the same shape every smoke-test
+# PipelineRun we author in `.tekton/` next will use.
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: hello-world-
+  annotations:
+    pipelinesascode.tekton.dev/on-event: "[pull_request]"
+    pipelinesascode.tekton.dev/on-target-branch: "[**]"
+    pipelinesascode.tekton.dev/max-keep-runs: "5"
+spec:
+  params:
+    - name: who
+      value: ceph
+  pipelineSpec:
+    params:
+      - name: who
+        type: string
+    tasks:
+      - name: greet
+        params:
+          - name: who
+            value: $(params.who)
+        taskSpec:
+          params:
+            - name: who
+              type: string
+          steps:
+            - name: say-hello
+              image: docker.io/library/busybox:1.36
+              script: |
+                #!/bin/sh
+                echo "hello, $(params.who) — from ceph-tekton"
