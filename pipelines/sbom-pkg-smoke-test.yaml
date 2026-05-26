@@ -1,27 +1,31 @@
 # sbom-pkg-smoke-test — smoke pipeline for the `generate-sbom` Task.
 #
-# Wires `generate-sbom` against the cheapest possible "package" artifacts
-# that still prove the Task end-to-end:
+# Wires `generate-sbom` against the cheapest possible "package"
+# artifacts that still prove the Task end-to-end:
 #
-#   - A `sbom-pkg-smoke-seed` Task creates two deterministic .tar files
-#     ("fake-pkg-a_1.0.tar", "fake-pkg-b_1.0.tar") in the shared
-#     artifacts workspace. Same deterministic-tar pattern as
+#   - A `sbom-pkg-smoke-seed` Task creates two deterministic .tar
+#     files ("fake-pkg-a_1.0.tar", "fake-pkg-b_1.0.tar") in the
+#     shared artifacts workspace. Same deterministic-tar pattern as
 #     pipelines/reproducibility-check.yaml — same flags, same intent
 #     (sort=name, mtime=@SOURCE_DATE_EPOCH, owner=0, numeric-owner).
 #
 #   - `generate-sbom` scans them with syft, writes one
 #     <basename>.cdx.json per artifact into the sboms workspace, and
-#     emits the Chains-grammar plural Results (`IMAGES`,
-#     `ARTIFACT_OUTPUTS`) plus the contract-level index Results
-#     (`SBOM_NAMES`, `SBOM_COUNT`, `SBOM_MEDIATYPE`).
+#     emits the Chains-valid plural Results (`IMAGES`, `SBOM_IMAGES`)
+#     plus the Chains-valid byproduct object Result
+#     (`sbom-ARTIFACT_OUTPUTS`). See `tasks/generate-sbom/task.yaml`
+#     header for the full rationale of the Result shape and why the
+#     #50 grammar (`SBOM_NAMES`/`SBOM_COUNT`/`SBOM_MEDIATYPE` +
+#     nested-sbom `ARTIFACT_OUTPUTS`) was retired in #55.
 #
-#   - `sbom-pkg-smoke-assert` greps every Result for shape conformance:
-#     IMAGES has one `<url>@sha256:<hex>` line per seeded artifact,
-#     ARTIFACT_OUTPUTS is a JSON array with one entry per artifact each
-#     embedding the CycloneDX mediaType, and SBOM_NAMES contains both
-#     expected per-artifact slugs (FAKE_PKG_A + FAKE_PKG_B). If any
-#     shape check fails, the PipelineRun fails — the smoke test exists
-#     to catch silent regressions in the Chains-grammar contract.
+#   - `sbom-pkg-smoke-assert` greps every Result for shape
+#     conformance: `IMAGES` has one `<url>@sha256:<hex>` line per
+#     seeded artifact, `SBOM_IMAGES` has one matching line per
+#     per-artifact SBOM file, and `sbom-ARTIFACT_OUTPUTS` carries a
+#     well-formed `{uri, digest, isBuildArtifact}` triplet. If any
+#     shape check fails, the PipelineRun fails — the smoke test
+#     exists to catch silent regressions in the
+#     Chains-grammar contract.
 #
 # Why .tar instead of real .deb / .rpm:
 #   - .deb / .rpm need apt/yum + signing keys + a real package source
@@ -32,6 +36,15 @@
 #   - When #16 lands, this smoke pipeline stays as-is and a sibling
 #     "real" pipeline does `build-package` -> `generate-sbom` against
 #     actual .deb / .rpm output.
+#
+# Why no `attach-sbom` smoke here:
+#   - `attach-sbom` is the CONTAINER path (cosign attach sbom against
+#     an OCI image reference). The package smoke pipeline has no
+#     image to attach to — that path is exercised by
+#     `pipelines/chains-smoke-test.yaml` and (when #54 lands) the
+#     real container e2e test. Mixing the two in one smoke pipeline
+#     would force a registry dependency this smoke is explicitly
+#     designed to avoid.
 #
 # The pipeline runs entirely offline-friendly: no S3 upload, no
 # registry pulls beyond syft + busybox + debian-slim (all already
@@ -101,10 +114,10 @@ metadata:
   name: sbom-pkg-smoke-assert
 spec:
   description: |
-    Assert that `generate-sbom` emitted the expected Chains-grammar
-    Results — both the declared plural Results Chains actually
-    consumes (`IMAGES`, `ARTIFACT_OUTPUTS`) and the contract-level
-    indices (`SBOM_NAMES`, `SBOM_COUNT`, `SBOM_MEDIATYPE`).
+    Assert that `generate-sbom` emitted the expected Chains-valid
+    Results — both the plural Results Chains promotes to subjects
+    (`IMAGES`, `SBOM_IMAGES`) and the byproduct object Result
+    (`sbom-ARTIFACT_OUTPUTS`).
 
     We wire the upstream Results in as Pipeline params and grep them
     in-pod, so this Task needs no cluster RBAC against TaskRuns and
@@ -114,35 +127,38 @@ spec:
       type: string
       description: |
         Upstream `IMAGES` Result — newline-separated
-        `<url>@sha256:<digest>` pairs.
-    - name: artifact-outputs
+        `<artifact-url>@sha256:<digest>` pairs.
+    - name: sbom-images
       type: string
       description: |
-        Upstream `ARTIFACT_OUTPUTS` Result — JSON array of per-artifact
-        descriptors with nested SBOM block.
-    - name: sbom-names
+        Upstream `SBOM_IMAGES` Result — newline-separated
+        `<sbom-url>@sha256:<digest>` pairs, one per per-artifact
+        SBOM file. Same Chains grammar as IMAGES; distinct Result
+        name so verifier tooling can separate artifact subjects from
+        SBOM subjects.
+    - name: sbom-artifact-outputs-uri
       type: string
       description: |
-        Upstream `SBOM_NAMES` Result — newline-separated slug index.
-    - name: sbom-count
+        `uri` field from the upstream `sbom-ARTIFACT_OUTPUTS` object
+        Result (the rollup SBOM file URL).
+    - name: sbom-artifact-outputs-digest
       type: string
-      description: Upstream `SBOM_COUNT` Result.
-    - name: sbom-mediatype
+      description: |
+        `digest` field from the upstream `sbom-ARTIFACT_OUTPUTS`
+        object Result.
+    - name: sbom-artifact-outputs-isbuildartifact
       type: string
-      description: Upstream `SBOM_MEDIATYPE` Result.
+      description: |
+        `isBuildArtifact` field from the upstream
+        `sbom-ARTIFACT_OUTPUTS` object Result. Must be `"false"` —
+        the SBOM is metadata about the build, not the build's
+        product.
     - name: expected-count
       type: string
       default: "2"
       description: |
         Expected number of (artifact, SBOM) pairs. The seed Task
         stages two .tar files, so the default is 2.
-    - name: expected-name-substrings
-      type: string
-      default: "FAKE_PKG_A FAKE_PKG_B"
-      description: |
-        Space-separated list of substrings that MUST appear in the
-        SBOM_NAMES output. Matches the slugged form of the seeded
-        artifact basenames (`fake-pkg-a_1.0.tar` -> `FAKE_PKG_A`).
     - name: tools-image
       type: string
       default: docker.io/library/busybox:1.36
@@ -152,48 +168,22 @@ spec:
       env:
         - name: IMAGES
           value: $(params.images)
-        - name: ARTIFACT_OUTPUTS
-          value: $(params.artifact-outputs)
-        - name: SBOM_NAMES
-          value: $(params.sbom-names)
-        - name: SBOM_COUNT
-          value: $(params.sbom-count)
-        - name: SBOM_MEDIATYPE
-          value: $(params.sbom-mediatype)
+        - name: SBOM_IMAGES
+          value: $(params.sbom-images)
+        - name: SBOM_AO_URI
+          value: $(params.sbom-artifact-outputs-uri)
+        - name: SBOM_AO_DIGEST
+          value: $(params.sbom-artifact-outputs-digest)
+        - name: SBOM_AO_ISBUILDARTIFACT
+          value: $(params.sbom-artifact-outputs-isbuildartifact)
         - name: EXPECTED_COUNT
           value: $(params.expected-count)
-        - name: EXPECTED_NAMES
-          value: $(params.expected-name-substrings)
       script: |
         #!/bin/sh
         set -eu
         FAIL=0
 
-        echo "[assert] SBOM_COUNT='${SBOM_COUNT}' (expected '${EXPECTED_COUNT}')"
-        if [ "${SBOM_COUNT}" != "${EXPECTED_COUNT}" ]; then
-          echo "[assert] FAIL: SBOM_COUNT mismatch" >&2
-          FAIL=1
-        fi
-
-        echo "[assert] SBOM_MEDIATYPE='${SBOM_MEDIATYPE}'"
-        if [ "${SBOM_MEDIATYPE}" != "application/vnd.cyclonedx+json" ]; then
-          echo "[assert] FAIL: SBOM_MEDIATYPE must be application/vnd.cyclonedx+json" >&2
-          FAIL=1
-        fi
-
-        echo "[assert] SBOM_NAMES contents:"
-        printf '%s\n' "${SBOM_NAMES}"
-
-        for needle in ${EXPECTED_NAMES}; do
-          if printf '%s\n' "${SBOM_NAMES}" | grep -q "${needle}"; then
-            echo "[assert] OK:   SBOM_NAMES contains '${needle}'"
-          else
-            echo "[assert] FAIL: SBOM_NAMES missing '${needle}'" >&2
-            FAIL=1
-          fi
-        done
-
-        # IMAGES Result: one `<url>@sha256:<hex>` line per artifact.
+        # IMAGES Result: one `<artifact-url>@sha256:<hex>` line per artifact.
         IMG_LINES=$(printf '%s\n' "${IMAGES}" | grep -c '@sha256:' || true)
         echo "[assert] IMAGES line count: ${IMG_LINES} (expected ${EXPECTED_COUNT})"
         if [ "${IMG_LINES}" != "${EXPECTED_COUNT}" ]; then
@@ -203,22 +193,54 @@ spec:
           FAIL=1
         fi
 
-        # ARTIFACT_OUTPUTS Result: JSON array. Busybox has no jq, so we
-        # validate by counting top-level `{"name":` occurrences (which
-        # is one per entry in our shape) and by asserting the media
-        # type appears exactly that many times.
-        AO_NAMES=$(printf '%s' "${ARTIFACT_OUTPUTS}" | grep -o '"name":"[^"]*"' | wc -l | awk '{print $1}')
-        echo "[assert] ARTIFACT_OUTPUTS entry count: ${AO_NAMES} (expected ${EXPECTED_COUNT})"
-        if [ "${AO_NAMES}" != "${EXPECTED_COUNT}" ]; then
-          echo "[assert] FAIL: ARTIFACT_OUTPUTS must have one entry per artifact" >&2
-          echo "[assert] got ARTIFACT_OUTPUTS:" >&2
-          printf '%s\n' "${ARTIFACT_OUTPUTS}" >&2
+        # SBOM_IMAGES Result: one `<sbom-url>@sha256:<hex>` line per SBOM file.
+        SBOM_LINES=$(printf '%s\n' "${SBOM_IMAGES}" | grep -c '@sha256:' || true)
+        echo "[assert] SBOM_IMAGES line count: ${SBOM_LINES} (expected ${EXPECTED_COUNT})"
+        if [ "${SBOM_LINES}" != "${EXPECTED_COUNT}" ]; then
+          echo "[assert] FAIL: SBOM_IMAGES must have one <url>@sha256:<hex> line per SBOM file" >&2
+          echo "[assert] got SBOM_IMAGES:" >&2
+          printf '%s\n' "${SBOM_IMAGES}" >&2
           FAIL=1
         fi
-        AO_MEDIATYPES=$(printf '%s' "${ARTIFACT_OUTPUTS}" \
-          | grep -o 'application/vnd.cyclonedx+json' | wc -l | awk '{print $1}')
-        if [ "${AO_MEDIATYPES}" != "${EXPECTED_COUNT}" ]; then
-          echo "[assert] FAIL: ARTIFACT_OUTPUTS must embed CycloneDX mediaType per entry" >&2
+
+        # Every SBOM_IMAGES entry must end in `.cdx.json@sha256:<hex>`,
+        # so smoke-time the file extension is the mediaType signal
+        # (mediaType isn't carried in the Chains object Result schema).
+        BAD_SUFFIX=$(printf '%s\n' "${SBOM_IMAGES}" \
+          | grep -v '\.cdx\.json@sha256:' \
+          | grep -c '@sha256:' || true)
+        if [ "${BAD_SUFFIX}" != "0" ]; then
+          echo "[assert] FAIL: SBOM_IMAGES entries must end in .cdx.json@sha256:<hex>" >&2
+          FAIL=1
+        fi
+
+        # sbom-ARTIFACT_OUTPUTS object Result: shape-check the three
+        # required keys (Chains 0.26 schema: uri, digest,
+        # isBuildArtifact). No mediaType, no nested sbom.
+        echo "[assert] sbom-ARTIFACT_OUTPUTS.uri='${SBOM_AO_URI}'"
+        echo "[assert] sbom-ARTIFACT_OUTPUTS.digest='${SBOM_AO_DIGEST}'"
+        echo "[assert] sbom-ARTIFACT_OUTPUTS.isBuildArtifact='${SBOM_AO_ISBUILDARTIFACT}'"
+
+        case "${SBOM_AO_URI}" in
+          workspace://sboms/*.cdx.json|https://*/sboms/*.cdx.json)
+            : ;;
+          *)
+            echo "[assert] FAIL: sbom-ARTIFACT_OUTPUTS.uri must point at a .cdx.json under sboms/" >&2
+            FAIL=1
+            ;;
+        esac
+
+        case "${SBOM_AO_DIGEST}" in
+          sha256:[0-9a-f]*)
+            : ;;
+          *)
+            echo "[assert] FAIL: sbom-ARTIFACT_OUTPUTS.digest must be sha256:<hex>" >&2
+            FAIL=1
+            ;;
+        esac
+
+        if [ "${SBOM_AO_ISBUILDARTIFACT}" != "false" ]; then
+          echo "[assert] FAIL: sbom-ARTIFACT_OUTPUTS.isBuildArtifact must be 'false' (SBOM is metadata, not product)" >&2
           FAIL=1
         fi
 
@@ -226,7 +248,7 @@ spec:
           echo "[assert] one or more assertions failed" >&2
           exit 1
         fi
-        echo "[assert] all Chains plural Results present and well-formed"
+        echo "[assert] all Chains-valid Results present and well-formed"
 ---
 apiVersion: tekton.dev/v1
 kind: Pipeline
@@ -238,21 +260,23 @@ spec:
       1. `seed`           — stage two deterministic .tar files into
                             the artifacts workspace.
       2. `generate-sbom`  — produce one CycloneDX SBOM per tarball,
-                            emit the Chains-grammar plural Results
-                            (`IMAGES`, `ARTIFACT_OUTPUTS`) plus the
-                            contract-level index Results
-                            (`SBOM_NAMES`, `SBOM_COUNT`,
-                             `SBOM_MEDIATYPE`).
+                            emit the Chains-valid plural Results
+                            (`IMAGES`, `SBOM_IMAGES`) plus the
+                            byproduct object Result
+                            (`sbom-ARTIFACT_OUTPUTS`).
       3. `assert-results` — verify each Result is shape-correct (one
-                            IMAGES line + one ARTIFACT_OUTPUTS entry
-                            per seeded artifact, both per-artifact
-                            slugs present in SBOM_NAMES, the right
-                            CycloneDX mediaType). Fails the
+                            IMAGES line + one SBOM_IMAGES line per
+                            seeded artifact, all SBOM URLs end in
+                            `.cdx.json@sha256:<hex>`, the byproduct
+                            object carries `{uri, digest,
+                            isBuildArtifact=false}`). Fails the
                             PipelineRun on any mismatch.
 
     See docs/provenance.md ("Per-build package SBOMs") for the
     walkthrough on extracting a specific package's SBOM from the
-    Chains-signed attestation once it lands.
+    Chains-signed attestation. The CONTAINER path
+    (`cosign attach sbom`) is exercised separately by
+    `pipelines/chains-smoke-test.yaml` + the `attach-sbom` Task.
   params:
     - name: artifact-glob
       type: string
@@ -312,39 +336,46 @@ spec:
       params:
         - name: images
           value: $(tasks.generate-sbom.results.IMAGES)
-        - name: artifact-outputs
-          value: $(tasks.generate-sbom.results.ARTIFACT_OUTPUTS)
-        - name: sbom-names
-          value: $(tasks.generate-sbom.results.SBOM_NAMES)
-        - name: sbom-count
-          value: $(tasks.generate-sbom.results.SBOM_COUNT)
-        - name: sbom-mediatype
-          value: $(tasks.generate-sbom.results.SBOM_MEDIATYPE)
+        - name: sbom-images
+          value: $(tasks.generate-sbom.results.SBOM_IMAGES)
+        - name: sbom-artifact-outputs-uri
+          value: $(tasks.generate-sbom.results.sbom-ARTIFACT_OUTPUTS.uri)
+        - name: sbom-artifact-outputs-digest
+          value: $(tasks.generate-sbom.results.sbom-ARTIFACT_OUTPUTS.digest)
+        - name: sbom-artifact-outputs-isbuildartifact
+          value: $(tasks.generate-sbom.results.sbom-ARTIFACT_OUTPUTS.isBuildArtifact)
         - name: tools-image
           value: $(params.tools-image)
   results:
     # Re-expose the generate-sbom Task's Results at the Pipeline level
-    # so a PipelineRun-level Chains attestation (deep-inspection enabled
-    # or not) sees the same multi-subject grammar that the TaskRun
-    # exposes. IMAGES + ARTIFACT_OUTPUTS are the Chains-grammar
-    # Results; the SBOM_* triplet is the contract-level index.
+    # so a PipelineRun-level Chains attestation (deep-inspection
+    # enabled or not) sees the same multi-subject grammar the TaskRun
+    # exposes. IMAGES + SBOM_IMAGES are promoted to subjects;
+    # `sbom-ARTIFACT_OUTPUTS` is promoted to a byproduct entry.
     - name: IMAGES
       description: |
-        Newline-separated `<url>@sha256:<digest>` pairs, one per
-        scanned artifact. Chains promotes each pair to a subject.
+        Newline-separated `<artifact-url>@sha256:<digest>` pairs, one
+        per scanned artifact. Chains promotes each pair to a subject.
       value: $(tasks.generate-sbom.results.IMAGES)
-    - name: ARTIFACT_OUTPUTS
+    - name: SBOM_IMAGES
       description: |
-        JSON array of per-artifact descriptors with nested SBOM
-        block. Chains 0.20+ uses the nested `sbom` to populate
-        `predicate.buildDefinition.resolvedDependencies[]`.
-      value: $(tasks.generate-sbom.results.ARTIFACT_OUTPUTS)
-    - name: sbom-count
-      description: Number of per-artifact CycloneDX SBOMs emitted.
-      value: $(tasks.generate-sbom.results.SBOM_COUNT)
-    - name: sbom-names
-      description: Newline-separated list of per-artifact slugs.
-      value: $(tasks.generate-sbom.results.SBOM_NAMES)
-    - name: sbom-mediatype
-      description: application/vnd.cyclonedx+json.
-      value: $(tasks.generate-sbom.results.SBOM_MEDIATYPE)
+        Newline-separated `<sbom-url>@sha256:<digest>` pairs, one per
+        per-artifact SBOM file. Same Chains grammar; distinct Result
+        name lets verifiers separate artifact subjects from SBOM
+        subjects.
+      value: $(tasks.generate-sbom.results.SBOM_IMAGES)
+    - name: sbom-ARTIFACT_OUTPUTS-uri
+      description: |
+        `uri` field of the rollup SBOM byproduct descriptor (Chains-
+        valid `*ARTIFACT_OUTPUTS` object Result).
+      value: $(tasks.generate-sbom.results.sbom-ARTIFACT_OUTPUTS.uri)
+    - name: sbom-ARTIFACT_OUTPUTS-digest
+      description: |
+        `digest` field of the rollup SBOM byproduct descriptor.
+      value: $(tasks.generate-sbom.results.sbom-ARTIFACT_OUTPUTS.digest)
+    - name: sbom-ARTIFACT_OUTPUTS-isBuildArtifact
+      description: |
+        `isBuildArtifact` field of the rollup SBOM byproduct
+        descriptor. `"false"` — the SBOM is metadata about the build,
+        not the build's product.
+      value: $(tasks.generate-sbom.results.sbom-ARTIFACT_OUTPUTS.isBuildArtifact)

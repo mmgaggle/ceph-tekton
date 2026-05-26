@@ -1,0 +1,273 @@
+# attach-sbom — canonical Sigstore SBOM-to-image attachment Task.
+#
+# Runs `cosign attach sbom --sbom <file> --type cyclonedx <image-ref>`
+# against a built container image so the SBOM lands in the OCI
+# registry as a properly-typed referrer (mediaType embedded in the
+# referrer manifest, discoverable via `cosign download sbom`).
+#
+# This Task is the FOLLOW-UP to `generate-sbom` for the CONTAINER
+# path. The split is:
+#
+#   * `tasks/generate-sbom/task.yaml`
+#       - Produces CycloneDX-JSON SBOM file(s) from the build outputs.
+#       - Emits Chains-valid Results (`IMAGES`, `SBOM_IMAGES`,
+#         `sbom-ARTIFACT_OUTPUTS`) so Chains signs the SBOM URI +
+#         content digest into the slsa/v2alpha4 attestation.
+#       - For PACKAGES (.deb / .rpm) this is the end of the line —
+#         the SBOM lives next to the package in S3, mediaType is
+#         conveyed by the `.cdx.json` filename extension, the
+#         signed-byproduct URI is how downstream verifiers find it.
+#
+#   * `tasks/attach-sbom/task.yaml`  (this Task)
+#       - For CONTAINER images only.
+#       - Pushes the SBOM into the OCI registry as a cosign referrer
+#         (mediaType `application/vnd.cyclonedx+json` recorded in the
+#         referrer manifest itself).
+#       - Lets verifiers run `cosign download sbom <image>` to round-
+#         trip the SBOM with its mediaType intact — the property
+#         compliance frameworks (M-22-18 §4(e), CIS SSC §3) ask for.
+#
+# WHY `cosign attach sbom` AND NOT `cosign attest --predicate ... --type spdxjson`:
+#   `cosign attach sbom` is what the SBOM-as-OCI-referrer ecosystem
+#   (anchore, GitHub container provenance, Sigstore docs) is built
+#   around. `cosign attest --predicate` produces an in-toto
+#   attestation envelope — that is a *separate* signed claim, useful
+#   when the verifier wants the SBOM inside an in-toto Statement, but
+#   it is NOT what `cosign download sbom` looks for. Issue #55
+#   explicitly chose `cosign attach sbom` because:
+#
+#     1. Round-trip via `cosign download sbom <image>` is the standard
+#        consumer flow (`cosign verify-attestation` is a different
+#        verification path — separately covered by Chains' own
+#        slsa/v2alpha4 attestation, which already wraps the SBOM URI
+#        + digest via the `sbom-ARTIFACT_OUTPUTS` byproduct from
+#        `generate-sbom`).
+#     2. The cosign-attach referrer carries the mediaType natively,
+#        closing the M-22-18 / CIS-SSC §3 "mediaType in the
+#        attestation surface" gap the original #50 design missed.
+#     3. `cosign attach sbom` is the path that downstream re-signing
+#        (Chains observing the cosign-signed referrer via the
+#        registry, or a sibling `cosign sign <image-ref>` covering
+#        the referrer manifest by content digest) composes with — the
+#        attest path is a distinct workflow we don't need here.
+#
+#   `cosign attach sbom` is marked "deprecated" in cosign 2.x release
+#   notes in favor of the OCI 1.1 referrers API, but the cosign CLI
+#   still supports it through at least v2.4.x (the version this Task
+#   pins). The deprecation is about the legacy `.sbom` tag fallback
+#   path — when the registry advertises the OCI 1.1 referrers API,
+#   `cosign attach sbom` automatically writes a proper referrer.
+#   Quay (where we push ceph images) supports the referrers API, so
+#   this is the modern referrer path, not the legacy tag path.
+#
+# INVOCATION SHAPE:
+#
+#   cosign attach sbom \
+#     --sbom /workspace/sboms/<file>.cdx.json \
+#     --type cyclonedx \
+#     quay.io/ceph/ceph@sha256:<digest>
+#
+# We require the IMAGE REFERENCE BY DIGEST (not by tag) so the SBOM is
+# unambiguously attached to the exact image bytes the build produced.
+# Tag-only references are racy (tag can move under us). Same constraint
+# as `cosign sign` and the same shape `build-builder-image` already
+# emits to its IMAGE_DIGEST Result.
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: attach-sbom
+spec:
+  description: |
+    Attach a CycloneDX-JSON SBOM to a container image via
+    `cosign attach sbom --type cyclonedx`. The SBOM lands in the
+    image's OCI registry as a cosign referrer with the proper
+    `application/vnd.cyclonedx+json` mediaType, discoverable via
+    `cosign download sbom <image>`.
+
+    This Task handles the CONTAINER path of the SBOM-attachment
+    contract. Packages don't live in an OCI registry, so they keep
+    the S3-sibling + signed-byproduct path produced by the
+    `generate-sbom` Task alone.
+  params:
+    - name: image-ref
+      type: string
+      description: |
+        OCI image reference, BY DIGEST, that the SBOM should be
+        attached to. Example:
+        `quay.io/ceph/ceph@sha256:abc123...`. Tag-only references
+        are rejected — the SBOM is attached to specific image bytes,
+        not to a moving pointer.
+    - name: sbom-file
+      type: string
+      description: |
+        Path (relative to the `sboms` workspace root) of the SBOM
+        file to attach. Typically the per-image
+        `<basename>.cdx.json` produced by `generate-sbom`. Must be
+        CycloneDX-JSON (this Task pins `--type cyclonedx`); for
+        SPDX-JSON containers (the path #46 documents) a sibling
+        Task / Step would invoke the same command with
+        `--type spdxjson` and a corresponding `.spdx.json` file.
+    - name: cosign-image
+      type: string
+      default: ghcr.io/sigstore/cosign/cosign:v2.4.1
+      description: |
+        Pinned cosign image. v2.4.x is the same line `build-grype-db`
+        and `vuln-scan` already pin (so we don't pull a second cosign
+        layer onto the cluster). The cosign 2.x distroless image has
+        no shell; we invoke `cosign` directly via command/args. Same
+        posture as the `build-grype-db` sign step.
+    - name: tools-image
+      type: string
+      default: docker.io/library/busybox:1.36
+      description: |
+        Pinned busybox image used by the precheck step. Gives us
+        /bin/sh + grep + sha256sum for the digest-form
+        image-ref check + SBOM file existence check. Same pin as the
+        rest of the cluster's smoke / utility steps.
+  workspaces:
+    - name: sboms
+      description: |
+        Workspace containing the SBOM file referenced by `sbom-file`.
+        Shared from the `generate-sbom` Task in a real pipeline (same
+        workspace it writes `<basename>.cdx.json` into). Mounted
+        read-only is fine — this Task only reads the SBOM file.
+      mountPath: /workspace/sboms
+    - name: cosign-key
+      description: |
+        Optional. If mounted, expected to contain `cosign.key`,
+        `cosign.pub`, and optionally `cosign.password` — same shape
+        the `build-grype-db` sign step uses. `cosign attach sbom`
+        itself does NOT sign; it pushes the SBOM as a referrer. A
+        follow-up `cosign sign <image-ref>` covering the referrer
+        manifest is what produces the verifiable signature. We
+        accept the key here so a sign-the-referrer step can be added
+        in-Task once the keyless-Fulcio path lands (#27); for now,
+        Chains' own attestation over the image (which references the
+        SBOM's content digest via the `sbom-ARTIFACT_OUTPUTS`
+        byproduct from `generate-sbom`) is the cryptographic binding.
+      optional: true
+  results:
+    # ----------------------------------------------------------------
+    # SBOM_ATTACHED — confirms the attach call succeeded and records
+    # the image ref the SBOM is now attached to. Single Result; this
+    # Task is per-image, so no plural Chains grammar.
+    #
+    # Verifiers can round-trip via:
+    #   cosign download sbom <SBOM_ATTACHED>
+    # which fetches the SBOM bytes + mediaType from the registry.
+    # ----------------------------------------------------------------
+    - name: SBOM_ATTACHED
+      type: string
+      description: |
+        The image reference (by digest) the SBOM was attached to.
+        Same value as the `image-ref` param when the attach call
+        succeeded — re-emitted as a Result so downstream Tasks /
+        verifiers can confirm the binding without re-reading the
+        Pipeline params.
+  steps:
+    # ----------------------------------------------------------------
+    # Step 1: precheck — busybox shell.
+    #
+    # Validates two things that `cosign attach sbom` itself surfaces
+    # as opaque errors deep in the cosign output:
+    #
+    #   1. `image-ref` is a DIGEST reference (contains `@sha256:`).
+    #      Tag-only refs are racy and `cosign attach sbom` accepts
+    #      them silently — we catch them here.
+    #   2. The SBOM file exists at /workspace/sboms/<sbom-file>.
+    #      Distroless cosign can't tell us "file not found" in a
+    #      way that distinguishes from registry errors; surface it
+    #      here.
+    # ----------------------------------------------------------------
+    - name: precheck
+      image: $(params.tools-image)
+      env:
+        - name: IMAGE_REF
+          value: $(params.image-ref)
+        - name: SBOM_FILE
+          value: $(params.sbom-file)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        SBOM_PATH="/workspace/sboms/${SBOM_FILE}"
+
+        if [ ! -f "${SBOM_PATH}" ]; then
+          echo "[precheck] FATAL: SBOM file not found at ${SBOM_PATH}" >&2
+          echo "[precheck]        Listing /workspace/sboms for diagnosis:" >&2
+          ls -la /workspace/sboms >&2 || true
+          exit 1
+        fi
+
+        case "${IMAGE_REF}" in
+          *@sha256:*) : ;;
+          *)
+            echo "[precheck] FATAL: image-ref '${IMAGE_REF}' is not a digest reference" >&2
+            echo "[precheck]        cosign attach sbom requires <repo>@sha256:<hex>" >&2
+            echo "[precheck]        Tag-only refs are racy and rejected here." >&2
+            exit 1
+            ;;
+        esac
+
+        # Surface the SBOM digest in the log so it's correlatable
+        # with the upstream `sbom-ARTIFACT_OUTPUTS` byproduct from
+        # `generate-sbom`. (The cosign-attach step doesn't print it.)
+        SBOM_SHA="sha256:$(sha256sum "${SBOM_PATH}" | awk '{print $1}')"
+        echo "[precheck] image-ref=${IMAGE_REF}"
+        echo "[precheck] sbom-file=${SBOM_FILE} digest=${SBOM_SHA}"
+
+    # ----------------------------------------------------------------
+    # Step 2: attach — distroless cosign image, no shell.
+    #
+    # `cosign attach sbom` pushes the SBOM into the OCI registry as a
+    # cosign referrer. With cosign 2.x against a registry advertising
+    # the OCI 1.1 referrers API (quay.io does), this writes a proper
+    # referrer manifest carrying `application/vnd.cyclonedx+json` as
+    # the artifact mediaType.
+    #
+    # We pin `--type cyclonedx` to match the CycloneDX-JSON SBOM
+    # `generate-sbom` produces. For an SPDX-JSON SBOM (the container-
+    # path #46 documents), a sibling invocation with `--type spdxjson`
+    # is the same shape; the Task is split CycloneDX-first because
+    # `generate-sbom` is CycloneDX-first.
+    #
+    # Auth to the registry is implicit: cosign reads `${HOME}/.docker/
+    # config.json` (mounted by the calling Pipeline's
+    # imagePullSecrets / serviceAccountName), or registry-specific
+    # env vars. Same posture `build-builder-image` uses for `podman
+    # push`.
+    # ----------------------------------------------------------------
+    - name: attach
+      image: $(params.cosign-image)
+      env:
+        # Skip the interactive Rekor-upload prompt. `cosign attach
+        # sbom` itself doesn't log to Rekor (it just pushes the
+        # referrer), but cosign's prompt-machinery checks the var on
+        # every invocation.
+        - name: COSIGN_YES
+          value: "true"
+      command: ["cosign"]
+      args:
+        - attach
+        - sbom
+        - --sbom
+        - /workspace/sboms/$(params.sbom-file)
+        - --type
+        - cyclonedx
+        - $(params.image-ref)
+
+    # ----------------------------------------------------------------
+    # Step 3: emit-result — busybox shell, writes SBOM_ATTACHED.
+    # ----------------------------------------------------------------
+    - name: emit-result
+      image: $(params.tools-image)
+      env:
+        - name: IMAGE_REF
+          value: $(params.image-ref)
+      script: |
+        #!/bin/sh
+        set -eu
+        printf '%s' "${IMAGE_REF}" > "$(results.SBOM_ATTACHED.path)"
+        echo "[emit] SBOM_ATTACHED=${IMAGE_REF}"
+        echo "[emit] verify with: cosign download sbom ${IMAGE_REF}"

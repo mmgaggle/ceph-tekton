@@ -321,50 +321,30 @@ That's the same `syft scan` invocation the Task runs.
 
 ## Per-build package SBOMs
 
-> **⚠️ KNOWN INCORRECT BELOW — see issue [#55](https://github.com/mmgaggle/ceph-tekton/issues/55) for the rewrite plan**
->
-> The grammar described in this section (`ARTIFACT_OUTPUTS` with a
-> nested `sbom: {uri, digest, mediaType}` block, plus `SBOM_NAMES`,
-> `SBOM_COUNT`, `SBOM_MEDIATYPE` Result conventions) was a hallucinated
-> extension to Chains 0.26 — these Results are emitted by
-> `tasks/generate-sbom/task.yaml` but Chains silently ignores them.
-> The valid type-hint set for Chains 0.26 is only:
-> `*IMAGE_URL`/`*IMAGE_DIGEST`, `IMAGES`, `*ARTIFACT_URI`/`*ARTIFACT_DIGEST`,
-> `*ARTIFACT_OUTPUTS` (object with `uri`/`digest`/`isBuildArtifact`,
-> no `sbom` sub-block, no `mediaType`).
->
-> The SBOM file is still generated correctly by syft and the smoke
-> pipeline passes — but the SBOM URI + digest do **not** appear in
-> the Chains attestation the way this section claims. The canonical
-> SBOM-to-attestation path is `cosign attach sbom` after the build;
-> issue #55 tracks the rewrite (generate-sbom Task + this docs
-> section) onto that path. E2E tests in #54 will keep this kind of
-> regression from shipping again.
-
-The `SBOM` section above covers the **container image** path: one image
-subject, one SPDX-JSON SBOM, attached via Chains' type-hint Result
-convention. For **packages** (`.deb`, `.rpm`) the same Chains plumbing
+The `SBOM` section above covers the **container image** path: one
+image subject, one SPDX-JSON SBOM, surfaced via Chains type-hint
+Results AND attached as an OCI referrer by `cosign attach sbom` (see
+[Container SBOM attachment via `cosign attach sbom`](#container-sbom-attachment-via-cosign-attach-sbom)
+below). For **packages** (`.deb`, `.rpm`) the same Chains plumbing
 is reused but with three deliberate differences:
 
 1. **One SBOM per artifact** — a single `build-package` TaskRun (#16)
    can emit a handful of `.deb`s and a handful of `.rpm`s. Each one
-   gets its own CycloneDX SBOM and its own subject in the attestation.
+   gets its own CycloneDX SBOM and its own subject in the
+   attestation.
 2. **CycloneDX-JSON, not SPDX-JSON** — see "Why CycloneDX (for
    packages)" below.
 3. **S3 storage, not OCI referrers** — packages don't live in a
    registry, so the SBOM lives next to the `.deb` / `.rpm` in the
-   build-output S3 prefix (same lifecycle, same access controls).
+   build-output S3 prefix. `cosign attach sbom` doesn't apply.
 
 The `generate-sbom` Task (`tasks/generate-sbom/task.yaml`) is the
-mechanism. It ships standalone today and gets `runAfter`'d by the real
-package pipeline once #16 lands.
+mechanism. It ships standalone today and gets `runAfter`'d by the
+real package pipeline once #16 lands.
 
 ### Why CycloneDX (for packages)
 
-Same operating principle as SPDX-for-images (#46): Chains is
-format-agnostic and copies `SBOM_MEDIATYPE` verbatim into the
-attestation's `resolvedDependencies[].mediaType`. Format choice is a
-**consumer-fit** decision, not a Chains constraint. We picked the split
+Format choice is a **consumer-fit** decision. We picked the split
 because:
 
 | | SPDX 2.3 JSON | CycloneDX 1.6 JSON |
@@ -375,65 +355,52 @@ because:
 | Per-package SBOM ergonomics | works; verbose | tighter — components + deps grouped per pkg |
 | What ceph consumers actually run | image-pull verifiers, fed-procurement audits | `grype <sbom.cdx.json>` against the vuln DB (#51) |
 
-For container images the consumer is "fed procurement / cosign verify"
-→ SPDX wins. For packages the consumer is "Grype + Dependency-Track
-correlating CVEs against the deb / rpm payload" → CycloneDX wins. Both
-are signed-into the same SLSA attestation; downstream tooling reads
-`SBOM_MEDIATYPE` and dispatches.
+For container images the consumer is "fed procurement / `cosign
+download sbom`" → SPDX wins. For packages the consumer is "Grype +
+Dependency-Track correlating CVEs against the deb / rpm payload" →
+CycloneDX wins. Containers get their mediaType from the cosign-attach
+referrer manifest; packages convey it via the `.cdx.json` filename
+extension recorded in the signed `IMAGES` / `SBOM_IMAGES` /
+`sbom-ARTIFACT_OUTPUTS` subjects.
 
-### The multi-subject Chains type-hint grammar
+### The Chains-valid type-hint grammar `generate-sbom` emits
 
-Container SBOM uses the **bare-name** form
-(`IMAGE_URL` + `IMAGE_DIGEST` + `SBOM_URL` + `SBOM_DIGEST` +
-`SBOM_MEDIATYPE` — one subject per TaskRun). Packages can't use that
-form because there are N subjects per TaskRun and Tekton's
-declared-results rule
-([tektoncd/pipeline#7140](https://github.com/tektoncd/pipeline/issues/7140))
-means we can't surface `<NAME>_*` Results whose `<NAME>` is only known
-at scan time.
-
-[`tektoncd/chains/docs/slsa-provenance.md`](https://github.com/tektoncd/chains/blob/main/docs/slsa-provenance.md)
-documents two declared plural Results that handle multi-subject
-TaskRuns cleanly, and `generate-sbom` emits BOTH:
+Chains 0.26 supports a fixed type-hint set (documented in
+[`tektoncd/chains/docs/slsa-provenance.md`](https://github.com/tektoncd/chains/blob/v0.26.0/docs/slsa-provenance.md#output-artifacts)):
+`*IMAGE_URL` / `*IMAGE_DIGEST`, `IMAGES`, `*ARTIFACT_URI` /
+`*ARTIFACT_DIGEST`, and `*ARTIFACT_OUTPUTS` (object with `uri`,
+`digest`, `isBuildArtifact` — **no** `mediaType`, **no** nested
+`sbom`). The `generate-sbom` Task surfaces exactly the subset Chains
+will sign:
 
 | Result name | Shape | What Chains does with it |
 | --- | --- | --- |
-| `IMAGES` | newline-separated `<url>@sha256:<digest>` pairs | Promotes each pair to a separate subject in the SLSA attestation. Works on every Chains version since 0.13. |
-| `ARTIFACT_OUTPUTS` | JSON array of `{name, uri, digest, sbom:{uri,digest,mediaType}}` | Reads the nested `sbom` block (Chains 0.20+) and populates one `predicate.buildDefinition.resolvedDependencies[]` entry per artifact with the CycloneDX descriptor. |
+| `IMAGES` | newline-separated `<artifact-url>@sha256:<digest>` pairs | Promotes each pair to a separate subject in the SLSA attestation. Works on every Chains version since 0.13. |
+| `SBOM_IMAGES` | newline-separated `<sbom-url>@sha256:<digest>` pairs, one per per-artifact SBOM file | Same Chains grammar as `IMAGES`; distinct Result name lets verifier tooling separate artifact subjects from SBOM subjects on the attestation subject list. |
+| `sbom-ARTIFACT_OUTPUTS` | object `{uri, digest, isBuildArtifact: "false"}` for the rollup SBOM file | Lifts into `predicate.runDetails.byproducts[]` of the slsa/v2alpha4 attestation (same shape as the existing `sbom-ARTIFACT_OUTPUTS` Result on `pipelines/chains-smoke-test.yaml`'s sbom step). |
 
-The Task also exposes three contract-level Results that aren't part of
-the Chains grammar but are useful for verifier tooling, dashboards,
-and the smoke test:
+> Earlier revisions of this Task (the original #50 shape) declared
+> three additional Result names — `SBOM_NAMES`, `SBOM_COUNT`,
+> `SBOM_MEDIATYPE` — and packed an `ARTIFACT_OUTPUTS` value with a
+> nested `sbom: {uri, digest, mediaType}` block. None of those are
+> part of the Chains 0.26 grammar; Chains silently ignored them.
+> Issue [#55](https://github.com/mmgaggle/ceph-tekton/issues/55)
+> removed them and re-shaped the Task onto the Chains-valid grammar
+> above.
 
-- **`SBOM_NAMES`** — newline-separated list of slug names (one per
-  artifact, derived from the basename: uppercase, non-alnum replaced
-  with `_`, prefixed `PKG_`). Lets a human grep TaskRun output without
-  having to JSON-parse `ARTIFACT_OUTPUTS`. Example:
-
-  ```
-  fake-pkg-a_1.0.tar                   -> PKG_FAKE_PKG_A_1_0_TAR
-  ceph-mds_19.2.0_arm64.deb            -> PKG_CEPH_MDS_19_2_0_ARM64_DEB
-  ceph-common-19.2.0-1.el10.x86_64.rpm -> PKG_CEPH_COMMON_19_2_0_1_EL10_X86_64_RPM
-  ```
-
-- **`SBOM_COUNT`** — decimal count of (artifact, SBOM) pairs. Zero is
-  a fatal misconfiguration; the Task fails before emitting in that
-  case (the smoke test asserts this).
-- **`SBOM_MEDIATYPE`** — `application/vnd.cyclonedx+json`, the per-Task
-  CycloneDX commitment.
-
-Chains' deep-inspection (the same
-`artifacts.pipelinerun.enable-deep-inspection: "true"` ConfigMap flag
-that the container path needs) walks the PipelineRun's child TaskRuns,
-pulls the `IMAGES` + `ARTIFACT_OUTPUTS` Results, and rolls up one
-attestation with **N subjects + N SBOM descriptors** for an N-package
-build.
+Chains' deep-inspection
+(`artifacts.pipelinerun.enable-deep-inspection: "true"` ConfigMap
+flag) walks the PipelineRun's child TaskRuns, pulls the
+`IMAGES` + `SBOM_IMAGES` Results, and rolls up one attestation with
+**2N subjects** for an N-package build (N artifacts + N SBOMs), plus
+one `byproducts[]` entry for the rollup SBOM.
 
 ### Extracting a specific package's SBOM from an attestation
 
 The attestation lives on the PipelineRun (deep-inspection rolls up
-child TaskRun Results). Pull it the same way as the container path,
-then filter `resolvedDependencies` by `mediaType` and `name`:
+child TaskRun Results). The signed subject list carries both the
+package URIs and the SBOM URIs; filter by the `.cdx.json` suffix to
+get the SBOMs:
 
 ```sh
 # 1. Pull the PipelineRun-level attestation.
@@ -443,22 +410,13 @@ kubectl get "$PR" \
   | base64 -d \
   | jq -r '.payload | @base64d | fromjson' > /tmp/att.json
 
-# 2. List every CycloneDX SBOM descriptor in the attestation.
-jq '.predicate.buildDefinition.resolvedDependencies[]
-    | select(.mediaType == "application/vnd.cyclonedx+json")' \
-  /tmp/att.json
+# 2. List every SBOM subject in the attestation (URI ends in .cdx.json).
+jq '.subject[] | select(.name | endswith(".cdx.json"))' /tmp/att.json
 
-# 3. Find the SBOM_URL for a specific package by its basename.
-BN=ceph-mds_19.2.0_arm64.deb
-tkn pipelinerun describe "${PR##*/}" -o json \
-  | jq -r ".status.childReferences[].name" \
-  | while read -r tr; do
-      tkn taskrun describe "$tr" -o json \
-        | jq -r --arg n "$BN" '
-            (.status.results[]? | select(.name == "ARTIFACT_OUTPUTS")).value
-            | fromjson
-            | .[] | select(.name == $n) | .sbom.uri'
-    done
+# 3. List the rollup SBOM byproduct (under runDetails.byproducts[]).
+jq '.predicate.runDetails.byproducts[]
+    | select(.uri | endswith(".cdx.json"))' \
+  /tmp/att.json
 
 # 4. Fetch the SBOM and re-parse it. The S3 layout is
 #    s3://<bucket>/<branch>/<sha>/<distro>/<arch>/sboms/<basename>.cdx.json
@@ -466,11 +424,68 @@ aws s3 cp \
   s3://ceph-artifacts-branch/main/<sha>/centos10/x86_64/sboms/ceph-mds_19.2.0_arm64.deb.cdx.json \
   /tmp/
 syft scan cyclonedx-json:/tmp/ceph-mds_19.2.0_arm64.deb.cdx.json -o table
+
+# 5. Confirm the SBOM bytes match the digest the attestation signed.
+sha256sum /tmp/ceph-mds_19.2.0_arm64.deb.cdx.json
+# -> must match the sha256 next to that URI in step 2 / step 3 output.
 ```
 
-The downstream `SBOM_DIGEST` you saw in step 2 should match `sha256sum
-/tmp/ceph-mds_19.2.0_arm64.deb.cdx.json` exactly — same Chains-attested
-integrity guarantee as the container path.
+The Chains-signed `sha256` of the SBOM file is the integrity binding
+— if `sha256sum` of the downloaded file doesn't match, the SBOM is
+not the one this build produced.
+
+### Container SBOM attachment via `cosign attach sbom`
+
+For container images the per-build SBOM has a SECOND distribution
+path on top of the Chains attestation: the `attach-sbom` Task
+(`tasks/attach-sbom/task.yaml`) runs
+
+```text
+cosign attach sbom \
+  --sbom /workspace/sboms/<file>.cdx.json \
+  --type cyclonedx \
+  <repo>@sha256:<digest>
+```
+
+against the built image's OCI registry. The SBOM lands as a cosign
+referrer carrying its mediaType (`application/vnd.cyclonedx+json`)
+natively in the referrer manifest, discoverable via
+
+```sh
+cosign download sbom <repo>@sha256:<digest>
+```
+
+This closes the M-22-18 §4(e) / CIS SSC §3 "mediaType embedded in
+the attestation surface" gap the original #50 design missed without
+inventing a Chains-grammar extension. The Task takes the image
+reference BY DIGEST (not tag) so the SBOM is unambiguously bound to
+the exact image bytes; the `precheck` step rejects tag-only refs.
+
+> **Why `cosign attach sbom` and not
+> `cosign attest --predicate <file> --type spdxjson`:**
+> `cosign attach sbom` writes the SBOM as an OCI referrer with the
+> right mediaType, round-tripping via `cosign download sbom`. That's
+> the consumer flow `anchore`, GitHub container provenance, and
+> Sigstore docs are built around. `cosign attest --predicate` would
+> wrap the SBOM in an in-toto Statement — a different signed claim,
+> useful when a verifier needs the SBOM inside an in-toto envelope,
+> but NOT what `cosign download sbom` looks for. We picked attach
+> because Chains' own slsa/v2alpha4 attestation already wraps the
+> SBOM URI + content digest as a signed byproduct (the
+> `sbom-ARTIFACT_OUTPUTS` Result above), so the cryptographic
+> binding is covered; what attach adds is the in-registry mediaType-
+> typed referrer that the standard SBOM-discovery tooling reads.
+> `cosign attach sbom` is marked "deprecated" in cosign 2.x release
+> notes only for the legacy `.sbom`-tag fallback path; against a
+> registry advertising the OCI 1.1 referrers API (Quay does), the
+> command writes a modern referrer and works through at least
+> cosign v2.4.x.
+
+Packages do NOT use the cosign-attach path — there is no OCI
+registry for `.deb` / `.rpm`. They keep the S3-sibling + signed-
+byproduct convention above, and the file extension on the
+`SBOM_IMAGES` / `sbom-ARTIFACT_OUTPUTS.uri` values (`*.cdx.json`)
+conveys the mediaType.
 
 ### OIDC S3 upload path
 
@@ -561,11 +576,19 @@ tkn pipeline start sbom-pkg-smoke-test \
 The pipeline:
 - seeds two deterministic `.tar` files into the artifacts workspace,
 - runs `generate-sbom` to produce one CycloneDX SBOM per artifact,
-- runs `assert-results` to verify `SBOM_COUNT=2`, the right
-  `SBOM_MEDIATYPE`, and that `SBOM_NAMES` contains both per-artifact
-  prefixes (`FAKE_PKG_A` + `FAKE_PKG_B`).
+- runs `assert-results` to verify `IMAGES` has one
+  `<url>@sha256:<hex>` line per seeded artifact, `SBOM_IMAGES` has
+  one matching `*.cdx.json@sha256:<hex>` line per SBOM file, and the
+  `sbom-ARTIFACT_OUTPUTS` object Result carries a well-formed
+  `{uri, digest, isBuildArtifact=false}` triplet.
 
-PipelineRun success = the Chains type-hint contract is intact.
+PipelineRun success = the Chains-valid type-hint contract is intact.
+
+The container path (`cosign attach sbom`) is exercised separately:
+`pipelines/chains-smoke-test.yaml` covers the image attestation, and
+when an image build pipeline lands (#23, #26) it will `runAfter`
+the build with the `attach-sbom` Task to push the SBOM into the
+registry as a cosign referrer.
 
 ## Promoting to Fulcio keyless (Sepia)
 
