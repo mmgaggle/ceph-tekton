@@ -87,7 +87,7 @@ SIG="${E2E_ARTIFACTS}/chains-smoke.sig"
 decode_attestation "${NS}" "${SBOM_TR}" "${ATT}" \
   || { log::fail "no Chains attestation annotation on sbom TaskRun"; \
        capture_pipelinerun_artifacts "${NS}" "${PR}"; exit 1; }
-decode_signature "${NS}" "${SBOM_TR}" "${SIG}" \
+decode_envelope "${NS}" "${SBOM_TR}" "${SIG}" \
   || { log::fail "no Chains signature annotation on sbom TaskRun"; \
        capture_pipelinerun_artifacts "${NS}" "${PR}"; exit 1; }
 
@@ -117,7 +117,7 @@ else
 fi
 
 # --- assertion 5: cosign verify-blob -------------------------------
-cosign_verify_blob "${COSIGN_PUB}" "${SIG}" "${ATT}" \
+cosign_verify_envelope "${COSIGN_PUB}" "${SIG}" "${ATT}" \
   || { log::fail "cosign verify-blob failed"; exit 1; }
 
 # --- assertion 6: Rekor log index ----------------------------------
