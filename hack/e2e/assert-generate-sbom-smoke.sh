@@ -52,15 +52,20 @@ require_cmd syft    "brew install syft"
 kube_ctx apply -f "${E2E_REPO_ROOT}/tasks/generate-sbom/task.yaml" >/dev/null
 kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/sbom-pkg-smoke-test.yaml" >/dev/null
 
-# Use NAMED PVCs for both workspaces. `sboms` so we can re-mount it in
-# a follow-up debug Pod and read the SBOM bytes out; `artifacts`
-# because Tekton gives each TaskRun pod its own emptyDir, so an
-# emptyDir-bound shared workspace doesn't actually share between
-# Tasks — the seed Task's .tar files vanish before generate-sbom can
-# see them. A PVC (or volumeClaimTemplate) is required for any
-# workspace that needs to flow data between TaskRuns.
+# Use a SINGLE NAMED PVC for both workspaces, mounted via subPath. Two
+# constraints collide otherwise:
+#   1. The `artifacts` workspace must flow data between TaskRuns (seed
+#      writes .tar files; generate-sbom reads them). An emptyDir-bound
+#      workspace can't do this — each TaskRun pod gets its own
+#      emptyDir, so seed's files vanish before generate-sbom looks.
+#   2. Binding `artifacts` and `sboms` to *two different* named PVCs
+#      makes Tekton's affinity-assistant bail with "more than one
+#      PersistentVolumeClaim is bound": it pins TaskRuns to one node
+#      via one anchor PVC and can't reconcile two.
+# One PVC + subPath sidesteps both — the underlying volume is shared
+# but the workspaces see distinct directories. The exfil Pod below
+# mounts the same PVC and reads /sboms/*.cdx.json out.
 PVC_NAME="e2e-sbom-pvc-$(date +%s)"
-ARTIFACTS_PVC_NAME="e2e-sbom-artifacts-pvc-$(date +%s)"
 kube_ctx -n "${NS}" apply -f - <<EOF >/dev/null
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -71,27 +76,16 @@ spec:
   resources:
     requests:
       storage: 100Mi
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: ${ARTIFACTS_PVC_NAME}
-spec:
-  accessModes: [ReadWriteOnce]
-  resources:
-    requests:
-      storage: 100Mi
 EOF
 cleanup_pvc() {
   kube_ctx -n "${NS}" delete pvc "${PVC_NAME}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-  kube_ctx -n "${NS}" delete pvc "${ARTIFACTS_PVC_NAME}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   kube_ctx -n "${NS}" delete pod  "exfil-${PVC_NAME}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 }
 trap cleanup_pvc EXIT
 
 PR="$(start_pipelinerun "${NS}" sbom-pkg-smoke-test \
-        --workspace=name=artifacts,claimName="${ARTIFACTS_PVC_NAME}" \
-        --workspace=name=sboms,claimName="${PVC_NAME}")"
+        --workspace=name=artifacts,claimName="${PVC_NAME}",subPath=artifacts \
+        --workspace=name=sboms,claimName="${PVC_NAME}",subPath=sboms)"
 log::info "started PipelineRun: ${NS}/${PR}"
 
 wait_pipelinerun_succeeded "${NS}" "${PR}" \
@@ -126,6 +120,11 @@ spec:
       volumeMounts:
         - name: sboms
           mountPath: /sboms
+          # The PVC carries both `artifacts/` and `sboms/` subdirs
+          # (Tekton subPath-mapped each workspace into its own dir).
+          # Mount only the sboms half here so existing /sboms/*.cdx.json
+          # paths still resolve.
+          subPath: sboms
   volumes:
     - name: sboms
       persistentVolumeClaim:
