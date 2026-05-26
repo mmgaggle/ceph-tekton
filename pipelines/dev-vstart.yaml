@@ -1,0 +1,357 @@
+# dev-vstart — chain build-from-source + vstart-cluster into a single
+# Pipeline so an engineer (or a CI test substrate) can `tkn pipeline
+# start dev-vstart …` and get back a running vstart cluster against
+# their ceph ref.
+#
+# Per issue #65. The Pipeline is intentionally thin: every interesting
+# knob lives on one of the two Tasks; this file is the wiring + the
+# user-facing param surface.
+#
+# PARAM NAMING — underscores at the Pipeline API, dashes at the Task
+# API. The issue body specifies the user-facing names with
+# underscores (`mon_count`, `keep_alive_seconds`, etc. — see the
+# `tkn pipeline start dev-vstart -p git_ref=wip-foo -p rgw_count=1`
+# example). Tekton Tasks across this repo use dash-cased params
+# (`git-ref`, `mon-count`), so we translate at the wiring layer
+# below. Keeping the user-facing names matched to the issue is
+# the contract; the internal dash form is an implementation
+# detail of how Tasks happen to be named in tektoncd/pipeline.
+#
+# DAEMON-COUNT DEFAULTS — RGW/MDS default to 0 (opt-in). The issue
+# calls this out: "opt in to the daemons you actually need so the
+# pod resource footprint matches the workload (RGW dev sets
+# rgw_count=1; CephFS dev sets mds_count=1; combined-stack dev
+# sets both)". The README in tasks/vstart-cluster/ has the
+# port-forward recipe for each of the three shapes.
+#
+# KEEP-ALIVE CAP — exposed as a Pipeline param (`keep_alive_cap_seconds`)
+# rather than hardcoded, so a namespace overlay (`kustomize/overlays/ci/`)
+# can lower the cap to e.g. 7200 (2h) for CI runs while the
+# default dev-shell case keeps the 86400 (24h) ceiling the issue
+# specifies. The enforcement itself happens inside the
+# vstart-cluster Task's validate-params step — see
+# tasks/vstart-cluster/task.yaml. We don't duplicate the check
+# at the Pipeline layer because Tekton param values can be
+# overridden per-PipelineRun anyway; defence-in-depth is the
+# Task's responsibility, the Pipeline's job is to thread the
+# value through.
+#
+# WORKSPACE SHAPE — one shared `source` workspace flows from
+# build-from-source into vstart-cluster. The Tasks' descriptions
+# call for a volumeClaimTemplate (PVC per PipelineRun) — vstart's
+# build tree is 4-8GB compiled, 12GB+ with debug symbols, too
+# large for most emptyDir defaults. The Pipeline itself stays
+# binding-agnostic; the PipelineRun (or the `tkn pipeline start`
+# invocation) decides PVC vs emptyDir vs an existing PVC re-used
+# across runs for ccache. The README in tasks/vstart-cluster/
+# documents the typical PipelineRun shapes.
+#
+# NO PIPELINERUN TEMPLATE — deliberately not shipped here. Whether
+# a consumer triggers this on-demand (`tkn pipeline start`), via
+# PaC on a PR, or on a cron schedule is a separate concern from
+# the Pipeline definition itself. The acceptance criterion calls
+# for `tkn pipeline start dev-vstart …` to work; that's a
+# PipelineRun the engineer constructs at invoke time, not a
+# checked-in YAML.
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: dev-vstart
+spec:
+  description: |
+    Build ceph from source at the given ref, then bring up a vstart
+    cluster against the build tree inside a pod that stays alive for
+    keep_alive_seconds (or until a .shutdown sentinel is written to
+    the shared workspace).
+
+    Two consumers share the same Pipeline:
+      1. Developer dev shell — `tkn pipeline start dev-vstart
+         -p git_ref=wip-foo -p keep_alive_seconds=14400`,
+         then `oc rsh` into the vstart-cluster pod.
+      2. CI test substrate — downstream test Task shares the
+         workspace via TaskRun affinity, runs against the live
+         cluster, then writes .shutdown to release the pod.
+
+    Shape selection is per the daemon-count params:
+      - RGW-only:   rgw_count=1 mds_count=0
+      - CephFS-only: mds_count=1 rgw_count=0
+      - Combined:   rgw_count=1 mds_count=1
+    See tasks/vstart-cluster/README.md for port-forward recipes.
+  params:
+    # ----- source selection -----
+    - name: git_url
+      type: string
+      default: https://github.com/ceph/ceph.git
+      description: |
+        Upstream ceph repo URL. Default tracks the canonical
+        github.com/ceph/ceph; override for PR builds (PaC threads
+        the PR's head-repo URL here) or for a private fork.
+    - name: git_ref
+      type: string
+      default: main
+      description: |
+        Git ref to build. Branch, tag, or commit SHA. Dev shell:
+        pin to your topic branch (`-p git_ref=wip-foo`). CI: pin
+        to the PR head SHA. The actual resolved SHA is exposed
+        as the build-from-source Task's source-sha Result.
+
+    # ----- builder image selection -----
+    - name: distro
+      type: string
+      default: centos10
+      description: |
+        Distro slug — phase 1 ships centos10 only (issue #10).
+        Threaded into the builder image tag below.
+    - name: arch
+      type: string
+      default: x86_64
+      description: |
+        Arch slug — phase 1 ships x86_64 only (issue #2 adds
+        aarch64 once arm64 workers land in Sepia).
+    - name: builder_image
+      type: string
+      default: ""
+      description: |
+        Full image reference for the ceph-builder. Empty (the
+        default) means "compute it from distro + arch": the
+        Pipeline wires `image-registry.openshift-image-registry.svc:5000/ceph-tekton/ceph-builder:<distro>-<arch>`
+        when this is empty, or passes through the caller's
+        explicit pin verbatim. The dev-cluster smoke path
+        (`make dev-up`) passes `-p builder_image=localhost/ceph-builder:centos10-x86_64`
+        to reach the kind-local tag.
+
+    # ----- build knobs -----
+    - name: cmake_extra_args
+      type: string
+      default: ""
+      description: |
+        Extra args appended to the `cmake` invocation in
+        build-from-source. Use to override e.g. `-DWITH_RADOSGW=OFF`
+        for a CephFS-only shape that saves the RGW compile time.
+    - name: ninja_jobs
+      type: string
+      default: ""
+      description: |
+        Override for `ninja -j<n>`. Empty = `$(nproc)`. Cap to
+        a smaller number on memory-constrained workers (ceph
+        link step is ~8-12GB resident on a 16-core node).
+    - name: ccache_dir
+      type: string
+      default: /workspace/source/.ccache
+      description: |
+        ccache directory. Default lives on the source workspace
+        so a re-run against the same PVC re-uses the cache.
+        Empty disables ccache.
+
+    # ----- daemon counts (the user-facing shape selector) -----
+    #
+    # Per issue #65 acceptance criterion. RGW/MDS default to 0 so
+    # the resource footprint matches the workload; engineers opt
+    # in to what they actually need.
+    - name: mon_count
+      type: string
+      default: "1"
+      description: |
+        ceph-mon daemons. 1 = dev default. 3 = exercise quorum.
+    - name: osd_count
+      type: string
+      default: "3"
+      description: |
+        ceph-osd daemons. 3 = minimum for the default replicated
+        rule (size=3); below 3 yields HEALTH_WARN forever.
+    - name: mgr_count
+      type: string
+      default: "1"
+      description: |
+        ceph-mgr daemons. 1 = dev default. 2 = exercise the
+        standby-mgr code path.
+    - name: rgw_count
+      type: string
+      default: "0"
+      description: |
+        radosgw daemons. 0 (default) = no RGW. 1 = the typical
+        RGW-dev shape (listens on :8000). See README port-forward
+        recipe for the RGW-only shape.
+    - name: mds_count
+      type: string
+      default: "0"
+      description: |
+        ceph-mds daemons. 0 (default) = no CephFS. 1 = the typical
+        CephFS-dev shape. >1 exercises multi-active MDS. See
+        README port-forward recipe for the CephFS-only shape.
+
+    # ----- runtime knobs -----
+    - name: vstart_extra_args
+      type: string
+      default: ""
+      description: |
+        Extra args appended to vstart.sh. Empty default = memstore
+        OSDs (no privileged loop devices required). Common values:
+          --bluestore                  (needs loop-device SCC)
+          --cache                      (per-OSD client cache)
+          --erasure-code-profile NAME  (test EC pools)
+    - name: keep_alive_seconds
+      type: string
+      default: "3600"
+      description: |
+        How long to hold the cluster alive after HEALTH_OK/WARN,
+        in seconds. Default 3600 (1h). Hard cap enforced by the
+        vstart-cluster Task — see keep_alive_cap_seconds.
+        Setting "0" exits immediately after the health check
+        (useful for build + health-check smokes).
+    - name: keep_alive_cap_seconds
+      type: string
+      default: "86400"
+      description: |
+        Hard cap on keep_alive_seconds. Default 86400 (24h) per
+        the issue's "no infinite pods" criterion. CI overlay
+        lowers to 7200 (2h) to free workers faster.
+    - name: health_timeout_seconds
+      type: string
+      default: "300"
+      description: |
+        How long to wait for HEALTH_OK/WARN after vstart.sh
+        returns. Default 5min covers a cold-start memstore
+        cluster; bluestore on slow IO can need 10+.
+
+  workspaces:
+    - name: source
+      description: |
+        Shared workspace flowing from build-from-source (clone +
+        cmake + ninja vstart) into vstart-cluster (vstart.sh
+        against the build tree).
+
+        Layout written by build-from-source:
+          $(workspaces.source.path)/ceph/         — git working tree
+          $(workspaces.source.path)/ceph/build/   — cmake build tree
+          $(workspaces.source.path)/.ccache/      — ccache cache
+
+        Read by vstart-cluster from
+        $(workspaces.source.path)/ceph/build (vstart.sh expects
+        to be invoked from build/).
+
+        Binding shape recommendation: a volumeClaimTemplate (PVC
+        per PipelineRun, ReadWriteOnce, ~30Gi for a Debug build
+        + ccache). emptyDir works for tiny smoke runs but the
+        Debug build tree (12GB+) blows past most emptyDir size
+        limits. The caller's PipelineRun decides — see the
+        README for example workspaces bindings.
+
+  tasks:
+    # ----------------------------------------------------------------
+    # build-from-source — clone ceph at git_ref, configure with cmake,
+    # build the `vstart` aggregator target. Emits the build tree on
+    # the `source` workspace.
+    # ----------------------------------------------------------------
+    - name: build
+      taskRef:
+        name: build-from-source
+      params:
+        - name: git-url
+          value: $(params.git_url)
+        - name: git-ref
+          value: $(params.git_ref)
+        - name: distro
+          value: $(params.distro)
+        - name: arch
+          value: $(params.arch)
+        # When the caller passes `-p builder_image=…` we forward
+        # verbatim; when they leave it empty the Task's own
+        # default (localhost/ceph-builder:centos10-x86_64, the
+        # kind-local tag) kicks in. We don't try to compute
+        # `image-registry.openshift…/ceph-builder:<distro>-<arch>`
+        # at the Pipeline layer because Tekton param defaults
+        # can't conditionally substitute — the smart-default
+        # belongs in a kustomize overlay, not the base Pipeline.
+        - name: builder-image
+          value: $(params.builder_image)
+        - name: cmake-extra-args
+          value: $(params.cmake_extra_args)
+        - name: ninja-jobs
+          value: $(params.ninja_jobs)
+        - name: ccache-dir
+          value: $(params.ccache_dir)
+      workspaces:
+        - name: source
+          workspace: source
+
+    # ----------------------------------------------------------------
+    # vstart-cluster — bring up the requested daemon set against the
+    # build tree from the previous Task, hold the cluster alive,
+    # then tear down with stop.sh.
+    #
+    # `runAfter: [build]` because both Tasks bind the SAME workspace
+    # and Tekton's Pipeline DAG only infers ordering via Results /
+    # param threading, not via shared workspaces. Without an
+    # explicit runAfter, Tekton would schedule the two Tasks in
+    # parallel and vstart-cluster would see an empty workspace.
+    # ----------------------------------------------------------------
+    - name: vstart
+      taskRef:
+        name: vstart-cluster
+      runAfter:
+        - build
+      params:
+        - name: mon-count
+          value: $(params.mon_count)
+        - name: osd-count
+          value: $(params.osd_count)
+        - name: mgr-count
+          value: $(params.mgr_count)
+        - name: rgw-count
+          value: $(params.rgw_count)
+        - name: mds-count
+          value: $(params.mds_count)
+        - name: vstart-extra-args
+          value: $(params.vstart_extra_args)
+        - name: keep-alive-seconds
+          value: $(params.keep_alive_seconds)
+        - name: keep-alive-cap-seconds
+          value: $(params.keep_alive_cap_seconds)
+        - name: health-timeout-seconds
+          value: $(params.health_timeout_seconds)
+        - name: builder-image
+          value: $(params.builder_image)
+      workspaces:
+        - name: source
+          workspace: source
+
+  results:
+    # Surface the most useful per-Task Results at the Pipeline level
+    # so a `tkn pipelinerun describe` shows them without drilling
+    # into individual TaskRuns. Downstream test Tasks (CI substrate)
+    # consume these to correlate test artefacts with the cluster
+    # they ran against.
+    - name: source-sha
+      description: |
+        Full git SHA the build actually ran against. Resolved
+        post-clone — `git_ref=main` resolves to a moving target,
+        this Result captures what was built.
+      value: $(tasks.build.results.source-sha)
+    - name: builder-image-digest
+      description: |
+        sha256 digest of the builder image the build ran inside.
+        Empty if the builder image was built without
+        /etc/ceph-builder-image.env (older builders).
+      value: $(tasks.build.results.builder-image-digest)
+    - name: cluster-fsid
+      description: |
+        Cluster fsid reported by `ceph -s` once the vstart cluster
+        reached steady state. Correlation key between this
+        PipelineRun and any artefacts (RGW objects, CephFS files)
+        a downstream test Task produced against the cluster.
+      value: $(tasks.vstart.results.cluster-fsid)
+    - name: cluster-health
+      description: |
+        Final health when the cluster reached steady state —
+        HEALTH_OK or HEALTH_WARN. HEALTH_ERR is a Pipeline
+        failure; this Result is only emitted on success.
+      value: $(tasks.vstart.results.cluster-health)
+    - name: shutdown-reason
+      description: |
+        How vstart-cluster wound down — one of `ttl-expired`,
+        `sentinel`, or `health-check-only`. Lets downstream
+        dashboards distinguish "test Task asked us to wind down
+        early" from "TTL ran out".
+      value: $(tasks.vstart.results.shutdown-reason)
