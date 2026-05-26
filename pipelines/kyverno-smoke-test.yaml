@@ -123,7 +123,15 @@ spec:
       default: kyverno-smoke
     - name: kubectl-image
       type: string
-      default: "docker.io/bitnami/kubectl:1.30"
+      # Bitnami retired `bitnami/kubectl` from the public Docker Hub
+      # catalog in mid-2025; the historical tags moved to the
+      # `bitnamilegacy` namespace (1.30 last pushed 2025-07-20). Tracking
+      # the legacy mirror here is the minimal change; switching to
+      # Chainguard's `cgr.dev/chainguard/kubectl` is a follow-up cleanup
+      # (that one is rolling-tag-only and pins differently). Other bitnami
+      # refs in the repo (build-grype-db, dev-kind kustomize) have the
+      # same problem and are tracked as a separate issue.
+      default: "docker.io/bitnamilegacy/kubectl:1.30"
       description: Image providing the `kubectl` CLI for the test step.
   steps:
     - name: try-create
