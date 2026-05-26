@@ -9,24 +9,24 @@ producing signed, provenance-attested packages and container images for
 the upstream [`ceph/ceph`](https://github.com/ceph/ceph) codebase — and
 for anything else that wants to inherit the same supply-chain posture.
 
-The driving concerns are operational, not pitch-y:
+The driving concerns are operational:
 
 - **Move the build platform onto infrastructure the project (and the
   wider community) already knows how to operate** — Kubernetes plus a
   bundled Tekton, instead of bespoke services owned by the build team.
 - **Make builds portable enough to debug locally.** A contributor
   reproducing a release-branch failure on their laptop should run the
-  same Pipeline that made the artefact, against the same Chains
+  same Pipeline that made the artifact, against the same Chains
   attestation shape — differences from prod are explicit overlay
   deltas, not "well, dev uses a different system."
 - **Make the security posture of every build a first-class output,
-  not a follow-up project.** Signed artefacts, SLSA v1.0 provenance
+  not a follow-up project.** Signed artifacts, SLSA v1.0 provenance
   to Rekor, SBOMs alongside every package, vuln-scan results
   produced from a self-hosted Grype DB we sign ourselves.
 
 ### Where it runs
 
-The same manifests run on any cluster shape worth caring about:
+The same manifests run on any cluster:
 
 - **OpenShift in the [Ceph Sepia lab](https://wiki.sepia.ceph.com/)** —
   the production target. Co-located with the Ceph S3/RGW the artifact
@@ -42,13 +42,13 @@ The same manifests run on any cluster shape worth caring about:
   iterating on a Pipeline change without booking Sepia time. The
   local overlay swaps Sepia-only bits (Fulcio keyless, RGW object-lock)
   for dev-shaped equivalents (a static cosign key in a Secret, an
-  in-cluster RGW or `quay.io/dparkes/zgw-posix` next to the kind
+  Rook managed RGW or `quay.io/dparkes/zgw-posix` inside the kind
   cluster), so the same Pipeline runs end-to-end with the same
   attestation shape.
 
 ### What every build produces
 
-- **A signed artefact** — `.deb` / `.rpm` / container image with a
+- **A signed artifact** — `.deb` / `.rpm` / container image with a
   cosign signature published alongside.
 - **A SLSA v1.0 provenance attestation** — emitted by Tekton Chains
   from the actual PipelineRun, signed by an identity the build itself
