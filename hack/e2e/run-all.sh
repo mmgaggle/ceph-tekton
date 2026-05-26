@@ -51,6 +51,7 @@ ASSERTIONS=(
   kyverno-smoke
   reproducibility-smoke
   generate-sbom-smoke
+  compute-matrix-smoke
   zgw-posix-up
   vuln-scan-smoke
   build-builder-image
