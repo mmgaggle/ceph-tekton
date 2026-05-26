@@ -1,0 +1,35 @@
+# Role for the cloudevents-sink SA (issue #63).
+#
+# The sink pod does NOT call the Kubernetes API. Its job is HTTP-in,
+# S3-out — receive CloudEvents POSTs, buffer, flush to S3. Even
+# secrets are env-injected via the Deployment spec, not API-fetched.
+#
+# A separate workload-OIDC trust on RGW (the `ceph-tekton-events`
+# role; see docs/build-archive.md §"Auth to S3") covers the S3 side.
+# Kubernetes RBAC has nothing to grant here.
+#
+# WHY a Role at all (instead of just omitting the file):
+#   - Makes the RBAC posture explicit in the manifests rather than
+#     "nothing exists, so it must be empty" inference at review time.
+#   - Gives us a concrete object to RoleBind to. The matched
+#     RoleBinding (rolebinding.yaml) anchors the SA → Role link by
+#     name, same convention build-grype-db follows.
+#   - If a future need arises (e.g. emitting Kubernetes events about
+#     flush failures via the Events API) we add the verb HERE rather
+#     than reaching for a ClusterRole.
+#
+# Scope: namespaced Role (not ClusterRole). The sink and its SA both
+# live in the cloudevents-sink namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cloudevents-sink
+  namespace: cloudevents-sink
+  labels:
+    app.kubernetes.io/name: cloudevents-sink
+    app.kubernetes.io/component: sink
+    app.kubernetes.io/part-of: ceph-tekton
+# Intentionally empty rules — see comment above. Kubernetes accepts an
+# empty rules list; the matched RoleBinding is the structural piece
+# that makes the SA → Role association reviewable.
+rules: []

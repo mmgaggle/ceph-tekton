@@ -1,0 +1,143 @@
+# Single-replica Deployment running the cloudevents-sink Python app
+# (issue #63).
+#
+# WHY replicas: 1
+#   The sink keeps an in-memory buffer to batch S3 PUTs (50 events OR
+#   30s, whichever first). Multiple replicas would each maintain a
+#   separate buffer, defeating the batching and producing more small
+#   objects — Ceph RGW's per-PUT overhead is non-trivial. A single
+#   replica is sufficient for Tekton's emission rate (every
+#   PipelineRun + TaskRun lifecycle transition, not every step log
+#   line); if it ever becomes a bottleneck, the answer is gunicorn -w 1
+#   in front (single process, multiple threads) rather than horizontal
+#   scale.
+#
+# WHY strategy.type: Recreate
+#   With a single replica + an in-memory buffer, RollingUpdate would
+#   briefly run two pods sharing the same Service and double-deliver
+#   to whichever wins the round-robin. Recreate cleanly drains the
+#   old pod (graceful SIGTERM flushes the buffer; see sink.py
+#   _on_term) before the new one starts.
+#
+# WHY no PVC, no Secret-managed state
+#   "Stateless preference" per issue #63 §"Why" — state lives in S3
+#   only. The pod has nothing to mount beyond the SA-token projection
+#   that the Sepia overlay attaches for AssumeRoleWithWebIdentity.
+#   See kustomize/overlays/sepia/cloudevents-sink/ when it lands.
+#
+# Image: placeholder `ceph-tekton/cloudevents-sink:dev` — the per-env
+# overlay will patch this to the registry-tagged path. The image is
+# built from services/cloudevents-sink/Dockerfile.
+#
+# Resources: small. Flask + boto3 idles at ~50MB RSS; a flushing batch
+# allocates ~50KB per buffered event. 128Mi request / 256Mi limit
+# covers a 50-event burst with headroom; bump if buffer thresholds
+# change.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudevents-sink
+  namespace: cloudevents-sink
+  labels:
+    app.kubernetes.io/name: cloudevents-sink
+    app.kubernetes.io/component: sink
+    app.kubernetes.io/part-of: ceph-tekton
+    app: cloudevents-sink
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: cloudevents-sink
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cloudevents-sink
+        app.kubernetes.io/component: sink
+        app.kubernetes.io/part-of: ceph-tekton
+        app: cloudevents-sink
+    spec:
+      serviceAccountName: cloudevents-sink
+      # Graceful shutdown window. SIGTERM triggers a final flush
+      # (sink.py _on_term); a single S3 PUT against RGW completes
+      # in well under a second under healthy conditions. 45s gives
+      # generous headroom for a worst-case retry on a transient S3
+      # blip without holding up rolling-update wall-clock.
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: sink
+          image: ceph-tekton/cloudevents-sink:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            # Bucket + key prefix — base defaults match the
+            # `events_bucket_name` default in terraform/modules/s3-buckets/.
+            # Per-env overlays patch these for dev (zgw-posix) or
+            # bucket_prefix'd names.
+            - name: EVENTS_BUCKET
+              value: ceph-tekton-events
+            - name: EVENTS_KEY_PREFIX
+              value: events
+            # S3 endpoint. Empty = AWS default; overlays set this to
+            # the RGW endpoint (Sepia) or the zgw-posix in-cluster
+            # service URL (dev).
+            - name: S3_ENDPOINT_URL
+              value: ""
+            # Region. RGW uses zone-group name ("default" out of the
+            # box); overlays may set this differently per env.
+            - name: AWS_REGION
+              value: default
+            # Flush thresholds. See sink.py header for the trade
+            # behind 50 / 30 — tuned for Tekton's PipelineRun
+            # emission rate.
+            - name: FLUSH_MAX_EVENTS
+              value: "50"
+            - name: FLUSH_MAX_INTERVAL_SECONDS
+              value: "30"
+            - name: LOG_LEVEL
+              value: INFO
+          # Credential env vars (AWS_ACCESS_KEY_ID /
+          # AWS_SECRET_ACCESS_KEY) and the projected-SA-token mount
+          # (AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE) are NOT in
+          # the base — per-env overlays add them. The base alone is
+          # sufficient to deploy the pod; it will fail readyz until
+          # creds resolve, which is the correct posture.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL

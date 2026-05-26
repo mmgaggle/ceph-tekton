@@ -1,0 +1,39 @@
+# ClusterIP Service fronting the cloudevents-sink Pod (issue #63).
+#
+# FQDN convention — Tekton's `default-cloud-events-sink` URL points at:
+#
+#   http://cloudevents-sink.cloudevents-sink.svc.cluster.local
+#
+# The first `cloudevents-sink` is the Service name, the second is the
+# Namespace. CoreDNS resolves the short form from any namespace; the
+# .svc.cluster.local suffix is the unambiguous absolute form and is
+# what should appear in TektonConfig.spec.pipeline.default-cloud-events-sink
+# so the resolution can't be redirected by a namespace's local search
+# domain.
+#
+# Plain HTTP on port 80 — no TLS in dev or in the cluster-internal
+# Sepia path. The cloud-events controller and the sink both live
+# in-cluster; mTLS would be the responsibility of a service-mesh
+# layer the project does not run today.
+#
+# WHY port 80 -> 8080: the sink binds 8080 inside the container
+# (non-privileged port for the non-root user). Clients reach it at the
+# Service's :80 — same posture zgw-posix uses.
+apiVersion: v1
+kind: Service
+metadata:
+  name: cloudevents-sink
+  namespace: cloudevents-sink
+  labels:
+    app.kubernetes.io/name: cloudevents-sink
+    app.kubernetes.io/component: sink
+    app.kubernetes.io/part-of: ceph-tekton
+spec:
+  type: ClusterIP
+  selector:
+    app: cloudevents-sink
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

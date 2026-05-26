@@ -127,6 +127,58 @@ variable "grype_db_expiration_days" {
   }
 }
 
+# ---------------------------------------------------------------------------
+# events bucket (issue #63)
+#
+# Tekton PipelineRun + TaskRun lifecycle CloudEvents archived as
+# JSON-Lines by the cloudevents-sink service. Distinct from the four
+# artifact / tooling buckets above:
+#   - PRIVATE only. PipelineRun payloads include step logs, internal
+#     URLs, and occasionally leaked secrets — there is intentionally no
+#     `events_public_read` knob. The sink writes; only the analytics
+#     consumer (DuckDB / Athena under operator creds) reads.
+#   - No versioning (each JSONL is a fresh object keyed by uuid).
+#   - No object-lock (analytics state, not release evidence).
+#   - Default expiration = 0 ("never expire"). Long-window trend
+#     queries want as much history as we can afford. Operators with
+#     storage budgets can set a finite ceiling per env.
+# ---------------------------------------------------------------------------
+
+variable "events_bucket_name" {
+  description = <<-EOT
+    Bucket for Tekton PipelineRun + TaskRun lifecycle CloudEvents
+    archived as JSON-Lines (issue #63). One JSONL object per
+    sink-flush, keyed under `events/dt=YYYY-MM-DD/hr=HH/<uuid>.jsonl`
+    so DuckDB / Athena can prune by date partition.
+
+    Private bucket; there is no `*_public_read` companion. See the
+    header comment in main.tf for the rationale.
+  EOT
+  type        = string
+  default     = "ceph-tekton-events"
+}
+
+variable "events_expiration_days" {
+  description = <<-EOT
+    Days until objects in the events bucket expire. 0 = never expire
+    (the default), which is what the long-window analytics use case
+    wants. Operators with finite storage budgets can set a positive
+    integer per env (e.g. 365 for "one year of build history").
+
+    When 0, the lifecycle resource that would carry the expiry rule
+    isn't created at all — S3 has no "infinite" sentinel; the safe
+    encoding is to omit the rule. A separate mpu-only lifecycle rule
+    still sweeps aborted multipart uploads regardless.
+  EOT
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.events_expiration_days >= 0 && var.events_expiration_days <= 3650
+    error_message = "events_expiration_days must be in [0, 3650] (10y ceiling)."
+  }
+}
+
 variable "release_object_lock_years" {
   description = <<-EOT
     Default retention period applied to every object PUT into the

@@ -1,15 +1,16 @@
 # `s3-buckets` module
 
-Creates the four artifact buckets ceph-tekton needs (see
-[`PLAN.md`](../../../PLAN.md) §"Artifact storage" and
+Creates the artifact, tooling, and analytics buckets ceph-tekton needs
+(see [`PLAN.md`](../../../PLAN.md) §"Artifact storage" and
 [`docs/architecture.md`](../../../docs/architecture.md#artifact-storage)):
 
-| Bucket                   | Lifecycle class                                                | Object-lock              |
-| ------------------------ | -------------------------------------------------------------- | ------------------------ |
-| `ceph-artifacts-dev`     | 30d object expiry                                              | none                     |
-| `ceph-artifacts-branch`  | keep latest N per (branch, distro, arch) + 180d hard ceiling   | none, versioning enabled |
-| `ceph-artifacts-release` | indefinite (object-lock retention)                             | GOVERNANCE, 7y default   |
-| `ceph-grype-db`          | 30d expiry (≈ keep last 30 dailies)                             | none, no versioning      |
+| Bucket                   | Lifecycle class                                                | Object-lock              | Public read |
+| ------------------------ | -------------------------------------------------------------- | ------------------------ | ----------- |
+| `ceph-artifacts-dev`     | 30d object expiry                                              | none                     | yes (mirror) |
+| `ceph-artifacts-branch`  | keep latest N per (branch, distro, arch) + 180d hard ceiling   | none, versioning enabled | yes (mirror) |
+| `ceph-artifacts-release` | indefinite (object-lock retention)                             | GOVERNANCE, 7y default   | yes (mirror) |
+| `ceph-grype-db`          | 30d expiry (≈ keep last 30 dailies)                            | none, no versioning      | yes (consumers) |
+| `ceph-tekton-events`     | configurable (default 0 = never expire); issue #63             | none, no versioning      | **no — private** |
 
 ## Why the AWS provider against every backend
 

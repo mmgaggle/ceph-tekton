@@ -1,0 +1,21 @@
+# Namespace for the cloudevents-sink Deployment + Service (issue #63).
+#
+# Keeps the sink in its own namespace so per-app RBAC + NetworkPolicy +
+# ResourceQuota scope to the sink and don't leak into the Tekton
+# control-plane namespace. Same convention build-grype-db,
+# tekton-chains, and zgw-posix use.
+#
+# Labels:
+#   app.kubernetes.io/name=cloudevents-sink  — what's in here
+#   app.kubernetes.io/part-of=ceph-tekton    — which stack it belongs to
+#
+# The kyverno ClusterPolicies + the observability stack both select
+# namespaces by `app.kubernetes.io/part-of=ceph-tekton`, so this label
+# is what enrolls the namespace in those cluster-wide flows.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cloudevents-sink
+  labels:
+    app.kubernetes.io/name: cloudevents-sink
+    app.kubernetes.io/part-of: ceph-tekton

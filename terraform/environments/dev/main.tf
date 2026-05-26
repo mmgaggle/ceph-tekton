@@ -61,15 +61,20 @@ module "artifacts" {
   branch_bucket_name   = "${var.bucket_prefix}ceph-artifacts-branch"
   release_bucket_name  = "${var.bucket_prefix}ceph-artifacts-release"
   grype_db_bucket_name = "${var.bucket_prefix}ceph-grype-db"
+  events_bucket_name   = "${var.bucket_prefix}ceph-tekton-events"
 
   # Dev defaults: force_destroy true so `terraform destroy` works
   # cleanly for an ephemeral environment. The release-bucket
   # object-lock years value is moot here — object-lock isn't
   # configured at all when enable_versioning = false (see below) —
   # but we set it to 1 so the variable still has a legal value.
-  dev_expiration_days       = 30
-  branch_expiration_days    = 180
-  grype_db_expiration_days  = 30
+  dev_expiration_days      = 30
+  branch_expiration_days   = 180
+  grype_db_expiration_days = 30
+  # 0 = never expire. Mirrors the Sepia posture; events_expiration is
+  # a moot value here anyway because enable_lifecycle = false below
+  # (zgw-posix can't service lifecycle calls).
+  events_expiration_days    = 0
   release_object_lock_mode  = "GOVERNANCE"
   release_object_lock_years = 1
 

@@ -36,13 +36,19 @@ module "artifacts" {
   branch_bucket_name   = "ceph-artifacts-branch"
   release_bucket_name  = "ceph-artifacts-release"
   grype_db_bucket_name = "ceph-grype-db"
+  events_bucket_name   = "ceph-tekton-events"
 
   dev_expiration_days                       = 30
   branch_expiration_days                    = 180
   branch_noncurrent_version_expiration_days = 7
   grype_db_expiration_days                  = 30
-  release_object_lock_mode                  = "GOVERNANCE"
-  release_object_lock_years                 = 7
+  # 0 = never expire. Long-window trend queries (build success rate by
+  # branch over the release cycle, queue-time trend across the year)
+  # want as much history as we can afford. Override here if Sepia
+  # storage budget tightens.
+  events_expiration_days    = 0
+  release_object_lock_mode  = "GOVERNANCE"
+  release_object_lock_years = 7
 
   # NEVER true in Sepia — release bucket holds signed artifacts with
   # multi-year retention; dev/branch buckets hold things the broader
