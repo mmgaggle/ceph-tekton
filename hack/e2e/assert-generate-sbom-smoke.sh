@@ -52,11 +52,15 @@ require_cmd syft    "brew install syft"
 kube_ctx apply -f "${E2E_REPO_ROOT}/tasks/generate-sbom/task.yaml" >/dev/null
 kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/sbom-pkg-smoke-test.yaml" >/dev/null
 
-# Use a NAMED PVC for the sboms workspace so we can re-mount it in a
-# follow-up debug Pod and read the SBOM bytes out. The artifacts
-# workspace can stay an emptyDir — it's only consumed within the
-# PipelineRun and we don't need its bytes after the fact.
+# Use NAMED PVCs for both workspaces. `sboms` so we can re-mount it in
+# a follow-up debug Pod and read the SBOM bytes out; `artifacts`
+# because Tekton gives each TaskRun pod its own emptyDir, so an
+# emptyDir-bound shared workspace doesn't actually share between
+# Tasks — the seed Task's .tar files vanish before generate-sbom can
+# see them. A PVC (or volumeClaimTemplate) is required for any
+# workspace that needs to flow data between TaskRuns.
 PVC_NAME="e2e-sbom-pvc-$(date +%s)"
+ARTIFACTS_PVC_NAME="e2e-sbom-artifacts-pvc-$(date +%s)"
 kube_ctx -n "${NS}" apply -f - <<EOF >/dev/null
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -67,15 +71,26 @@ spec:
   resources:
     requests:
       storage: 100Mi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${ARTIFACTS_PVC_NAME}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 100Mi
 EOF
 cleanup_pvc() {
   kube_ctx -n "${NS}" delete pvc "${PVC_NAME}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  kube_ctx -n "${NS}" delete pvc "${ARTIFACTS_PVC_NAME}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   kube_ctx -n "${NS}" delete pod  "exfil-${PVC_NAME}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 }
 trap cleanup_pvc EXIT
 
 PR="$(start_pipelinerun "${NS}" sbom-pkg-smoke-test \
-        --workspace=name=artifacts,emptyDir="" \
+        --workspace=name=artifacts,claimName="${ARTIFACTS_PVC_NAME}" \
         --workspace=name=sboms,claimName="${PVC_NAME}")"
 log::info "started PipelineRun: ${NS}/${PR}"
 
