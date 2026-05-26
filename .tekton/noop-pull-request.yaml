@@ -8,13 +8,12 @@
 # target namespace, and posted a GitHub Check back on the PR.
 #
 # How PaC consumes this file:
-#   * In phase 1 this template lives in ceph-tekton/pipelines/. PaC is
-#     pointed at it via the "Remote Resolution" pattern from the test
-#     repo's .tekton/ directory (the test repo only needs a tiny stub
-#     referencing this file by URL). The walkthrough is in
-#     docs/pipelines-as-code.md.
-#   * In phase 2 this file moves to ceph/ceph/.tekton/ unchanged, so CI
-#     edits flow through code review with the code that needs them
+#   * Phase 1 (this repo): lives in `.tekton/` at the repo root. PaC
+#     discovers it natively — every PR matching the annotations below
+#     instantiates a PipelineRun in the namespace named by the
+#     `Repository` CR for this repo (today: `ceph-tekton-ci`).
+#   * Phase 2: a sibling moves to `ceph/ceph/.tekton/` so ceph PRs
+#     themselves carry the CI definition next to the code they gate
 #     (PLAN.md "Open / phase-2 items").
 #
 # Annotations:
