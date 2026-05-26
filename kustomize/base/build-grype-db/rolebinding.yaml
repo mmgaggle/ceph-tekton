@@ -1,0 +1,22 @@
+# Binds the `build-grype-db-cron` Role to the `build-grype-db-cron`
+# ServiceAccount in the `build-grype-db` namespace. Same name on both
+# sides is intentional — RoleBinding is the only thing tying them
+# together, so when an operator greps for `build-grype-db-cron` the
+# three objects (SA, Role, RoleBinding) line up by name in the output.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: build-grype-db-cron
+  namespace: build-grype-db
+  labels:
+    app.kubernetes.io/name: build-grype-db
+    app.kubernetes.io/component: cron-submitter
+    app.kubernetes.io/part-of: ceph-tekton
+subjects:
+  - kind: ServiceAccount
+    name: build-grype-db-cron
+    namespace: build-grype-db
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: build-grype-db-cron

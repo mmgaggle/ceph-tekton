@@ -1,0 +1,32 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# sepia overlay — Sepia OpenShift target.
+#
+# Distinguishing posture vs dev-{local,kind}:
+#   - NO zgw-posix base. Sepia colocates real Ceph RGW with the
+#     OpenShift cluster; Pipelines reach S3 via the real endpoint, not
+#     the dev approximation. Wiring zgw-posix here would just produce
+#     dead manifests + confuse operators reading the namespace list.
+#   - Tekton bundle: this overlay's eventual posture is the OpenShift
+#     Pipelines operator (which manages Tekton + PaC + Chains as a
+#     supported bundle). For phase-1 alignment with the dev overlays
+#     we currently still pull the same `kustomize/base/tekton-pipelines/`
+#     manifest — that line is expected to be replaced by an
+#     openshift-pipelines Subscription/Operator stanza in a follow-up
+#     PR (tracked in PLAN.md "Bootstrap & cluster install"). Leave
+#     the line in place for now so this overlay renders successfully
+#     in `make kustomize-validate`.
+#   - build-grype-db RBAC is identical to the dev path. The PipelineRun
+#     EXECUTOR SA (cosign-signing-key + S3 STS via projected SA token)
+#     is a separate Sepia-only object that lives in its own follow-up;
+#     see kustomize/base/build-grype-db/serviceaccount.yaml's comment.
+#   - chains-config overrides (fulcio/keyless, OCI artifact storage,
+#     OIDC issuer URL) ALSO land here in a follow-up — same overlay,
+#     separate PR — per kustomize/base/tekton-chains/chains-config.patch.yaml.
+#
+# Resource ordering: Tekton first so its CRDs land before the
+# build-grype-db Role names them.
+resources:
+  - ../../base/tekton-pipelines
+  - ../../base/build-grype-db

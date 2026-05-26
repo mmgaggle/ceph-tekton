@@ -1,0 +1,41 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# build-grype-db — RBAC for the cron submitter.
+#
+# Scope of THIS base (issue #61): the in-cluster identity the
+# `build-grype-db-cron` CronJob (pipelines/build-grype-db.yaml) runs
+# under. That CronJob's pod does one thing — `kubectl create -f -` of
+# a PipelineRun manifest in its own namespace. It does NOT need the
+# rights to mount workspaces, write to S3, or sign attestations; those
+# rights live on the SEPARATE ServiceAccount the PipelineRun ITSELF
+# executes under (configured in the broader Sepia overlay).
+#
+# Keep the Role narrow. The cron submitter:
+#   - creates PipelineRuns (the submit itself)
+#   - reads PipelineRuns it just created (get/list/watch, for the
+#     occasional debug attach and to let kubectl's --wait paths work
+#     if we ever wire them in)
+#   - reads the Pipeline definition it is submitting against
+# That's the whole list. No Secret access, no PVC creation, nothing
+# else. Widening this Role widens the blast radius if a malicious
+# PipelineRun manifest escapes review and lands in the cron pod.
+#
+# WHY a separate namespace (build-grype-db) rather than colocating
+# in tekton-pipelines: the Pipeline + CronJob live in their own
+# namespace so per-job RBAC + NetworkPolicy + ResourceQuota stay
+# scoped to the producer pipeline and don't leak into the Tekton
+# control-plane namespace. Same convention tekton-chains uses
+# (its own namespace, its own SA, its own Role).
+#
+# WHY kustomize at the base level (rather than helm or terraform):
+# this is four small YAMLs with no parametrization — kustomize is the
+# right tool. Helm would add a values.yaml + template dance for zero
+# net flexibility.
+namespace: build-grype-db
+
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - role.yaml
+  - rolebinding.yaml

@@ -1,0 +1,21 @@
+# Namespace for the build-grype-db producer Pipeline + its cron
+# submitter. The Pipeline (`build-grype-db`), CronJob
+# (`build-grype-db-cron`), and PipelineRuns the cron spawns all land
+# here. Keeping them in their own namespace makes RBAC, NetworkPolicy,
+# and ResourceQuota straightforward to scope without pulling in
+# unrelated Tekton control-plane objects.
+#
+# Labels:
+#   app.kubernetes.io/name=build-grype-db   — what's in here
+#   app.kubernetes.io/part-of=ceph-tekton   — which stack it belongs to
+#
+# The kyverno ClusterPolicies + the observability stack both select
+# namespaces by `app.kubernetes.io/part-of=ceph-tekton`, so this label
+# is what enrolls the namespace in those cluster-wide flows.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: build-grype-db
+  labels:
+    app.kubernetes.io/name: build-grype-db
+    app.kubernetes.io/part-of: ceph-tekton

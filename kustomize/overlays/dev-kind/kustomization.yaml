@@ -1,0 +1,34 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# dev-kind overlay — placeholder for a future kind-specific posture
+# distinct from dev-local.
+#
+# Today this overlay renders the same resources as dev-local: Tekton
+# Pipelines + the in-cluster zgw-posix S3 endpoint + the build-grype-db
+# RBAC. The two overlays exist as separate paths because the PLAN.md /
+# README.md / architecture.md docs all reference them as distinct
+# targets, and because dev-kind is expected to grow kind-specific
+# patches (NodePort exposure for the PaC controller, image-pull
+# pre-load for the kind nodes, looser pod security so the bitnami/
+# kubectl cron pod runs unprivileged on the kind default PSA profile)
+# that don't apply to a plain `kubectl --context kind-...`-driven
+# dev-local flow.
+#
+# WHY ship the overlay now (rather than wait for the first kind-only
+# patch): so issue #61's acceptance criterion "all three overlays
+# include the new base" lands materially. An empty/missing overlay
+# would be a worse signal than this near-identical one — the directory
+# being present + rendering tells the next contributor the slot
+# exists and is expected to diverge from dev-local over time.
+#
+# Resource ordering: Tekton goes first so the tekton-pipelines
+# namespace + CRDs apply before anything that references the
+# tekton.dev API group (the build-grype-db Role names pipelineruns /
+# pipelines in its verbs list — a Role pointing at a not-yet-installed
+# CRD is permitted by the apiserver but is a confusing signal). zgw-posix
+# is dev-only and applies after Tekton settles in.
+resources:
+  - ../../base/tekton-pipelines
+  - ../../base/zgw-posix
+  - ../../base/build-grype-db
