@@ -10,6 +10,7 @@ resource "aws_s3_bucket" "dev" {
 }
 
 resource "aws_s3_bucket_lifecycle_configuration" "dev" {
+  count  = var.enable_lifecycle ? 1 : 0
   bucket = aws_s3_bucket.dev.id
 
   rule {
@@ -55,6 +56,7 @@ resource "aws_s3_bucket_versioning" "branch" {
 }
 
 resource "aws_s3_bucket_lifecycle_configuration" "branch" {
+  count  = var.enable_lifecycle ? 1 : 0
   bucket = aws_s3_bucket.branch.id
 
   # Time ceiling for current versions.
@@ -141,6 +143,7 @@ resource "aws_s3_bucket_object_lock_configuration" "release" {
 # which makes operational reasoning harder. We only sweep aborted
 # multipart uploads.
 resource "aws_s3_bucket_lifecycle_configuration" "release" {
+  count  = var.enable_lifecycle ? 1 : 0
   bucket = aws_s3_bucket.release.id
 
   rule {

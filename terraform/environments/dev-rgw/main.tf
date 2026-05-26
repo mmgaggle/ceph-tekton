@@ -60,6 +60,14 @@ module "artifacts" {
   enable_public_access_block       = true
   enable_bucket_ownership_controls = true
 
+  # Lifecycle is intentionally OFF for dev-rgw until RGW's
+  # GetBucketLifecycleConfiguration handler stops downgrading the V2
+  # `<Filter></Filter>` shape to legacy V1 `<Prefix></Prefix>`. The AWS
+  # provider 5.x can't converge its post-PUT consistency wait against
+  # the downgraded GET. See notes/rgw-lifecycle-empty-filter-v1-downgrade.md
+  # for the reproducer; flip back to true once RGW is fixed.
+  enable_lifecycle = false
+
   # Mirror semantics: validate that public bucket policies actually
   # let anonymous curl through. The Sepia env has the same flags.
   dev_public_read     = true

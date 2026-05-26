@@ -5,10 +5,18 @@ account**. Sits between the `dev` env (MinIO, no RGW-specific behavior)
 and the `sepia` env (production stub, intentionally not applied).
 
 Use this when you have a test user on a real Ceph cluster and want to
-verify the bits MinIO can't: lifecycle scanner actually deletes
-expired objects, object-lock retention across the real chain, public
-bucket policies served by the gateway, public-access-block /
+verify the bits MinIO can't: object-lock retention across the real
+chain, public bucket policies served by the gateway, public-access-block /
 bucket-ownership-controls (Squid+ only).
+
+> **Lifecycle currently disabled.** This env sets `enable_lifecycle =
+> false` until an upstream RGW bug is fixed. The bug: RGW's
+> `GetBucketLifecycleConfiguration` handler downgrades a V2
+> `<Filter></Filter>` PUT to legacy V1 `<Prefix></Prefix>` on GET, which
+> prevents the AWS terraform provider 5.x from converging its post-PUT
+> consistency wait. Reproducer in
+> [`notes/rgw-lifecycle-empty-filter-v1-downgrade.md`](../../../notes/rgw-lifecycle-empty-filter-v1-downgrade.md);
+> re-enable tracked by [issue #57](https://github.com/mmgaggle/ceph-tekton/issues/57).
 
 ## Why not MinIO
 

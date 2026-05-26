@@ -156,6 +156,32 @@ variable "enable_public_access_block" {
   default     = false
 }
 
+variable "enable_lifecycle" {
+  description = <<-EOT
+    Manage `aws_s3_bucket_lifecycle_configuration` on the dev / branch /
+    release buckets. Default true.
+
+    Set to false on environments where the AWS provider's post-PUT
+    consistency wait can't converge — currently the `dev-rgw` env, due
+    to an RGW lifecycle GET handler bug that downgrades the V2
+    `<Filter></Filter>` shape (which the AWS provider PUTs) to legacy
+    V1 `<Prefix></Prefix>` on GET. The provider does a structural diff
+    between PUT and GET until they match, times out at 3m, and tears
+    the resource out of state. See
+    `notes/rgw-lifecycle-empty-filter-v1-downgrade.md` for the
+    reproducer and tracking.
+
+    When this flag is false the buckets are still created — only the
+    expiry / noncurrent-version-cleanup / mpu-abort rules are skipped.
+    The publish-repo keep-N pruner still works (it's a Tekton task,
+    not a bucket-side rule).
+
+    Tracked by ceph-tekton issue #57.
+  EOT
+  type        = bool
+  default     = true
+}
+
 # ---------------------------------------------------------------------------
 # Public-mirror semantics
 #
