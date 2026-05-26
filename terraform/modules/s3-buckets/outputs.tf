@@ -13,12 +13,18 @@ output "release_bucket" {
   value       = aws_s3_bucket.release.id
 }
 
+output "grype_db_bucket" {
+  description = "Name of the self-hosted Grype vulnerability DB bucket (issue #56)."
+  value       = aws_s3_bucket.grype_db.id
+}
+
 output "buckets" {
-  description = "All three bucket names keyed by lifecycle class."
+  description = "All four bucket names keyed by content class."
   value = {
-    dev     = aws_s3_bucket.dev.id
-    branch  = aws_s3_bucket.branch.id
-    release = aws_s3_bucket.release.id
+    dev      = aws_s3_bucket.dev.id
+    branch   = aws_s3_bucket.branch.id
+    release  = aws_s3_bucket.release.id
+    grype_db = aws_s3_bucket.grype_db.id
   }
 }
 

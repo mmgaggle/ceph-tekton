@@ -29,9 +29,10 @@ provider "aws" {
 module "artifacts" {
   source = "../../modules/s3-buckets"
 
-  dev_bucket_name     = "${var.bucket_prefix}ceph-artifacts-dev"
-  branch_bucket_name  = "${var.bucket_prefix}ceph-artifacts-branch"
-  release_bucket_name = "${var.bucket_prefix}ceph-artifacts-release"
+  dev_bucket_name      = "${var.bucket_prefix}ceph-artifacts-dev"
+  branch_bucket_name   = "${var.bucket_prefix}ceph-artifacts-branch"
+  release_bucket_name  = "${var.bucket_prefix}ceph-artifacts-release"
+  grype_db_bucket_name = "${var.bucket_prefix}ceph-grype-db"
 
   # Dev defaults: short retention so the local MinIO doesn't keep
   # growing; force_destroy true so `terraform destroy` works for an
@@ -39,6 +40,7 @@ module "artifacts" {
   # legal object-lock retention (1y) — MinIO refuses 0.
   dev_expiration_days       = 30
   branch_expiration_days    = 180
+  grype_db_expiration_days  = 30
   release_object_lock_mode  = "GOVERNANCE"
   release_object_lock_years = 1
 
@@ -52,9 +54,10 @@ module "artifacts" {
   # anonymous curl against MinIO works once the public bucket policy
   # lands. MinIO supports public bucket policies natively — no
   # public-access-block plumbing needed.
-  dev_public_read     = true
-  branch_public_read  = true
-  release_public_read = true
+  dev_public_read      = true
+  branch_public_read   = true
+  release_public_read  = true
+  grype_db_public_read = true
 
   tags = {
     project = "ceph-tekton"

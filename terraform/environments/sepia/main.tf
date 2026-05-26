@@ -32,13 +32,15 @@ provider "aws" {
 module "artifacts" {
   source = "../../modules/s3-buckets"
 
-  dev_bucket_name     = "ceph-artifacts-dev"
-  branch_bucket_name  = "ceph-artifacts-branch"
-  release_bucket_name = "ceph-artifacts-release"
+  dev_bucket_name      = "ceph-artifacts-dev"
+  branch_bucket_name   = "ceph-artifacts-branch"
+  release_bucket_name  = "ceph-artifacts-release"
+  grype_db_bucket_name = "ceph-grype-db"
 
   dev_expiration_days                       = 30
   branch_expiration_days                    = 180
   branch_noncurrent_version_expiration_days = 7
+  grype_db_expiration_days                  = 30
   release_object_lock_mode                  = "GOVERNANCE"
   release_object_lock_years                 = 7
 
@@ -53,13 +55,16 @@ module "artifacts" {
   enable_public_access_block       = true
   enable_bucket_ownership_controls = true
 
-  # All three buckets are public-readable. Ceph users + teuthology fetch
-  # via plain HTTP from `artifacts.ceph.com/<bucket>/...`. Authenticated
-  # writes still gate on the STS roles (#7, #8). Object-lock on the
-  # release bucket is orthogonal — read open, write/delete restricted.
-  dev_public_read     = true
-  branch_public_read  = true
-  release_public_read = true
+  # All four buckets are public-readable. Ceph users + teuthology fetch
+  # via plain HTTP from `artifacts.ceph.com/<bucket>/...`; the grype-db
+  # bucket is consumed by every vuln-scan TaskRun across all clusters.
+  # Authenticated writes still gate on the STS roles (#7, #8).
+  # Object-lock on the release bucket is orthogonal — read open,
+  # write/delete restricted.
+  dev_public_read      = true
+  branch_public_read   = true
+  release_public_read  = true
+  grype_db_public_read = true
 
   # Default `["*"]` exposes the entire bucket. Override here to keep
   # any internal `staging/` prefix private during publish-repo atomic

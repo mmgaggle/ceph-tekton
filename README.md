@@ -61,18 +61,21 @@ Rekor + cosign foundation without disturbing the phase-1 surface.
 
 ## Artifact lifecycle and retention
 
-Built artifacts live in three RGW S3 buckets, each with policy tuned to
+Built artifacts live in four RGW S3 buckets, each with policy tuned to
 its consumer's needs and to the compliance properties named above. The
 buckets are terraform-managed (see [`terraform/modules/s3-buckets/`](terraform/modules/s3-buckets/));
-the choice of three buckets — rather than one bucket with prefix-scoped
+the choice of separate buckets — rather than one bucket with prefix-scoped
 lifecycle — is deliberate because **object-lock is a bucket-level S3
-property** and can't be tightened per prefix.
+property** and can't be tightened per prefix, and because the
+vulnerability-DB content has different retention + access semantics
+than build artifacts.
 
 | Bucket | Holds | Lifecycle | Object-lock | Public read |
 |---|---|---|---|---|
 | `ceph-artifacts-dev` | `wip-*` branch builds, fork-PR builds | 30-day object expiry | none | yes (mirror) |
 | `ceph-artifacts-branch` | `main` + release-branch builds | keep latest 20 per `(branch, distro, arch)` + 180-day hard ceiling | none, versioning enabled | yes (mirror) |
 | `ceph-artifacts-release` | tag builds (`vX.Y.Z`) | none — kept indefinitely under object-lock | **GOVERNANCE, 7-year retention** | yes (mirror) |
+| `ceph-grype-db` | self-hosted Grype vulnerability DB snapshots ([#56](https://github.com/mmgaggle/ceph-tekton/issues/56)) | 30-day expiry (≈ keep last 30 dailies) | none, no versioning | yes (consumers fetch by curl) |
 
 ### Why each tier looks the way it does
 
@@ -100,9 +103,19 @@ shipped on day X" property compliance frameworks ask for. **Reads stay
 public** so consumers can still `dnf install ceph-X.Y.Z` years later;
 **writes are immutable**.
 
+**Grype-DB bucket — supply-chain tooling, separate from build outputs.**
+The vuln-scan Task fetches a self-hosted Grype DB snapshot ([#56](https://github.com/mmgaggle/ceph-tekton/issues/56))
+on every run, so the producer (`build-grype-db` Pipeline) and the
+consumer (`vuln-scan` Task) need their own S3 path independent of
+build artifacts. No versioning (each dated path is a fresh object),
+no object-lock (DB snapshots are tooling, not releases), 30-day
+keep-N retention. Public read, same posture as anchore.io's published
+DB — supply-chain integrity is enforced by cosign-verifying the
+tarball against our public key, not by ACL.
+
 ### Mirror semantics
 
-All three buckets grant `s3:GetObject` (and `s3:GetObjectVersion`) to
+All four buckets grant `s3:GetObject` (and `s3:GetObjectVersion`) to
 `Principal: "*"` via bucket policy — no anonymous listing, just object
 fetches by key. This is exactly what `download.ceph.com` /
 `chacra.ceph.com` do today. The URL convention is the discovery
@@ -163,6 +176,7 @@ flowchart LR
     DEV[("ceph-artifacts-dev<br/>30d expiry")]
     BRANCH[("ceph-artifacts-branch<br/>keep-20 + 180d")]
     REL[("ceph-artifacts-release<br/>object-lock 7y")]
+    GRYPEDB[("ceph-grype-db<br/>keep last 30 dailies<br/>signed via cosign")]
   end
 
   subgraph Sigstore["Sigstore public-good"]

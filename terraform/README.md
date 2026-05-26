@@ -12,7 +12,7 @@ App (#?), and Vault transit-engine config (#?).
 ```
 terraform/
 ├── modules/
-│   └── s3-buckets/        # 3 buckets: dev, branch, release
+│   └── s3-buckets/        # 4 buckets: dev, branch, release, grype-db
 └── environments/
     ├── dev/               # MinIO target, local backend (full local cycle)
     ├── dev-rgw/           # Real RGW test-user target, local backend (high-fidelity local cycle)

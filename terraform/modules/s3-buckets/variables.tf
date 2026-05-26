@@ -86,6 +86,46 @@ variable "release_object_lock_mode" {
   }
 }
 
+variable "grype_db_bucket_name" {
+  description = <<-EOT
+    Bucket for the self-hosted Grype vulnerability database tarballs
+    (see ceph-tekton issue #56). The producer Pipeline publishes
+    one dated snapshot per build under
+    `grype-db/<schema-version>/<date>/vulnerability.db.tar.zst`
+    plus a `latest.json` pointer at
+    `grype-db/<schema-version>/latest.json`.
+
+    Distinct from the build-artifact buckets:
+      - No versioning (each dated path is a fresh object).
+      - No object-lock (DB snapshots are tooling, not release
+        artifacts).
+      - Short keep-N retention via lifecycle expiry.
+      - Public read so the vuln-scan Task can fetch the DB via curl
+        without authentication, same way clients fetch packages from
+        the branch bucket.
+  EOT
+  type        = string
+  default     = "ceph-grype-db"
+}
+
+variable "grype_db_expiration_days" {
+  description = <<-EOT
+    Days until grype-db snapshots in the grype-db bucket expire.
+    Approximates "keep last N daily builds" on a daily producer
+    cadence: 30 days ≈ last 30 dailies. The `latest.json` pointer is
+    excluded from expiry implicitly because the producer rewrites it
+    each run (S3 lifecycle compares against last-modified, not
+    last-PUT-by-this-producer).
+  EOT
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.grype_db_expiration_days > 0 && var.grype_db_expiration_days <= 365
+    error_message = "grype_db_expiration_days must be in (0, 365]."
+  }
+}
+
 variable "release_object_lock_years" {
   description = <<-EOT
     Default retention period applied to every object PUT into the
@@ -211,6 +251,19 @@ variable "release_public_read" {
   description = "Allow anonymous GetObject on the release bucket (mirror semantics)."
   type        = bool
   default     = false
+}
+
+variable "grype_db_public_read" {
+  description = <<-EOT
+    Allow anonymous GetObject on the grype-db bucket. Default true:
+    vuln-scan Tasks running in clusters that can't authenticate to
+    this RGW account still need to fetch the DB tarball, and the DB
+    itself is supply-chain *tooling* (signed via cosign), not
+    sensitive content. anchore.io's published DB has the same
+    posture.
+  EOT
+  type        = bool
+  default     = true
 }
 
 variable "public_read_prefixes" {

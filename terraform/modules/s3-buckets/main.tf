@@ -161,14 +161,53 @@ resource "aws_s3_bucket_lifecycle_configuration" "release" {
 }
 
 # ===========================================================================
+# ceph-grype-db
+#   Self-hosted Grype vulnerability database snapshots (issue #56).
+#   Producer Pipeline publishes one tarball + cosign bundle per build
+#   under grype-db/<schema>/<date>/...; vuln-scan Tasks fetch +
+#   cosign-verify before scanning. Different content class from the
+#   three build-artifact buckets above:
+#     - no versioning (each date is a fresh prefix)
+#     - no object-lock (DB snapshots are tooling, not releases)
+#     - short retention (keep last N dailies via lifecycle expiry)
+# ===========================================================================
+
+resource "aws_s3_bucket" "grype_db" {
+  bucket        = var.grype_db_bucket_name
+  force_destroy = var.force_destroy
+  tags          = var.tags
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "grype_db" {
+  count  = var.enable_lifecycle ? 1 : 0
+  bucket = aws_s3_bucket.grype_db.id
+
+  rule {
+    id     = "expire-old-snapshots"
+    status = "Enabled"
+
+    filter {}
+
+    expiration {
+      days = var.grype_db_expiration_days
+    }
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 1
+    }
+  }
+}
+
+# ===========================================================================
 # AWS-only hardening (toggled off by default for MinIO compatibility)
 # ===========================================================================
 
 locals {
   bucket_ids = {
-    dev     = aws_s3_bucket.dev.id
-    branch  = aws_s3_bucket.branch.id
-    release = aws_s3_bucket.release.id
+    dev      = aws_s3_bucket.dev.id
+    branch   = aws_s3_bucket.branch.id
+    release  = aws_s3_bucket.release.id
+    grype_db = aws_s3_bucket.grype_db.id
   }
 }
 
@@ -215,9 +254,10 @@ resource "aws_s3_bucket_public_access_block" "this" {
 
 locals {
   bucket_public_read = {
-    dev     = var.dev_public_read
-    branch  = var.branch_public_read
-    release = var.release_public_read
+    dev      = var.dev_public_read
+    branch   = var.branch_public_read
+    release  = var.release_public_read
+    grype_db = var.grype_db_public_read
   }
   buckets_with_public_read = {
     for k, v in local.bucket_public_read : k => local.bucket_ids[k] if v

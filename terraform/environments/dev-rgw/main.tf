@@ -37,15 +37,17 @@ module "artifacts" {
   source = "../../modules/s3-buckets"
 
   # bucket_prefix namespaces every bucket so devs don't collide.
-  dev_bucket_name     = "${var.bucket_prefix}ceph-artifacts-dev"
-  branch_bucket_name  = "${var.bucket_prefix}ceph-artifacts-branch"
-  release_bucket_name = "${var.bucket_prefix}ceph-artifacts-release"
+  dev_bucket_name      = "${var.bucket_prefix}ceph-artifacts-dev"
+  branch_bucket_name   = "${var.bucket_prefix}ceph-artifacts-branch"
+  release_bucket_name  = "${var.bucket_prefix}ceph-artifacts-release"
+  grype_db_bucket_name = "${var.bucket_prefix}ceph-grype-db"
 
   # Short retention windows make test cycles cheap. The release bucket
   # keeps the minimum legal object-lock retention (1y on RGW; bumpable
   # via the variable for longer-window testing).
   dev_expiration_days       = 30
   branch_expiration_days    = 180
+  grype_db_expiration_days  = 30
   release_object_lock_mode  = "GOVERNANCE"
   release_object_lock_years = var.release_object_lock_years
 
@@ -70,9 +72,10 @@ module "artifacts" {
 
   # Mirror semantics: validate that public bucket policies actually
   # let anonymous curl through. The Sepia env has the same flags.
-  dev_public_read     = true
-  branch_public_read  = true
-  release_public_read = true
+  dev_public_read      = true
+  branch_public_read   = true
+  release_public_read  = true
+  grype_db_public_read = true
 
   tags = {
     project = "ceph-tekton"

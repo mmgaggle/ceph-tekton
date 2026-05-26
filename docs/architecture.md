@@ -35,6 +35,7 @@ flowchart LR
     DEV[("ceph-artifacts-dev<br/>30d expiry")]
     BRANCH[("ceph-artifacts-branch<br/>keep-20 + 180d")]
     REL[("ceph-artifacts-release<br/>object-lock 7y")]
+    GRYPEDB[("ceph-grype-db<br/>keep last 30 dailies")]
   end
 
   subgraph Sigstore["Sigstore public-good"]
@@ -251,6 +252,7 @@ flowchart TB
     DEV[ceph-artifacts-dev<br/>wip-* branches<br/>30d expiry<br/>no object-lock]
     BR[ceph-artifacts-branch<br/>main + release branches<br/>keep latest 20 + 180d ceiling]
     REL[ceph-artifacts-release<br/>tags<br/>object-lock governance<br/>7-year retention]
+    GRYPEDB[ceph-grype-db<br/>self-hosted Grype DB snapshots<br/>30d expiry · cosign-signed]
   end
 
   subgraph URL["URL convention"]
@@ -261,8 +263,10 @@ flowchart TB
   S3 --> URL
 ```
 
-Three buckets divide artifacts by lifecycle class so that wip-branch
-churn never threatens the release archive:
+Four buckets divide artifacts by content class so that wip-branch
+churn never threatens the release archive, and so that the
+vulnerability-DB tooling has its own retention and access semantics
+independent of build outputs:
 
 - **`ceph-artifacts-dev`** — wip-* branches, 30-day expiry, no
   object-lock.
@@ -270,12 +274,23 @@ churn never threatens the release archive:
   latest 20 per `(branch, distro, arch)` with a 180-day ceiling.
 - **`ceph-artifacts-release`** — tags, **object-lock governance mode**,
   7-year retention.
+- **`ceph-grype-db`** — self-hosted Grype vulnerability DB snapshots
+  ([#56](https://github.com/mmgaggle/ceph-tekton/issues/56)). One
+  dated tarball per build under
+  `grype-db/<schema-version>/<date>/vulnerability.db.tar.zst` with a
+  cosign bundle alongside; `latest.json` is rewritten atomically per
+  build. No versioning, no object-lock, 30-day expiry ≈ "keep last
+  30 dailies". The vuln-scan Task fetches + cosign-verifies before
+  every scan.
 
 URLs follow
-`https://artifacts.ceph.com/<bucket>/<branch>/<sha>/<distro>/<arch>/`,
-and each successful build atomically updates
-`<branch>/latest/manifest.json` with the new sha, timestamp, and a
-pointer to its provenance attestation.
+`https://artifacts.ceph.com/<bucket>/<branch>/<sha>/<distro>/<arch>/`
+for build artifacts, and
+`https://artifacts.ceph.com/ceph-grype-db/grype-db/<schema>/<date>/`
+for vulnerability-DB snapshots. Each successful build atomically
+updates `<branch>/latest/manifest.json` for build outputs and
+`grype-db/<schema>/latest.json` for DB snapshots, with the new sha,
+timestamp, and a pointer to its provenance attestation.
 
 ---
 
@@ -295,7 +310,7 @@ flowchart TB
   end
 
   subgraph OUT["Out-of-cluster (terraform-managed)"]
-    S3[3 × S3 buckets<br/>lifecycle + object-lock]
+    S3[4 × S3 buckets<br/>lifecycle + object-lock<br/>+ grype-db]
     OIDC[RGW OIDC trust<br/>+ roles + policies]
     APP[GitHub App<br/>+ webhook]
   end
@@ -327,9 +342,10 @@ Three concentric rings of ownership:
   Chains, Vault (with transit engine), Loki/Promtail and
   Prometheus/Grafana for observability, an in-cluster registry for
   builder images, and the `ceph-builds-api` shim.
-- **Out-of-cluster**, terraform-managed: the three S3 buckets and their
-  lifecycle/object-lock policies, the RGW OIDC trust + roles +
-  policies, and the GitHub App and its webhook.
+- **Out-of-cluster**, terraform-managed: the four S3 buckets
+  (artifacts-dev / artifacts-branch / artifacts-release / grype-db)
+  and their lifecycle/object-lock policies, the RGW OIDC trust +
+  roles + policies, and the GitHub App and its webhook.
 - **External public infra** consumed as-a-service: GitHub, quay.io,
   Fulcio, Rekor.
 
@@ -403,18 +419,26 @@ rewriting the old one.
   Sepia access. A portable base is the cheapest insurance against
   lock-in if the platform choice ever changes.
 
-### Artifact storage: S3 on Sepia Ceph RGW with three lifecycle-tiered buckets
+### Artifact storage: S3 on Sepia Ceph RGW with four lifecycle-tiered buckets
 
-- **Decision:** Three terraform-managed RGW S3 buckets —
+- **Decision:** Four terraform-managed RGW S3 buckets —
   `ceph-artifacts-dev` (30d), `ceph-artifacts-branch` (keep-20 + 180d),
-  `ceph-artifacts-release` (object-lock, 7y).
+  `ceph-artifacts-release` (object-lock, 7y), and `ceph-grype-db`
+  (keep last 30 dailies, cosign-signed) for the self-hosted Grype
+  vulnerability database ([#56](https://github.com/mmgaggle/ceph-tekton/issues/56)).
 - **Rejected alternatives:** One bucket with prefix-based lifecycle; a
   filesystem-backed artifact store (chacra-style); cloud object
-  storage outside Sepia.
+  storage outside Sepia; piggybacking the Grype DB onto
+  `ceph-artifacts-branch` under a `grype-db/` prefix.
 - **Reason:** Per-bucket lifecycle and object-lock policies are simpler
   to reason about and audit than per-prefix rules. Eating our own
   dogfood (RGW) keeps the artifact path inside Sepia. Object-lock on
-  releases is non-negotiable for supply-chain integrity.
+  releases is non-negotiable for supply-chain integrity. The Grype DB
+  is a fourth content class — supply-chain tooling, not build output
+  — with its own retention story (short keep-N) and access pattern
+  (every vuln-scan TaskRun fetches it). Splitting it from
+  `ceph-artifacts-branch` keeps the blast radius of misconfiguration
+  contained.
 
 ### S3 credentials: STS OIDC via SA-token (no long-lived keys)
 
