@@ -54,12 +54,12 @@ fi
 
 # Apply the setup (Namespace + RBAC), then the Task, then the Pipeline
 # (idempotent). Issue #68 split `pipelines/kyverno-smoke-test.yaml`
-# into single-resource files (RBAC at pipelines/setup/, Task at
-# pipelines/tasks/, Pipeline at pipelines/pipelines/) so PaC
-# remote-resolution works on the Task + Pipeline halves. The RBAC
-# stays multi-doc because Namespace/SA/Role/RoleBinding aren't
-# PaC-resolvable resources.
-kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/setup/kyverno-smoke-rbac.yaml" >/dev/null
+# into single-resource files (Task at pipelines/tasks/, Pipeline at
+# pipelines/pipelines/) so PaC remote-resolution works on the Task +
+# Pipeline halves. The RBAC stays multi-doc and lives outside
+# pipelines/ (under manifests/smoke-setup/) because Namespace/SA/Role/
+# RoleBinding aren't PaC-resolvable resources.
+kube_ctx apply -f "${E2E_REPO_ROOT}/manifests/smoke-setup/kyverno-smoke-rbac.yaml" >/dev/null
 kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/tasks/try-pod-admit.yaml"      >/dev/null
 kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/pipelines/kyverno-smoke-test.yaml" >/dev/null
 
