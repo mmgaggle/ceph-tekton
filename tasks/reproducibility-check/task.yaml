@@ -80,8 +80,9 @@ spec:
       type: string
       default: ""
       description: |
-        Optional S3 endpoint URL (for RGW or MinIO). Empty = AWS S3
-        default. Passed as `--endpoint-url`.
+        Optional S3 endpoint URL (for RGW or any S3-compatible
+        local backend). Empty = AWS S3 default. Passed as
+        `--endpoint-url`.
     - name: fail-on-diff
       type: string
       default: "false"

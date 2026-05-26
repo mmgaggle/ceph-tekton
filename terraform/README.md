@@ -14,7 +14,7 @@ terraform/
 ├── modules/
 │   └── s3-buckets/        # 4 buckets: dev, branch, release, grype-db
 └── environments/
-    ├── dev/               # MinIO target, local backend (full local cycle)
+    ├── dev/               # zgw-posix target, local backend (full local cycle)
     ├── dev-rgw/           # Real RGW test-user target, local backend (high-fidelity local cycle)
     └── sepia/             # Sepia RGW target, S3 backend (STUB — not applied)
 ```
@@ -24,7 +24,7 @@ terraform/
 See [`modules/s3-buckets/README.md`](modules/s3-buckets/README.md)
 for the design notes:
 
-- Why the AWS provider is pointed at MinIO and RGW (single resource
+- Why the AWS provider is pointed at every backend (single resource
   graph; backend differences become variables).
 - Why "keep latest N per (branch, distro, arch)" is enforced by the
   publish-repo task with a lifecycle safety net, not by lifecycle
@@ -36,7 +36,7 @@ for the design notes:
 
 | Env     | Backend | Why                                                                                   |
 | ------- | ------- | ------------------------------------------------------------------------------------- |
-| dev     | `local` | Ephemeral MinIO; developer can `terraform destroy` + `rm -rf` to start over.          |
+| dev     | `local` | Ephemeral zgw-posix; developer can `terraform destroy` + `rm -rf` to start over.      |
 | dev-rgw | `local` | Per-developer test scope; `bucket_prefix` variable namespaces resources so multiple devs share the same RGW without collisions. Backend stanza in `versions.tf` shows how to promote to shared state. |
 | sepia   | `s3`    | RGW-hosted `ceph-tekton-tfstate` bucket. Backend block in `versions.tf` is commented out until the bucket is bootstrapped — see `environments/sepia/README.md`. |
 
@@ -45,26 +45,39 @@ versioning enabled and no object-lock.
 
 ## Running the dev env
 
-The dev env spins up against a local MinIO. The one-shot way:
+The dev env spins up against a local `quay.io/dparkes/zgw-posix:latest`
+container — Ceph's RGW running against the experimental POSIX backend
+driver. The one-shot way:
 
 ```sh
 ./hack/verify-s3-module.sh
 ```
 
-That script (from the repo root) starts MinIO in docker/podman,
+That script (from the repo root) starts zgw-posix in docker/podman,
 runs `terraform init && apply` against `terraform/environments/dev/`,
-asserts the lifecycle and object-lock policies, exercises the
-object-lock retention with a write-then-delete test, and tears
+asserts the bucket-create + PUT/GET + public-read paths, and tears
 everything down. Single-command verification, no leftover state.
+
+The dev env intentionally sets `enable_versioning = false`,
+`enable_lifecycle = false`, `enable_public_access_block = false`, and
+`enable_bucket_ownership_controls = false` because zgw-posix's POSIX
+driver doesn't yet implement those sub-APIs cleanly
+(`PutBucketVersioning` and `PutBucketLifecycleConfiguration` crash
+the gateway). For validation of those load-bearing features, the
+`dev-rgw` env points at a full RGW (e.g. vstart) — see the next
+section.
 
 To iterate manually (useful when developing the module):
 
 ```sh
-# Start MinIO yourself (port 9000, defaults minioadmin/minioadmin):
-docker run -d --name ceph-tekton-minio \
-  -p 9000:9000 -p 9001:9001 \
-  quay.io/minio/minio:latest \
-  server /data --console-address ":9001"
+# Start zgw-posix yourself (port 8000, dev creds cephtekton/cephtekton):
+mkdir -p /tmp/zgw-posix-data
+docker run -d --name ceph-tekton-zgw-posix \
+  -p 8000:8000 \
+  -v /tmp/zgw-posix-data:/data \
+  -e RGW_ACCESS_KEY=cephtekton \
+  -e RGW_SECRET_KEY=cephtekton \
+  quay.io/dparkes/zgw-posix:latest
 
 # Apply:
 cd terraform/environments/dev
@@ -72,46 +85,33 @@ terraform init
 terraform apply -auto-approve
 
 # Inspect:
-aws --endpoint-url http://127.0.0.1:9000 \
-    --region us-east-1 \
+aws --endpoint-url http://127.0.0.1:8000 \
+    --region default \
     s3api list-buckets
-aws --endpoint-url http://127.0.0.1:9000 \
-    --region us-east-1 \
-    s3api get-bucket-lifecycle-configuration \
-    --bucket ceph-artifacts-dev
 
 # Tear down:
 terraform destroy -auto-approve
-docker rm -f ceph-tekton-minio
+docker rm -f ceph-tekton-zgw-posix
 ```
 
-MinIO admin credentials default to `minioadmin` / `minioadmin`. The
-`aws` CLI calls above expect them in `AWS_ACCESS_KEY_ID` /
-`AWS_SECRET_ACCESS_KEY` (or `~/.aws/credentials`).
+Defaults match what `hack/verify-s3-module.sh` uses
+(`AWS_ACCESS_KEY_ID=cephtekton`, `AWS_SECRET_ACCESS_KEY=cephtekton`),
+so the `aws` CLI calls above pick them up from
+`~/.aws/credentials` or `AWS_*` env vars.
 
 ## Running the dev-rgw env
 
 For higher-fidelity validation against a real Ceph cluster's RGW —
-catches lifecycle scanner behavior, real object-lock retention
+catches lifecycle scanner behavior, versioning + object-lock retention
 enforcement, and Squid+-only features (public-access-block,
-bucket-ownership-controls) that MinIO and zgw-posix can't exercise.
+bucket-ownership-controls) that the local zgw-posix dev env can't
+exercise.
 
 See [`environments/dev-rgw/README.md`](environments/dev-rgw/README.md)
 for the apply runbook. Short version: provision a test user on a
-real RGW, export `TF_VAR_rgw_endpoint` / `rgw_access_key` /
+real RGW (vstart on a build host works; any production-like RGW works
+better), export `TF_VAR_rgw_endpoint` / `rgw_access_key` /
 `rgw_secret_key` / `bucket_prefix`, then `terraform apply`.
-
-### Why not zgw-posix as a local target
-
-We evaluated `quay.io/dparkes/zgw-posix:latest` — Ceph's RGW with the
-experimental POSIX backend driver, intended as a lightweight
-RGW-on-a-laptop. Basic bucket + object ops work, but
-`PutBucketLifecycleConfiguration` and `PutBucketVersioning` **crash
-the gateway** rather than return a clean error. Our module depends
-on both, so zgw-posix can't substitute for MinIO (or a real cluster)
-in `hack/verify-s3-module.sh` today. Revisit when the POSIX driver
-covers the broader S3 sub-API surface — at that point it'd be the
-ideal local target (real RGW code paths, no external cluster needed).
 
 ## Running the Sepia env
 
@@ -122,11 +122,12 @@ site that mirrors Sepia values, not so it can be applied today.
 
 ## Caveats
 
-- **MinIO + bucket-default object-lock retention.** Recent MinIO
-  releases support PutObjectLockConfiguration; older ones return
-  NotImplemented. The verification script emits a `CAVEAT` line if
-  it can't fully exercise the release bucket's GOVERNANCE block,
-  and falls back to per-object retention assertions in that case.
+- **zgw-posix surface is intentionally small.** `verify-s3-module.sh`
+  against the dev env only asserts bucket-create + object PUT/GET
+  + public-read; it does NOT cover versioning, lifecycle, or
+  object-lock because the POSIX driver crashes the gateway on
+  those calls. Higher-fidelity validation of those features lives
+  in `environments/dev-rgw/` against real RGW.
 - **No DynamoDB locking on RGW.** Sepia's backend won't have S3
   state locking; the operating model is "one operator changes
   terraform at a time, coordinated in #ceph-infra". Workable for a

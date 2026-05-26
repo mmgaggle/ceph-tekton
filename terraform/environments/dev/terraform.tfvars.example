@@ -1,7 +1,7 @@
 # Copy to terraform.tfvars to customize. All values shown are defaults.
 #
-# minio_endpoint   = "http://127.0.0.1:9000"
-# minio_access_key = "minioadmin"
-# minio_secret_key = "minioadmin"
-# minio_region     = "us-east-1"
-# bucket_prefix    = ""
+# rgw_endpoint   = "http://127.0.0.1:8000"
+# rgw_access_key = "cephtekton"
+# rgw_secret_key = "cephtekton"
+# rgw_region     = "default"
+# bucket_prefix  = ""

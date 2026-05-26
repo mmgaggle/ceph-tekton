@@ -41,9 +41,10 @@ The same manifests run on any cluster shape worth caring about:
 - **A `kind` or `k3s` cluster under a contributor's desk** — for
   iterating on a Pipeline change without booking Sepia time. The
   local overlay swaps Sepia-only bits (Fulcio keyless, RGW object-lock)
-  for dev-shaped equivalents (a static cosign key in a Secret, MinIO
-  or an in-cluster RGW), so the same Pipeline runs end-to-end with
-  the same attestation shape.
+  for dev-shaped equivalents (a static cosign key in a Secret, an
+  in-cluster RGW or `quay.io/dparkes/zgw-posix` next to the kind
+  cluster), so the same Pipeline runs end-to-end with the same
+  attestation shape.
 
 ### What every build produces
 

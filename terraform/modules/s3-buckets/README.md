@@ -1,37 +1,42 @@
 # `s3-buckets` module
 
-Creates the three artifact buckets ceph-tekton needs for the chacra
-replacement (see [`PLAN.md`](../../../PLAN.md) §"Artifact storage"):
+Creates the four artifact buckets ceph-tekton needs (see
+[`PLAN.md`](../../../PLAN.md) §"Artifact storage" and
+[`docs/architecture.md`](../../../docs/architecture.md#artifact-storage)):
 
 | Bucket                   | Lifecycle class                                                | Object-lock              |
 | ------------------------ | -------------------------------------------------------------- | ------------------------ |
 | `ceph-artifacts-dev`     | 30d object expiry                                              | none                     |
 | `ceph-artifacts-branch`  | keep latest N per (branch, distro, arch) + 180d hard ceiling   | none, versioning enabled |
 | `ceph-artifacts-release` | indefinite (object-lock retention)                             | GOVERNANCE, 7y default   |
+| `ceph-grype-db`          | 30d expiry (≈ keep last 30 dailies)                             | none, no versioning      |
 
-## Why the AWS provider against MinIO and RGW
+## Why the AWS provider against every backend
 
-We use the `hashicorp/aws` provider for all three target backends —
-AWS S3 (as a parity proxy), MinIO (dev/CI), and Sepia RGW (prod) —
-with `endpoints.s3` (and friends) overridden per environment.
+We use the `hashicorp/aws` provider for every target backend —
+AWS S3 (parity proxy), zgw-posix (local dev), real Ceph RGW
+(dev-rgw + Sepia) — with `endpoints.s3` overridden per environment.
 
-The alternative is a dedicated MinIO provider (`aminueza/minio`) or a
-generic-S3 provider per backend. We chose the AWS provider because:
+The alternative is a backend-specific Terraform provider per
+flavour. We chose the single AWS provider because:
 
 1. The bucket / lifecycle / object-lock resources we exercise are
    1:1 with the S3 API verbs RGW already speaks
    (`PutBucketLifecycleConfiguration`, `PutObjectLockConfiguration`,
-   `PutBucketVersioning`). MinIO and RGW are S3-API-compatible —
-   that is the contract they ship.
+   `PutBucketVersioning`). RGW and zgw-posix are S3-API-compatible
+   by design — that is the contract Ceph ships.
 2. Using one provider means one resource graph, one set of `import`
    commands, and one mental model for operators. The differences
-   between backends become *variables* (`enable_public_access_block`,
-   `enable_bucket_ownership_controls`) rather than divergent code
-   paths.
-3. The dev MinIO `apply` exercises exactly the same Terraform graph
-   that will run against Sepia RGW. That's the whole reason we wrote
-   the dev env — to catch provider-level surprises before they hit
-   Sepia.
+   between backends become *variables*
+   (`enable_versioning`, `enable_lifecycle`,
+   `enable_public_access_block`, `enable_bucket_ownership_controls`)
+   rather than divergent code paths.
+3. The local-dev `apply` exercises exactly the same Terraform graph
+   that runs against Sepia RGW. That's the whole reason we have a
+   dev env — to catch provider-level surprises before they hit
+   Sepia. The capability gap between backends shows up as which
+   `enable_*` flags are true; the resource graph itself is
+   identical.
 
 ## "Keep latest N per (branch, distro, arch)" — design note
 
@@ -103,10 +108,11 @@ sure no human will ever need to take it back.
 ## "Why no public-access block / ownership controls by default"
 
 Both `PutPublicAccessBlock` and `PutBucketOwnershipControls` are
-AWS-specific extensions. MinIO returns `NotImplemented`; many RGW
-versions don't ship them either. The `enable_public_access_block`
-and `enable_bucket_ownership_controls` variables let the Sepia env
-opt in once RGW support is confirmed, without breaking the dev env.
+AWS-specific extensions. zgw-posix and older RGW return
+`NotImplemented`; Squid+ RGW + AWS S3 implement them. The
+`enable_public_access_block` and `enable_bucket_ownership_controls`
+variables let the Sepia env opt in once RGW support is confirmed,
+without breaking the local-dev env.
 
 ## Public-mirror semantics
 
@@ -154,13 +160,15 @@ only need to set:
 module "artifacts" {
   source = "../../modules/s3-buckets"
 
-  # Bucket naming is per-env: Sepia uses the plain names; dev MinIO
-  # may want a namespace prefix to coexist with other tests.
-  dev_bucket_name     = "ceph-artifacts-dev"
-  branch_bucket_name  = "ceph-artifacts-branch"
-  release_bucket_name = "ceph-artifacts-release"
+  # Bucket naming is per-env: Sepia uses the plain names; per-developer
+  # envs may want a namespace prefix to coexist with other tests.
+  dev_bucket_name      = "ceph-artifacts-dev"
+  branch_bucket_name   = "ceph-artifacts-branch"
+  release_bucket_name  = "ceph-artifacts-release"
+  grype_db_bucket_name = "ceph-grype-db"
 
-  # AWS-only hardening — leave off for MinIO, on for AWS/RGW.
+  # AWS-only hardening — leave off for zgw-posix and older RGW; on for
+  # AWS S3 and Squid+ RGW.
   enable_public_access_block       = false
   enable_bucket_ownership_controls = false
 }

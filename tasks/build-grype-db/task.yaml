@@ -130,9 +130,10 @@ spec:
       type: string
       default: ""
       description: |
-        Optional S3 endpoint URL (for Sepia RGW or MinIO). Empty =
-        AWS S3 default. Passed as `--endpoint-url`. Same pattern as
-        the generate-sbom Task's S3 step.
+        Optional S3 endpoint URL (for Sepia RGW or any local
+        S3-compatible backend). Empty = AWS S3 default. Passed as
+        `--endpoint-url`. Same pattern as the generate-sbom Task's
+        S3 step.
     - name: subject-prefix
       type: string
       default: https://artifacts.ceph.com/ceph-grype-db/

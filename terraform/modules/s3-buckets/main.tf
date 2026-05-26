@@ -49,6 +49,7 @@ resource "aws_s3_bucket" "branch" {
 }
 
 resource "aws_s3_bucket_versioning" "branch" {
+  count  = var.enable_versioning ? 1 : 0
   bucket = aws_s3_bucket.branch.id
   versioning_configuration {
     status = "Enabled"
@@ -103,13 +104,18 @@ resource "aws_s3_bucket_lifecycle_configuration" "branch" {
 # ===========================================================================
 
 resource "aws_s3_bucket" "release" {
-  bucket              = var.release_bucket_name
+  bucket = var.release_bucket_name
+  # Object-lock is a one-shot opt-in at bucket creation AND requires
+  # versioning. When `enable_versioning = false` we can't honour
+  # object-lock anyway, so don't request it on the bucket — that flag
+  # is rejected by backends without PutBucketVersioning.
+  object_lock_enabled = var.enable_versioning
   force_destroy       = var.force_destroy
-  object_lock_enabled = true
   tags                = var.tags
 }
 
 resource "aws_s3_bucket_versioning" "release" {
+  count  = var.enable_versioning ? 1 : 0
   bucket = aws_s3_bucket.release.id
   versioning_configuration {
     status = "Enabled"
@@ -117,6 +123,9 @@ resource "aws_s3_bucket_versioning" "release" {
 }
 
 resource "aws_s3_bucket_object_lock_configuration" "release" {
+  # Object-lock config requires versioning + the bucket-creation
+  # object_lock_enabled flag — gated together via enable_versioning.
+  count  = var.enable_versioning ? 1 : 0
   bucket = aws_s3_bucket.release.id
 
   # `object_lock_enabled` here is "Enabled" (string) and is distinct
@@ -199,7 +208,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "grype_db" {
 }
 
 # ===========================================================================
-# AWS-only hardening (toggled off by default for MinIO compatibility)
+# AWS-only hardening (toggled off by default for zgw-posix / older-RGW compatibility)
 # ===========================================================================
 
 locals {
@@ -279,7 +288,7 @@ data "aws_iam_policy_document" "public_read" {
 
     # public_read_prefixes uses S3-style globs (e.g. "repodata/*"). The
     # default "*" yields the full bucket. ARN format is the same on
-    # AWS, RGW, and MinIO — bucket-policy ARN strings are not validated
+    # AWS S3, RGW, and zgw-posix — bucket-policy ARN strings are not validated
     # against a backend-specific partition.
     resources = [
       for prefix in var.public_read_prefixes :
@@ -298,7 +307,7 @@ resource "aws_s3_bucket_policy" "public_read" {
   # public policy is applied, otherwise AWS rejects the policy as a
   # would-be public statement against a blocked bucket. depends_on is
   # safe even when the public-access-block resource has 0 instances
-  # (e.g. against MinIO with enable_public_access_block = false).
+  # (e.g. against zgw-posix with enable_public_access_block = false).
   depends_on = [
     aws_s3_bucket_ownership_controls.this,
     aws_s3_bucket_public_access_block.this,

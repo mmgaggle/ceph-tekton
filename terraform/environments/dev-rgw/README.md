@@ -1,13 +1,17 @@
 # `dev-rgw` environment
 
 Applies the `s3-buckets` module against a **real Ceph RGW test user's
-account**. Sits between the `dev` env (MinIO, no RGW-specific behavior)
-and the `sepia` env (production stub, intentionally not applied).
+account**. Sits between the `dev` env (`quay.io/dparkes/zgw-posix:latest`
+— RGW with the experimental POSIX backend driver; versioning + lifecycle
+still crash the gateway there) and the `sepia` env (production stub,
+intentionally not applied).
 
 Use this when you have a test user on a real Ceph cluster and want to
-verify the bits MinIO can't: object-lock retention across the real
-chain, public bucket policies served by the gateway, public-access-block /
-bucket-ownership-controls (Squid+ only).
+verify the bits the local-dev backend can't: object-lock retention
+across the real chain, lifecycle scanner timing, versioned PUT/DELETE
+semantics, public-access-block + bucket-ownership-controls (Squid+
+only). For lifecycle specifically, see the note below — there's a
+current RGW bug that gates that on a follow-up.
 
 > **Lifecycle currently disabled.** This env sets `enable_lifecycle =
 > false` until an upstream RGW bug is fixed. The bug: RGW's
@@ -18,34 +22,31 @@ bucket-ownership-controls (Squid+ only).
 > [`notes/rgw-lifecycle-empty-filter-v1-downgrade.md`](../../../notes/rgw-lifecycle-empty-filter-v1-downgrade.md);
 > re-enable tracked by [issue #57](https://github.com/mmgaggle/ceph-tekton/issues/57).
 
-## Why not MinIO
+## Relationship to the `dev` env
 
-MinIO covers ~80% of the S3 API but quietly diverges on the bits we
-care about most:
+The `dev` env uses `quay.io/dparkes/zgw-posix:latest` — Ceph RGW with
+the experimental POSIX backend driver. It runs the same RGW codebase
+this env points at, so the S3-API surface tested locally is the same
+code that runs on Sepia. What it CAN'T do today:
 
-- Lifecycle: MinIO accepts the config but its scanner is gentler than
-  RGW's — timing-sensitive rules won't fire on the same cadence.
-- Object-lock: MinIO honors per-object retention but the default-rule
-  semantics differ from RGW's.
-- Bucket-ownership-controls and public-access-block: MinIO returns
-  `NotImplemented`.
+- `PutBucketVersioning` crashes the gateway (driver is explicitly
+  experimental) — the dev env therefore sets `enable_versioning = false`
+  in the module, which also disables object-lock on the release bucket
+  (object-lock requires versioning).
+- `PutBucketLifecycleConfiguration` likewise crashes the gateway —
+  `enable_lifecycle = false`.
+- The AWS-only sub-APIs (`PutBucketOwnershipControls`,
+  `PutPublicAccessBlock`) aren't implemented and are flagged off.
 
-For phase 1 we accept MinIO for the basic verification (`hack/verify-s3-module.sh`)
-and use this env for higher-fidelity checks against the real codebase.
+What `dev` CAN exercise: bucket create, object PUT/GET/DELETE, and the
+public-read bucket-policy path. That's enough to validate the
+download-mirror semantics — exactly what `dnf install ceph` traverses
+against production — against the same RGW code that ships to Sepia.
 
-## Why not zgw-posix
-
-We evaluated `quay.io/dparkes/zgw-posix:latest` (Ceph RGW with the POSIX
-backend driver, a strict S3-API parity claim). The basic path works
-(bucket create, object PUT/GET) but lifecycle and versioning calls
-**crash the gateway** rather than return NotImplemented. The driver is
-explicitly experimental, and our terraform module depends on lifecycle +
-versioning + object-lock — all of which it doesn't support. The decision
-trail is in `terraform/README.md`.
-
-When zgw-posix's S3 API surface grows to cover lifecycle, we'll
-reconsider — it would be the ideal local target (real RGW code paths,
-no external cluster needed).
+When zgw-posix's S3 API surface grows to cover versioning + lifecycle
+without crashing, the `dev` env's `enable_*` flags can flip back on
+and this env becomes a redundant step. Until then, `dev-rgw` is the
+higher-fidelity validation layer.
 
 ## Prerequisites
 

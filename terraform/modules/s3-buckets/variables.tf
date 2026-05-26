@@ -1,9 +1,10 @@
 # ---------------------------------------------------------------------------
 # Per-bucket inputs
 #
-# The module creates exactly the three buckets ceph-tekton needs (dev /
-# branch / release). Bucket *names* are inputs so the same module can be
-# pointed at MinIO (dev), AWS S3 (parity testing), or RGW (Sepia) with
+# The module creates the four buckets ceph-tekton needs (dev / branch /
+# release / grype-db). Bucket *names* are inputs so the same module can
+# be pointed at any S3-compatible backend (zgw-posix for local dev, real
+# Ceph RGW for dev-rgw + Sepia, AWS S3 for parity testing) with
 # namespace conventions chosen per environment.
 # ---------------------------------------------------------------------------
 
@@ -148,9 +149,10 @@ variable "release_object_lock_years" {
 variable "force_destroy" {
   description = <<-EOT
     Allow `terraform destroy` to delete buckets that still contain
-    objects. Safe to enable in dev (MinIO is ephemeral). MUST be false
-    in any environment with real artifacts — and is *ignored by S3*
-    for the release bucket when object-lock retention is still active.
+    objects. Safe to enable in the local-dev env (zgw-posix is
+    ephemeral). MUST be false in any environment with real
+    artifacts — and is *ignored by S3* for the release bucket when
+    object-lock retention is still active.
   EOT
   type        = bool
   default     = false
@@ -165,7 +167,8 @@ variable "tags" {
 # ---------------------------------------------------------------------------
 # Backend-flavor toggles
 #
-# MinIO and (older) RGW implementations are missing some S3 sub-APIs that
+# Different S3-compatible backends (zgw-posix, older RGW, current RGW
+# Squid+, AWS S3) implement different subsets of the S3 sub-API surface
 # the AWS provider always tries to call. These flags let us skip the
 # unsupported configuration without forking the module.
 # ---------------------------------------------------------------------------
@@ -173,9 +176,9 @@ variable "tags" {
 variable "enable_bucket_ownership_controls" {
   description = <<-EOT
     Apply `aws_s3_bucket_ownership_controls`. AWS S3 requires this for
-    sane ACL behavior; MinIO returns NotImplemented for the
-    PutBucketOwnershipControls call. Default off (MinIO-safe); set true
-    for AWS and recent RGW.
+    sane ACL behavior; zgw-posix and older RGW return NotImplemented
+    for the PutBucketOwnershipControls call. Default off (dev-safe);
+    set true for AWS S3 and recent (Squid+) RGW.
   EOT
   type        = bool
   default     = false
@@ -183,9 +186,9 @@ variable "enable_bucket_ownership_controls" {
 
 variable "enable_public_access_block" {
   description = <<-EOT
-    Apply `aws_s3_bucket_public_access_block`. AWS-only feature; MinIO
-    and most RGW versions return NotImplemented. Default off; set true
-    for AWS.
+    Apply `aws_s3_bucket_public_access_block`. AWS-only sub-API on
+    older S3 implementations; zgw-posix and pre-Squid RGW return
+    NotImplemented. Default off; set true for AWS S3 and recent RGW.
 
     When set true AND a bucket has `*_public_read = true`, the
     public-access-block for that bucket is configured *permissively*
@@ -194,6 +197,29 @@ variable "enable_public_access_block" {
   EOT
   type        = bool
   default     = false
+}
+
+variable "enable_versioning" {
+  description = <<-EOT
+    Manage `aws_s3_bucket_versioning` on the branch and release
+    buckets, AND the matching `aws_s3_bucket_object_lock_configuration`
+    on release (object-lock requires versioning). Default true.
+
+    Set to false on environments whose S3 backend can't service
+    `PutBucketVersioning` — currently the `dev` env when it's pointed
+    at `quay.io/dparkes/zgw-posix:latest`, whose `PutBucketVersioning`
+    crashes the gateway rather than returning NotImplemented.
+
+    When this flag is false the buckets are still created, but the
+    branch bucket loses its keep-N-via-versioning story and the
+    release bucket loses object-lock entirely. Dev environments
+    accepting this tradeoff get to exercise bucket create + object
+    PUT/GET + public-read policy locally; for higher-fidelity
+    versioning / object-lock validation, use the `dev-rgw` env
+    against a real Ceph RGW (e.g. vstart on a build host).
+  EOT
+  type        = bool
+  default     = true
 }
 
 variable "enable_lifecycle" {

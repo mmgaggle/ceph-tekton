@@ -1,7 +1,9 @@
 # ---------------------------------------------------------------------------
 # dev-rgw — applies the s3-buckets module against a real Ceph RGW test
-# user's account. Bridges between the MinIO `dev` env (no RGW-specific
-# behavior) and the `sepia` production stub (no apply allowed).
+# user's account. Bridges between the `dev` env (zgw-posix — RGW with
+# the experimental POSIX backend driver; versioning + lifecycle still
+# crash the gateway there) and the `sepia` production stub (no apply
+# allowed).
 #
 # Use this env when you have a test user on a real Ceph cluster and
 # want to verify:
