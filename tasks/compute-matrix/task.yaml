@@ -1,0 +1,232 @@
+# compute-matrix — emit the build-matrix JSON array for Tekton fan-out.
+#
+# This Task reads `matrix.yaml` from a source workspace (typically populated
+# by an upstream `git-clone` Task at the PR / branch / tag ref the build is
+# running against) and emits a JSON array of `{distro, arch, gating}`
+# objects as a Tekton Result. Downstream Tasks (build-package, publish-repo,
+# build-container — issues #17, #22, #24) fan out across those cells via
+# Tekton's native `matrix:` field, e.g.:
+#
+#   - name: build
+#     runAfter: [compute-matrix]
+#     taskRef: { name: build-package }
+#     matrix:
+#       include: $(tasks.compute-matrix.results.matrix[*])
+#     params:
+#       - name: distro
+#         value: $(matrix.distro)
+#       - name: arch
+#         value: $(matrix.arch)
+#       - name: gating
+#         value: $(matrix.gating)
+#
+# WHY BRANCH-VERSIONED: matrix.yaml lives in the source tree at the
+# ceph/ceph ref the PipelineRun is building. reef's matrix.yaml differs
+# from main's — older release branches keep building the OS targets they
+# shipped on, and dropping (e.g.) centos8 from main doesn't retroactively
+# break reef. See docs/architecture.md § "Build matrix" + docs/build-matrix.md.
+#
+# WHY THE GATING FIELD IS A STRING: Tekton's `matrix:` field passes each
+# cell's object keys as param values, and Tekton params are typed
+# string|array|object — there is no bool. Downstream Tasks read
+# `$(params.gating)` and `case "${gating}" in true) ... ;; esac`.
+#
+# FALLBACK SEMANTICS: if `matrix.yaml` is absent at the source ref
+# (e.g. an old release branch that pre-dates this work), the Task emits
+# a documented default matrix (centos10 + ubuntu-noble × x86_64 + aarch64,
+# all gating=true) and logs a warning to stderr. This makes the Task
+# graceful for branches that haven't been backported. See docs/build-matrix.md.
+#
+# CONTRACT — the JSON array shape (locked):
+#   [
+#     {"distro": "<name>", "arch": "<arch>", "gating": "true"|"false"},
+#     ...
+#   ]
+#
+# The cell-count + gating-count scalar Results let a downstream Pipeline
+# sanity-check "at least N gating cells" before fanning out, useful for
+# dashboards and for asserting we didn't accidentally ship a matrix.yaml
+# where every cell is non-gating.
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: compute-matrix
+spec:
+  description: |
+    Read `matrix.yaml` from the source workspace at the build ref and emit
+    a JSON array of `{distro, arch, gating}` objects as the `matrix`
+    Result for Tekton matrix-fan-out, plus scalar `cell-count` and
+    `gating-count` Results for dashboards / sanity checks.
+
+    If `matrix.yaml` is absent at the source ref, emit the documented
+    default matrix (centos10 + ubuntu-noble × x86_64 + aarch64, all
+    gating=true) and log a warning. This is the graceful fallback for
+    old release branches that pre-date this work.
+  params:
+    - name: source-ref
+      type: string
+      default: ""
+      description: |
+        Source git ref the upstream git-clone Task populated the source
+        workspace with. Only used in log + error messages so a reader
+        can find the bad ref quickly. Not interpreted — the Task only
+        reads what's already in the workspace.
+    - name: matrix-file
+      type: string
+      default: matrix.yaml
+      description: |
+        Path to the matrix YAML file, relative to the source workspace
+        root. Default `matrix.yaml`. Smoke tests override this so they
+        can drop a synthetic matrix at a non-default path without
+        colliding with anything a real source tree might ship.
+    - name: tools-image
+      type: string
+      default: docker.io/mikefarah/yq:4.40.7
+      description: |
+        Pinned mikefarah/yq image. Alpine-based, so it ships a real
+        `/bin/sh` (Tekton's `script:` shim works), and bundles `yq`
+        for the YAML→JSON conversion. v4.40.7 is the current stable
+        line; bumping this is a deliberate supply-chain decision —
+        same posture as the other pinned images in this repo.
+  workspaces:
+    - name: source
+      description: |
+        Source workspace populated by an upstream Task (usually a
+        Tekton catalog `git-clone`). The Task reads
+        `$(workspaces.source.path)/$(params.matrix-file)` and does
+        nothing else with the workspace — no writes, no clone, no
+        network. Smoke tests bind an emptyDir + seed it with a
+        synthetic matrix.yaml via a sibling Task.
+      mountPath: /workspace/source
+      readOnly: true
+  results:
+    - name: matrix
+      description: |
+        JSON array of `{distro, arch, gating}` objects, one per matrix
+        cell. Consumed by downstream Tasks via Tekton's `matrix:` field:
+
+            matrix:
+              include: $(tasks.compute-matrix.results.matrix[*])
+
+        Each entry's keys become param values for the matrix cell.
+        `gating` is the string `"true"` or `"false"` (Tekton matrix
+        params are strings); downstream Tasks decide whether a cell
+        failure fails the PipelineRun based on `$(params.gating)`.
+    - name: cell-count
+      description: |
+        Integer count of matrix cells (decimal string). Lets a Pipeline
+        log "fanning out across N cells" or a downstream assert step
+        sanity-check `len(matrix) == cell-count`.
+    - name: gating-count
+      description: |
+        Integer count of cells whose `gating` field is `"true"`
+        (decimal string). Pipelines can assert "at least N gating
+        cells" as a sanity check before fanning out — useful for
+        catching a matrix.yaml that accidentally marks every cell as
+        non-gating.
+  steps:
+    - name: parse
+      image: $(params.tools-image)
+      env:
+        - name: SOURCE_REF
+          value: $(params.source-ref)
+        - name: MATRIX_FILE
+          value: $(params.matrix-file)
+        - name: SOURCE_DIR
+          value: $(workspaces.source.path)
+        - name: RESULT_MATRIX
+          value: $(results.matrix.path)
+        - name: RESULT_CELL_COUNT
+          value: $(results.cell-count.path)
+        - name: RESULT_GATING_COUNT
+          value: $(results.gating-count.path)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        # The documented default matrix — emitted verbatim when
+        # matrix.yaml is missing at the source ref. Kept in sync with
+        # the table in docs/build-matrix.md ("Default-matrix fallback").
+        #
+        # We use printf to avoid heredoc quoting weirdness with yq.
+        DEFAULT_MATRIX_JSON='[{"distro":"centos10","arch":"x86_64","gating":"true"},{"distro":"centos10","arch":"aarch64","gating":"true"},{"distro":"ubuntu-noble","arch":"x86_64","gating":"true"},{"distro":"ubuntu-noble","arch":"aarch64","gating":"true"}]'
+
+        MATRIX_PATH="${SOURCE_DIR}/${MATRIX_FILE}"
+
+        echo "[compute-matrix] source-ref=${SOURCE_REF:-<unset>}"
+        echo "[compute-matrix] reading matrix from ${MATRIX_PATH}"
+        ls -la "${SOURCE_DIR}" || true
+
+        if [ ! -f "${MATRIX_PATH}" ]; then
+          echo "[compute-matrix] WARNING: ${MATRIX_PATH} not present at source-ref=${SOURCE_REF:-<unset>}" >&2
+          echo "[compute-matrix] WARNING: emitting documented default matrix (centos10 + ubuntu-noble x amd64/arm64, gating=true)" >&2
+          echo "[compute-matrix] WARNING: see docs/build-matrix.md § 'Default-matrix fallback' for rationale" >&2
+          MATRIX_JSON="${DEFAULT_MATRIX_JSON}"
+        else
+          # yq's `-o=json` writes pretty-printed JSON by default;
+          # `-I=0` collapses it to a single line (Tekton Results must
+          # be a single-line string when consumed via `matrix.include`).
+          #
+          # We emit the `gating` field as a string because Tekton
+          # matrix params are strings — yq's `tostring` coerces YAML
+          # bool true/false into the literal strings "true"/"false".
+          #
+          # If matrix.yaml lacks a `.cells` key or `.cells` is empty,
+          # yq emits `null` or `[]`; we treat both as "broken matrix"
+          # and fail the Task (vs. silently emitting an empty array
+          # that would make the downstream `matrix:` fan-out resolve
+          # to zero cells, which is much worse than a fail-loud).
+          MATRIX_JSON="$(
+            yq -o=json -I=0 '
+              .cells
+              | map({
+                  "distro": .distro,
+                  "arch":   .arch,
+                  "gating": (.gating | tostring)
+                })
+            ' "${MATRIX_PATH}"
+          )"
+
+          case "${MATRIX_JSON}" in
+            ""|"null"|"[]")
+              echo "[compute-matrix] FAIL: ${MATRIX_PATH} has no .cells entries (got '${MATRIX_JSON}')" >&2
+              echo "[compute-matrix] FAIL: see docs/build-matrix.md for the matrix.yaml schema" >&2
+              exit 1
+              ;;
+          esac
+        fi
+
+        # ---- Sanity-check shape ----
+        # Every cell must carry distro + arch + gating. Compare the
+        # length of the unfiltered array with the length after
+        # filtering on the presence of all three keys; equal counts
+        # mean every cell has all three. This is more robust across
+        # yq versions than `all(...)` (which mikefarah/yq has shipped
+        # under two different signatures over its v4 lifetime).
+        TOTAL_LEN="$(printf '%s' "${MATRIX_JSON}" | yq -p=json '. | length')"
+        SHAPED_LEN="$(
+          printf '%s' "${MATRIX_JSON}" \
+            | yq -p=json '[.[] | select(.distro != null and .arch != null and .gating != null)] | length'
+        )"
+        if [ "${TOTAL_LEN}" != "${SHAPED_LEN}" ]; then
+          echo "[compute-matrix] FAIL: ${TOTAL_LEN} cells but only ${SHAPED_LEN} carry distro/arch/gating" >&2
+          echo "[compute-matrix] FAIL: matrix JSON: ${MATRIX_JSON}" >&2
+          exit 1
+        fi
+
+        # ---- Counts ----
+        CELL_COUNT="${TOTAL_LEN}"
+        GATING_COUNT="$(
+          printf '%s' "${MATRIX_JSON}" \
+            | yq -p=json '[.[] | select(.gating == "true")] | length'
+        )"
+
+        # ---- Emit Results ----
+        printf '%s' "${MATRIX_JSON}"  > "${RESULT_MATRIX}"
+        printf '%s' "${CELL_COUNT}"   > "${RESULT_CELL_COUNT}"
+        printf '%s' "${GATING_COUNT}" > "${RESULT_GATING_COUNT}"
+
+        echo "[compute-matrix] cell-count=${CELL_COUNT} gating-count=${GATING_COUNT}"
+        echo "[compute-matrix] matrix:"
+        printf '%s\n' "${MATRIX_JSON}" | yq -p=json -o=yaml
