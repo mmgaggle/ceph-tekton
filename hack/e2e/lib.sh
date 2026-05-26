@@ -221,18 +221,24 @@ decode_attestation() {
   log::info "decoded attestation to ${outfile} ($(wc -c <"${outfile}") bytes)"
 }
 
-# decode_signature NAMESPACE TASKRUN OUTFILE
+# decode_envelope NAMESPACE TASKRUN OUTFILE
 #
-# Same as decode_attestation but pulls the signature blob (which lives
-# in a sibling annotation, signature-taskrun-<uid>), then converts it
-# from ASN.1 DER (the format Chains 0.26 emits) into raw IEEE P1363
-# (R||S, 64 bytes for P-256). cosign 2.4 `verify-blob` requires the
-# latter and rejects DER with "ecdsa: Invalid IEEE_P1363 encoded bytes";
-# downstream `cosign verify-attestation` against an OCI ref handles
-# DER natively, but the dev assert verifies bytes directly without an
-# OCI reference, so the conversion has to happen here. See the
-# follow-up issue for migrating chains-smoke off verify-blob entirely.
-decode_signature() {
+# Chains 0.26's `chains.tekton.dev/signature-taskrun-<uid>` annotation
+# stores a base64-encoded DSSE envelope JSON:
+#
+#   { "payloadType": "application/vnd.in-toto+json",
+#     "payload":     "<base64 of in-toto Statement>",
+#     "signatures":  [ { "keyid": "...", "sig": "<base64 DER ECDSA>" } ] }
+#
+# The envelope itself is what `cosign verify-blob-attestation` expects
+# as its `--signature` argument — that command handles the DSSE PAE
+# reconstruction and the DER-vs-IEEE-P1363 quirk internally. Earlier
+# iterations of this helper tried to extract the raw signature for
+# `cosign verify-blob`; that path is fundamentally wrong for DSSE
+# (raw-sig verification skips the PAE, so the signature never matches
+# the payload bytes) and is replaced by the verify-blob-attestation
+# helper below.
+decode_envelope() {
   local ns="$1" tr="$2" outfile="$3"
   local ann_key
   ann_key="$(kube_ctx -n "${ns}" get taskrun "${tr}" -o json \
@@ -242,39 +248,10 @@ decode_signature() {
     log::fail "no chains signature annotation on ${ns}/${tr}"
     return 1
   fi
-  local der_tmp
-  der_tmp="$(mktemp)"
   kube_ctx -n "${ns}" get taskrun "${tr}" -o json \
     | jq -r --arg k "${ann_key}" '.metadata.annotations[$k]' \
-    | base64 -d > "${der_tmp}"
-  python3 - "${der_tmp}" "${outfile}" <<'PYEOF'
-import sys
-with open(sys.argv[1], "rb") as f:
-    data = f.read()
-# SEQUENCE
-assert data[0] == 0x30, "not a DER SEQUENCE"
-# Short-form length is the common case for P-256 sigs; long-form is
-# handled defensively in case a larger curve sneaks in.
-if data[1] & 0x80:
-    pos = 2 + (data[1] & 0x7f)
-else:
-    pos = 2
-# INTEGER R
-assert data[pos] == 0x02, "expected INTEGER for R"
-r_len = data[pos + 1]
-r = int.from_bytes(data[pos + 2 : pos + 2 + r_len], "big")
-pos += 2 + r_len
-# INTEGER S
-assert data[pos] == 0x02, "expected INTEGER for S"
-s_len = data[pos + 1]
-s = int.from_bytes(data[pos + 2 : pos + 2 + s_len], "big")
-# P-256: each scalar fits in 32 bytes. P-384/P-521 would need 48/66;
-# the assert target here is the dev P-256 cosign.key only.
-with open(sys.argv[2], "wb") as f:
-    f.write(r.to_bytes(32, "big") + s.to_bytes(32, "big"))
-PYEOF
-  rm -f "${der_tmp}"
-  log::info "decoded signature to ${outfile} ($(wc -c <"${outfile}") bytes, DER -> IEEE_P1363)"
+    | base64 -d > "${outfile}"
+  log::info "decoded DSSE envelope to ${outfile} ($(wc -c <"${outfile}") bytes)"
 }
 
 # fetch_cosign_pub OUTFILE
@@ -298,20 +275,32 @@ fetch_cosign_pub() {
 # Wraps `cosign verify-blob`. Returns 0 if cosign reports Verified OK.
 # Captures cosign's output to ${E2E_ARTIFACTS}/cosign-verify-blob.txt
 # so a CI failure has the full message to read.
-cosign_verify_blob() {
-  local keyfile="$1" sigfile="$2" payloadfile="$3"
-  local out="${E2E_ARTIFACTS}/cosign-verify-blob-$$.txt"
-  log::info "cosign verify-blob (key=${keyfile##*/} sig=${sigfile##*/} payload=${payloadfile##*/})"
-  if cosign verify-blob \
+cosign_verify_envelope() {
+  local keyfile="$1" envelopefile="$2" payloadfile="$3"
+  local out="${E2E_ARTIFACTS}/cosign-verify-blob-attestation-$$.txt"
+  log::info "cosign verify-blob-attestation (key=${keyfile##*/} envelope=${envelopefile##*/})"
+  # --check-claims=false: skip the "envelope's subject digest equals the
+  # supplied blob's hash" check. The assert harness already verifies the
+  # subject digest in a prior step against the TaskRun's IMAGE_DIGEST
+  # Result; here we only need cosign to verify the DSSE signature is
+  # valid for the supplied public key. The positional blob argument is
+  # still required by the CLI but its content is unused with
+  # --check-claims=false; pass payloadfile so the path is unambiguous.
+  # --insecure-ignore-tlog: dev Chains doesn't push to the public Rekor;
+  # the rekor_search helper below verifies Rekor presence independently
+  # when the cluster's transparency: rekor option is enabled.
+  if cosign verify-blob-attestation \
       --key "${keyfile}" \
-      --signature "${sigfile}" \
+      --signature "${envelopefile}" \
+      --type slsaprovenance \
+      --check-claims=false \
       --insecure-ignore-tlog \
       "${payloadfile}" >"${out}" 2>&1; then
-    log::pass "cosign verify-blob OK"
+    log::pass "cosign verify-blob-attestation OK"
     return 0
   fi
-  log::fail "cosign verify-blob FAILED — see ${out}"
-  cp -f "${out}" "${E2E_ARTIFACTS}/cosign-verify-blob-fail.txt" 2>/dev/null || true
+  log::fail "cosign verify-blob-attestation FAILED — see ${out}"
+  cp -f "${out}" "${E2E_ARTIFACTS}/cosign-verify-blob-attestation-fail.txt" 2>/dev/null || true
   cat "${out}" >&2
   return 1
 }
