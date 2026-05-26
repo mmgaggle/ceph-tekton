@@ -89,25 +89,23 @@ reportsController:
 #
 # Kyverno's webhook MUST NOT see its own pods (chicken-and-egg on
 # install) and should skip the kube-system control plane. The chart's
-# defaults already exclude kube-system + kyverno; we add the namespaces
-# that host the rest of the ceph-tekton dev stack so a policy outage
-# can't take them down.
+# defaults already exclude kube-system + kyverno; that's enough for
+# the smoke pipeline, which only exercises the verifyImages policy
+# against `quay.io/ceph/*` images.
+#
+# Earlier dev iterations carried an extra `config.webhooks` list that
+# added tekton-pipelines / tekton-chains / vault / pipelines-as-code
+# to the exclusion set. Kyverno chart 3.3.x changed `config.webhooks`
+# from a list of webhook configs into a map keyed by webhook name —
+# the old list shape now renders a template error at install time
+# (`$webhook.namespaceSelector: can't evaluate field`). Dropping the
+# override unblocks the dev install at the cost of those four
+# namespaces being subject to Kyverno admission; the smoke pipeline
+# doesn't deploy `quay.io/ceph/*` workloads into them, so the policy
+# is a noop there anyway. The full exclusion set returns when we
+# rewrite this block against the new schema (tracked separately).
 config:
   excludeKyvernoNamespace: true
-  webhooks:
-    - namespaceSelector:
-        matchExpressions:
-          - key: kubernetes.io/metadata.name
-            operator: NotIn
-            values:
-              - kube-system
-              - kube-public
-              - kube-node-lease
-              - kyverno
-              - tekton-pipelines
-              - tekton-chains
-              - vault
-              - pipelines-as-code
 
 # ---- image-verification specifics ----
 #
