@@ -286,7 +286,7 @@ Three-bullet summary:
   the `verify-ceph-image-signatures-dev` ClusterPolicy, which requires
   every Pod with a `quay.io/ceph/*` image to carry a valid cosign
   signature from that same Chains key.
-- Smoke test: `kubectl apply -f pipelines/setup/kyverno-smoke-rbac.yaml -f pipelines/tasks/try-pod-admit.yaml -f pipelines/pipelines/kyverno-smoke-test.yaml &&
+- Smoke test: `kubectl apply -f manifests/smoke-setup/kyverno-smoke-rbac.yaml -f pipelines/tasks/try-pod-admit.yaml -f pipelines/pipelines/kyverno-smoke-test.yaml &&
   tkn pipeline start kyverno-smoke-test --showlog` — one TaskRun pulls
   a signed image (admit expected), another pulls an unsigned image
   (reject expected). Confirm with `kubectl get policyreport -A`.

@@ -2,9 +2,9 @@
 #
 # Multi-doc setup manifest applied alongside pipelines/tasks/try-pod-admit.yaml
 # and pipelines/pipelines/kyverno-smoke-test.yaml. These resources are NOT
-# Tekton Tasks/Pipelines, so they don't live under pipelines/tasks/ or
-# pipelines/pipelines/ — those directories are reserved for PaC-resolvable
-# Task / Pipeline files (one resource per file).
+# Tekton Tasks/Pipelines, so they live under manifests/smoke-setup/ rather
+# than pipelines/ — pipelines/ is reserved for PaC-resolvable Task / Pipeline
+# files (one resource per file).
 #
 # The `kyverno-smoke` namespace is intentionally NOT in the chart's
 # webhook-exclusion list. The namespace must be one the dev policy

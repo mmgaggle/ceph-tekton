@@ -69,7 +69,7 @@ kubectl apply -k kustomize/base/kyverno-policies/
 
 # Run the smoke test. Issue #68 split the smoke pipeline into
 # single-resource files; apply the setup, Task, then Pipeline.
-kubectl apply -f pipelines/setup/kyverno-smoke-rbac.yaml
+kubectl apply -f manifests/smoke-setup/kyverno-smoke-rbac.yaml
 kubectl apply -f pipelines/tasks/try-pod-admit.yaml
 kubectl apply -f pipelines/pipelines/kyverno-smoke-test.yaml
 tkn pipeline start kyverno-smoke-test --showlog
