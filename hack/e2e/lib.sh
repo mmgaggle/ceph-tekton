@@ -163,7 +163,16 @@ start_pipelinerun() {
   # `tkn pipeline start --output=name` prints just `pipelinerun.tekton.dev/<name>`
   # to stdout — the form `kubectl wait` expects. Trim to bare name so
   # downstream callers can also use bare-name jsonpath queries.
-  pr="$(tkn_ctx pipeline start "${pipeline}" -n "${ns}" --output=name "$@")"
+  #
+  # `--use-param-defaults` is required in non-interactive contexts: tkn
+  # 0.39 still prompts for every param without an explicit `-p value=...`
+  # flag, even when the Pipeline declares a default for it. In CI stdin
+  # is closed; the prompt fails with "Error: EOF" and tkn emits its
+  # half-rendered prompt text to stdout, which the caller then captures
+  # as the "PipelineRun name". The flag tells tkn to silently use each
+  # param's declared default for anything the caller didn't override.
+  pr="$(tkn_ctx pipeline start "${pipeline}" -n "${ns}" \
+        --output=name --use-param-defaults "$@")"
   pr="${pr##*/}"
   printf '%s\n' "${pr}"
 }
