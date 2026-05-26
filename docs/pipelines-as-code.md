@@ -11,11 +11,12 @@ This page covers:
 1. [What gets installed](#what-gets-installed)
 2. [Install PaC into the dev cluster](#install-pac-into-the-dev-cluster)
 3. [Webhook ingress via smee.io](#webhook-ingress-via-smeeio)
-4. [Create a GitHub App for your dev cluster](#create-a-github-app-for-your-dev-cluster)
-5. [Wire the GitHub App to PaC](#wire-the-github-app-to-pac)
-6. [Smoke-test with the noop pipeline](#smoke-test-with-the-noop-pipeline)
-7. [Troubleshooting](#troubleshooting)
-8. [Bumping the pinned PaC version](#bumping-the-pinned-pac-version)
+4. [Public ingress (replacing smee.io)](#public-ingress-replacing-smeeio)
+5. [Create a GitHub App for your dev cluster](#create-a-github-app-for-your-dev-cluster)
+6. [Wire the GitHub App to PaC](#wire-the-github-app-to-pac)
+7. [Smoke-test with the noop pipeline](#smoke-test-with-the-noop-pipeline)
+8. [Troubleshooting](#troubleshooting)
+9. [Bumping the pinned PaC version](#bumping-the-pinned-pac-version)
 
 > The "real" GitHub App for `ceph/ceph` is tracked separately in #9 and
 > is a human-in-the-loop task. The walkthrough below is for a
@@ -148,6 +149,155 @@ kubectl --context kind-ceph-tekton-dev -n pipelines-as-code logs deploy/gosmee
 > Deployment becomes a kustomize resource with the channel URL pulled
 > from an env var or ConfigMapGenerator. For now it's a one-liner you
 > run manually — keeps secrets (the smee URL is one) out of git.
+
+---
+
+## Public ingress (replacing smee.io)
+
+smee.io is fine for laptop-bound prototyping but is third-party and
+unauthenticated. For sustained CI we run a real ingress at the cluster's
+public IP, terminate TLS with Let's Encrypt, and point the GitHub App's
+webhook URL directly at it.
+
+This section sets up that ingress. It coexists with the smee.io path
+above — applying it does **not** retire `gosmee`. The cutover (flip
+the App webhook URL, then delete the gosmee Deployment) is the last
+two steps and is intentionally manual: that way a single edit on the
+GitHub App side bounces you back to smee.io if anything misbehaves.
+
+### What gets installed
+
+`kustomize/base/pac-ingress/` is a self-authored kustomize base. Its
+resources land in the existing `pipelines-as-code` namespace:
+
+| Resource                         | Why                                                                   |
+|----------------------------------|-----------------------------------------------------------------------|
+| `ConfigMap/pac-ingress-caddy`    | The Caddyfile (reverse-proxy + ACME config).                          |
+| `PersistentVolumeClaim` (1Gi)    | Mounted at `/data` so issued certs survive pod restarts.              |
+| `Deployment/pac-ingress-caddy`   | Single Caddy replica (TLS termination + Let's Encrypt + reverse-proxy).|
+| `Service/pac-ingress` (LB :443+:80)| Klipper-LB binds the LB to the node's host IP on k3s.                 |
+
+Why Caddy over nginx-ingress + cert-manager: built-in ACME means one
+container does TLS termination, cert issuance, and renewal. No extra
+ingress controller, no Issuer/Certificate CRs. nginx + cert-manager
+is the right call once we have multiple ingresses to manage, but
+single-endpoint phase-1 doesn't warrant the parts.
+
+The hostname is intentionally not baked in. The Caddyfile carries the
+sentinel `PAC_HOSTNAME_PLACEHOLDER`; an apply that forgets to
+substitute it will obviously not match real DNS, so it stands out.
+
+### Prerequisites (HITL)
+
+1. **DNS A record** — pick a stable hostname (e.g.
+   `pac.<your-domain>`) and add an A record pointing at the cluster's
+   public IP. For the shared EC2 cluster that is **`54.90.98.182`**.
+
+   The script below cannot make this change for you; DNS is owned by
+   you, not the cluster.
+
+2. **EC2 security group** — the EC2 instance hosting the k3s cluster
+   needs inbound rules:
+
+   | Protocol | Port | Source      | Why                                  |
+   |----------|------|-------------|--------------------------------------|
+   | TCP      | 443  | `0.0.0.0/0` | webhook deliveries                   |
+   | TCP      | 80   | `0.0.0.0/0` | Let's Encrypt HTTP-01 ACME challenge |
+
+   The :80 rule is only strictly required during issuance and
+   renewals, but Caddy auto-redirects HTTP to HTTPS on every other
+   request, so leaving it open is safe. (Coordinate with the SG
+   owner — the EC2 IP is shared with the vstart cluster and the kind
+   dev cluster; double-check there's no port conflict on 443.)
+
+### Apply
+
+```sh
+PAC_HOSTNAME=pac.<your-domain> \
+ACME_EMAIL=you@example.com \
+KUBECONTEXT=<ec2-k3s-context> \
+  hack/dev-pac-ingress.sh
+```
+
+The script:
+
+- Renders `kustomize/base/pac-ingress/` with `kubectl kustomize`.
+- Substitutes `PAC_HOSTNAME_PLACEHOLDER` and `ACME_EMAIL_PLACEHOLDER`
+  in the rendered output.
+- Pipes to `kubectl apply` against `$KUBECONTEXT`.
+- Waits for the Caddy Deployment to roll out.
+- Prints the cutover checklist (below) with the values you passed in.
+
+Watch the Caddy log for the initial cert issuance:
+
+```sh
+kubectl -n pipelines-as-code logs deploy/pac-ingress-caddy -f \
+  | grep -i -e certificate -e acme -e error
+```
+
+You're looking for a `certificate obtained successfully` line within
+~30 seconds of DNS propagation + SG allowing :80.
+
+Confirm the endpoint serves a real cert:
+
+```sh
+curl -sSI https://pac.<your-domain>/
+# HTTP/2 200, server: Caddy
+```
+
+(`GET /` returns a small JSON 200 so casual probes don't see a
+confusing 404 from PaC, which only accepts POST.)
+
+### Cutover — flip the GitHub App webhook URL
+
+Once the endpoint serves HTTPS cleanly:
+
+1. Open the GitHub App settings (`ceph-tekton PaC dev` for the dev
+   app, or whichever App you set up under
+   [Create a GitHub App for your dev cluster](#create-a-github-app-for-your-dev-cluster)).
+2. Change **Webhook → Webhook URL** from your smee.io channel to
+   `https://pac.<your-domain>/`.
+3. Save, then under **Advanced → Recent Deliveries** click
+   **Redeliver** on any recent delivery. Confirm:
+   - The delivery's response panel shows a 2xx from the new endpoint
+     (not from smee.io).
+   - `kubectl -n pipelines-as-code logs deploy/pac-ingress-caddy`
+     shows the inbound POST.
+   - `kubectl -n pipelines-as-code logs deploy/pipelines-as-code-controller`
+     shows the same event being processed.
+
+### Retire gosmee
+
+Only after the App's webhook URL is flipped and a real
+`pull_request` (or `/retest` comment) event has driven a PipelineRun
+end-to-end via the new path:
+
+```sh
+kubectl -n pipelines-as-code delete deployment gosmee
+```
+
+The `pac-ingress` kustomize stays applied — leaving it in place is
+the default state.
+
+### Rollback
+
+If the public ingress misbehaves at any point:
+
+1. Re-point the GitHub App's webhook URL back at the smee.io channel
+   (a single edit in the App's settings).
+2. If you already deleted `gosmee`, re-create it per the
+   [Run a gosmee forwarder Pod](#2-run-a-gosmee-forwarder-pod) step
+   above.
+3. Leave `pac-ingress` applied or delete it; nothing else in the
+   cluster depends on it.
+
+   ```sh
+   # only if you want to fully tear it down:
+   kubectl delete -k kustomize/base/pac-ingress/
+   ```
+
+The smee.io path is intentionally preserved so this is a one-edit
+rollback.
 
 ---
 

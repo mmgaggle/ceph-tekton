@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: pac-ingress
+  annotations:
+    # k3s ships klipper-lb as the default LoadBalancer provider; it
+    # binds the LB ports on each node's host IP via a DaemonSet of
+    # svclb-* helper pods. On the single-node EC2 cluster that means
+    # 54.90.98.182:443 (and :80) ends up routed here as long as the
+    # EC2 SG allows the inbound. No cloud LB is provisioned and no
+    # extra cost is incurred.
+    #
+    # If the target cluster has a real cloud LB controller (AWS LB,
+    # GCP LB, MetalLB, etc.), this Service will provision one and
+    # the DNS A record should point at that LB's address instead of
+    # the node IP. The overlay can swap to externalIPs / NodePort
+    # by patching `.spec.type` if that's not desired.
+    description: "Public HTTPS endpoint for GitHub -> PaC webhooks."
+spec:
+  type: LoadBalancer
+  # externalTrafficPolicy=Local keeps the client source IP visible to
+  # Caddy (and thence to PaC), useful for log correlation and for any
+  # future IP-allowlist on GitHub's webhook source ranges. With Local,
+  # only nodes that actually host a backend pod will answer LB
+  # traffic — fine on a single-node cluster, will need revisiting if
+  # we ever scale the cluster out.
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: pac-ingress
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+    - name: https
+      port: 443
+      targetPort: https
+      protocol: TCP

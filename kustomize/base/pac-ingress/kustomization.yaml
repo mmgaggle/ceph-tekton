@@ -1,0 +1,61 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Public webhook ingress for Pipelines-as-Code (PaC).
+#
+# Replaces the prototype smee.io + gosmee relay (see
+# docs/pipelines-as-code.md) with a real HTTPS endpoint that GitHub can
+# POST webhook deliveries to directly.
+#
+# The pieces:
+#   * caddy-configmap.yaml — the Caddyfile. Reverse-proxies to the
+#                            in-cluster PaC controller Service. Caddy
+#                            has built-in ACME (Let's Encrypt) support,
+#                            so one container handles TLS termination
+#                            + cert issuance + auto-renewal with no
+#                            separate cert-manager + ingress-controller
+#                            stack.
+#   * deployment.yaml      — Caddy Deployment, single replica.
+#   * service.yaml         — LoadBalancer Service exposing :443 (and
+#                            :80, required by the HTTP-01 ACME
+#                            challenge). On k3s the bundled klipper-lb
+#                            maps the LB to the node's host IP, so the
+#                            EC2 public IP (54.90.98.182) reaches it
+#                            once the EC2 SG allows inbound 443/80.
+#   * pvc.yaml             — 1Gi PVC at /data so issued certs survive
+#                            pod restarts (otherwise we'd hit
+#                            Let's Encrypt's rate-limit on every
+#                            restart).
+#
+# Hostname is intentionally NOT baked in. Apply this base via an
+# overlay (or `kustomize edit add patch`) that substitutes
+# `PAC_HOSTNAME_PLACEHOLDER` in caddy-configmap.yaml with the real
+# DNS name (e.g. `pac.example.com`). The placeholder is also a useful
+# tripwire: a misconfigured apply will fail Caddy's startup parse and
+# stand out in the pod log rather than silently serving on an
+# undefined host.
+#
+# Coexists with the gosmee Deployment by design — flipping the GitHub
+# App's webhook URL is the cutover, not deleting any Deployment. See
+# the doc for the rollback story.
+
+namespace: pipelines-as-code
+
+resources:
+  - caddy-configmap.yaml
+  - pvc.yaml
+  - deployment.yaml
+  - service.yaml
+
+# `labels` (vs the deprecated `commonLabels`) lets us decide which
+# labels propagate into selectors. We pin only `app.kubernetes.io/name`
+# into selectors so the Service + Deployment selectors stay simple and
+# stable across future label additions.
+labels:
+  - pairs:
+      app.kubernetes.io/name: pac-ingress
+    includeSelectors: true
+  - pairs:
+      app.kubernetes.io/component: webhook-ingress
+      app.kubernetes.io/part-of: pipelines-as-code
+    includeSelectors: false
