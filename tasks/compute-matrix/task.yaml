@@ -177,16 +177,19 @@ spec:
           # and fail the Task (vs. silently emitting an empty array
           # that would make the downstream `matrix:` fan-out resolve
           # to zero cells, which is much worse than a fail-loud).
-          # mikefarah/yq 4.40.7's parser chokes on `tostring` in pretty
-          # much every position we tried (inside `(.x | tostring)` as an
-          # object value, and as the RHS of `.x |= tostring`). Use
-          # string interpolation `"\(.gating)"` instead: it's a single
-          # grammar token (not a pipeline), so the parser handles it
-          # cleanly, and it coerces YAML bool → JSON string "true"/"false"
-          # the same way `tostring` would.
+          # mikefarah/yq 4.40.7 doesn't support two jq idioms we'd like:
+          #   1. `tostring` as a pipeline value (in `(.x | tostring)`
+          #      or as RHS of `.x |= tostring`) — parser bails.
+          #   2. Bare-identifier shorthand `{distro}` (jq's
+          #      `{distro: .distro}` sugar) — parser bails with
+          #      "invalid input text" on the bare key.
+          # Workarounds: string interpolation `"\(.gating)"` for the
+          # coercion (single grammar token, no pipeline), and write out
+          # every key:value pair explicitly. Verbose but works on every
+          # mikefarah/yq 4.x.
           MATRIX_JSON="$(
             yq -o=json -I=0 '
-              .cells | map({distro, arch, gating: "\(.gating)"})
+              .cells | map({distro: .distro, arch: .arch, gating: "\(.gating)"})
             ' "${MATRIX_PATH}"
           )"
 
