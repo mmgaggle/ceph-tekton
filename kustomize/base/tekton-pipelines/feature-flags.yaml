@@ -1,0 +1,26 @@
+# Tekton feature-flags patch.
+#
+# coschedule=pipelineruns (instead of the v1.6.0 default `workspaces`)
+# fixes pod-affinity deadlock for Pipelines whose TaskRuns mount
+# multiple workspaces backed by a single PVC (typical with subPath).
+# Under `workspaces`, Tekton's affinity-assistant creates one anchor
+# StatefulSet per workspace name, and a TaskRun pod mounting two such
+# workspaces has affinity for both anchors simultaneously — which is
+# unsatisfiable on single-node clusters and fragile on multi-node.
+# `pipelineruns` creates one anchor per PipelineRun and binds all
+# TaskRuns to it, which is what every shared-PVC pattern actually wants.
+#
+# Symptom this avoids: generate-sbom TaskRun stuck Pending with
+#   FailedScheduling: didn't match pod affinity rules
+# even on a single-node kind cluster. Caught by the sbom-pkg-smoke
+# assertion after PR #86's single-PVC + subPath workspace fix.
+#
+# Applies cluster-wide (CI kind, EC2 k3s dev, Sepia OpenShift); behaviour
+# is correct in all three.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: feature-flags
+  namespace: tekton-pipelines
+data:
+  coschedule: pipelineruns

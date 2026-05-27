@@ -19,3 +19,13 @@ kind: Kustomization
 # end-to-end testing on a real k3s cluster, May 2026.
 resources:
   - https://storage.googleapis.com/tekton-releases/pipeline/previous/v1.6.0/release.yaml
+
+# Merge feature-flags overrides on top of the upstream ConfigMap. See
+# feature-flags.yaml for the rationale (coschedule mode fix for
+# multi-workspace shared-PVC pipelines).
+patches:
+  - path: feature-flags.yaml
+    target:
+      kind: ConfigMap
+      name: feature-flags
+      namespace: tekton-pipelines
