@@ -407,12 +407,16 @@ spec:
         # sbom-ARTIFACT_OUTPUTS object Result — Chains-valid byproduct
         # descriptor for the rollup SBOM. Shape Chains 0.26 accepts:
         # `{uri, digest, isBuildArtifact}` — no mediaType, no nested
-        # sbom block. Object Results are written one key per line as
-        # `<key>=<value>` in busybox-friendly form.
+        # sbom block. Tekton parses object Results as JSON (not
+        # key=value), and surfaces a TaskRunValidationFailed if the
+        # declared `type: object` doesn't match the file contents.
+        # Matches the same emit pattern as tasks/vuln-scan and
+        # pipelines/chains-smoke-test (single-line JSON, printf-built
+        # so we don't need jq in the busybox-flavoured tools image).
         ROLLUP_URL="${SBOM_URL_PREFIX}/sbom.cdx.json"
-        printf 'uri=%s\n'             "${ROLLUP_URL}" >  "$(results.sbom-ARTIFACT_OUTPUTS.path)"
-        printf 'digest=%s\n'          "${ROLLUP_SHA}" >> "$(results.sbom-ARTIFACT_OUTPUTS.path)"
-        printf 'isBuildArtifact=%s\n' "false"         >> "$(results.sbom-ARTIFACT_OUTPUTS.path)"
+        printf '{"uri":"%s","digest":"%s","isBuildArtifact":"%s"}' \
+          "${ROLLUP_URL}" "${ROLLUP_SHA}" "false" \
+          > "$(results.sbom-ARTIFACT_OUTPUTS.path)"
 
         echo "[emit] IMAGES:"
         cat "${IMAGES_FILE}"
