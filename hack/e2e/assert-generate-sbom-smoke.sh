@@ -145,10 +145,12 @@ if [[ -z "${SBOM_NAMES}" ]]; then
   exit 1
 fi
 
-# Pull each one out and round-trip it through `syft scan sbom:`.
-# `sbom:` is syft's input scheme for reading an existing SBOM file
-# (cyclonedx-json is an OUTPUT format, not an input source — passing
-# it as a scheme makes syft try to resolve it as a container source).
+# Pull each one out and round-trip it through `syft convert`.
+# `syft scan` produces an SBOM from a SOURCE (image/dir/archive) — it
+# has no input scheme that reads an existing SBOM file. The subcommand
+# that parses an SBOM and re-renders it in another format is
+# `syft convert <file> -o <format>`. Round-tripping our CycloneDX
+# output through `convert` validates the format end-to-end.
 SBOM_DIR="${E2E_ARTIFACTS}/sboms"
 mkdir -p "${SBOM_DIR}"
 FAIL=0
@@ -159,7 +161,7 @@ for path in ${SBOM_NAMES}; do
   size="$(wc -c <"${local_path}")"
   log::info "extracted ${base} (${size} bytes)"
 
-  if syft scan "sbom:${local_path}" -o table >/dev/null 2>"${SBOM_DIR}/${base}.syft.err"; then
+  if syft convert "${local_path}" -o table >/dev/null 2>"${SBOM_DIR}/${base}.syft.err"; then
     log::pass "syft round-trips ${base}"
   else
     log::fail "syft refused ${base} — see ${SBOM_DIR}/${base}.syft.err"
