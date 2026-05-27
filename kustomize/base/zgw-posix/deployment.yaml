@@ -1,7 +1,9 @@
 # Single-replica Deployment running zgw-posix — Ceph RGW with the
-# experimental POSIX backend driver. Listens on container port 8000;
-# the sibling Service maps :80 to :8000 so in-cluster consumers can
-# hit it at `http://zgw-posix.zgw-posix.svc.cluster.local`.
+# experimental POSIX backend driver. Listens on container port 7480
+# (RGW's beast frontend default; the upstream zgw-posix repo's
+# OpenShift example at examples/openshift/zgw-posix.yaml uses the
+# same); the sibling Service maps :80 to :7480 so in-cluster
+# consumers can hit it at `http://zgw-posix.zgw-posix.svc.cluster.local`.
 #
 # Why Deployment and not StatefulSet, given there's a PVC attached:
 #   replicas: 1, RWO access mode, no headless-service / per-pod-DNS
@@ -61,7 +63,7 @@ spec:
           imagePullPolicy: IfNotPresent
           ports:
             - name: s3
-              containerPort: 8000
+              containerPort: 7480
               protocol: TCP
           envFrom:
             - secretRef:
