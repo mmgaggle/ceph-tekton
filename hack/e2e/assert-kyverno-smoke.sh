@@ -53,7 +53,14 @@ if ! kube_ctx get clusterpolicy verify-ceph-image-signatures-dev >/dev/null 2>&1
 fi
 
 # Apply the pipeline (which creates the kyverno-smoke namespace + SA).
-kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/kyverno-smoke-test.yaml" >/dev/null
+# `-n "${NS}"` is required for the Task and Pipeline resources, which
+# don't pin a namespace in the manifest; without it they land in the
+# kubectl context's current namespace (default) while `tkn pipeline
+# start` below looks in `${NS}` (kyverno-smoke) and fails with
+# "Pipeline name kyverno-smoke-test does not exist". The Namespace +
+# SA + Role + RoleBinding already pin `kyverno-smoke` in their
+# metadata so the `-n` here is a no-op for them.
+kube_ctx -n "${NS}" apply -f "${E2E_REPO_ROOT}/pipelines/kyverno-smoke-test.yaml" >/dev/null
 
 # The pipeline itself decides pass/fail in the try-pod-admit Task.
 # If E2E_KYVERNO_STRICT_ADMIT=false we let the admit-signed-ceph half

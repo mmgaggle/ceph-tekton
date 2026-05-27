@@ -161,5 +161,9 @@ spec:
                     # in phase 3, point `roots:` at the TUF mirror.
                     rekor:
                       url: https://rekor.sigstore.dev
-                    ctlog:
-                      url: https://ctfe.sigstore.dev/2022
+                    # ctlog is sourced from the Sigstore TUF root in
+                    # Kyverno v1.13+; the explicit `ctlog.url` field
+                    # was removed from the keyless schema and the
+                    # webhook rejects manifests carrying it. Default
+                    # behaviour (use TUF-rooted public-good ctlog
+                    # keys) is what this policy wants anyway.

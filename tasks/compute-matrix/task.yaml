@@ -177,15 +177,24 @@ spec:
           # and fail the Task (vs. silently emitting an empty array
           # that would make the downstream `matrix:` fan-out resolve
           # to zero cells, which is much worse than a fail-loud).
+          # mikefarah/yq 4.40.7 has three parser limitations we ran into:
+          #   1. `tostring` as a pipeline value (in `(.x | tostring)`
+          #      or as RHS of `.x |= tostring`) — parser bails.
+          #   2. Bare-identifier shorthand `{distro}` (jq's
+          #      `{distro: .distro}` sugar) — parser bails on bare key.
+          #   3. `"\(.x)"` string interpolation — not interpreted;
+          #      passes through as a literal `\(.x)` in the output.
+          # Net effect: there's no clean in-yq way to coerce YAML bool
+          # → JSON string. So we let yq emit the bool as-is and
+          # post-process the JSON with sed. The regex is narrow (gating
+          # field, exact true/false token), and both bool inputs only
+          # come from the YAML schema we control.
           MATRIX_JSON="$(
             yq -o=json -I=0 '
-              .cells
-              | map({
-                  "distro": .distro,
-                  "arch":   .arch,
-                  "gating": (.gating | tostring)
-                })
-            ' "${MATRIX_PATH}"
+              .cells | map({"distro": .distro, "arch": .arch, "gating": .gating})
+            ' "${MATRIX_PATH}" \
+            | sed -e 's/"gating": *true/"gating": "true"/g' \
+                  -e 's/"gating": *false/"gating": "false"/g'
           )"
 
           case "${MATRIX_JSON}" in

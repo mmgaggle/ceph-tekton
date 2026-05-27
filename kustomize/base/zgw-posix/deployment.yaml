@@ -1,7 +1,9 @@
 # Single-replica Deployment running zgw-posix — Ceph RGW with the
-# experimental POSIX backend driver. Listens on container port 8000;
-# the sibling Service maps :80 to :8000 so in-cluster consumers can
-# hit it at `http://zgw-posix.zgw-posix.svc.cluster.local`.
+# experimental POSIX backend driver. Listens on container port 7480
+# (RGW's beast frontend default; the upstream zgw-posix repo's
+# OpenShift example at examples/openshift/zgw-posix.yaml uses the
+# same); the sibling Service maps :80 to :7480 so in-cluster
+# consumers can hit it at `http://zgw-posix.zgw-posix.svc.cluster.local`.
 #
 # Why Deployment and not StatefulSet, given there's a PVC attached:
 #   replicas: 1, RWO access mode, no headless-service / per-pod-DNS
@@ -61,7 +63,7 @@ spec:
           imagePullPolicy: IfNotPresent
           ports:
             - name: s3
-              containerPort: 8000
+              containerPort: 7480
               protocol: TCP
           envFrom:
             - secretRef:
@@ -76,6 +78,23 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/ceph/zgw
+          # Probes bumped after CI on PR #86 caught a first-start
+          # crashloop: the e2e runner takes ~40s just to pull the
+          # 618MB zgw-posix image, then the container has another
+          # 30s before the liveness probe starts killing it. Cold
+          # path on a fresh PVC needs more headroom than the
+          # warm-restart case the original timing assumed.
+          #
+          # Startup probe handles the cold-start window (up to 5 min:
+          # 30 attempts × 10s). Once it passes, liveness takes over
+          # at the original 30s/10s/3 cadence.
+          startupProbe:
+            tcpSocket:
+              port: s3
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 30
           readinessProbe:
             tcpSocket:
               port: s3
@@ -86,9 +105,6 @@ spec:
           livenessProbe:
             tcpSocket:
               port: s3
-            # 30s grace before the kubelet decides we're dead. zgw-posix
-            # parses its on-disk layout at startup; on a re-rolled Pod
-            # with existing data this can take a beat.
             initialDelaySeconds: 30
             periodSeconds: 10
             timeoutSeconds: 3

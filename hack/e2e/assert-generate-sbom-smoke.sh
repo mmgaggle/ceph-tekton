@@ -52,10 +52,19 @@ require_cmd syft    "brew install syft"
 kube_ctx apply -f "${E2E_REPO_ROOT}/tasks/generate-sbom/task.yaml" >/dev/null
 kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/sbom-pkg-smoke-test.yaml" >/dev/null
 
-# Use a NAMED PVC for the sboms workspace so we can re-mount it in a
-# follow-up debug Pod and read the SBOM bytes out. The artifacts
-# workspace can stay an emptyDir — it's only consumed within the
-# PipelineRun and we don't need its bytes after the fact.
+# Use a SINGLE NAMED PVC for both workspaces, mounted via subPath. Two
+# constraints collide otherwise:
+#   1. The `artifacts` workspace must flow data between TaskRuns (seed
+#      writes .tar files; generate-sbom reads them). An emptyDir-bound
+#      workspace can't do this — each TaskRun pod gets its own
+#      emptyDir, so seed's files vanish before generate-sbom looks.
+#   2. Binding `artifacts` and `sboms` to *two different* named PVCs
+#      makes Tekton's affinity-assistant bail with "more than one
+#      PersistentVolumeClaim is bound": it pins TaskRuns to one node
+#      via one anchor PVC and can't reconcile two.
+# One PVC + subPath sidesteps both — the underlying volume is shared
+# but the workspaces see distinct directories. The exfil Pod below
+# mounts the same PVC and reads /sboms/*.cdx.json out.
 PVC_NAME="e2e-sbom-pvc-$(date +%s)"
 kube_ctx -n "${NS}" apply -f - <<EOF >/dev/null
 apiVersion: v1
@@ -75,8 +84,8 @@ cleanup_pvc() {
 trap cleanup_pvc EXIT
 
 PR="$(start_pipelinerun "${NS}" sbom-pkg-smoke-test \
-        --workspace=name=artifacts,emptyDir="" \
-        --workspace=name=sboms,claimName="${PVC_NAME}")"
+        --workspace=name=artifacts,claimName="${PVC_NAME}",subPath=artifacts \
+        --workspace=name=sboms,claimName="${PVC_NAME}",subPath=sboms)"
 log::info "started PipelineRun: ${NS}/${PR}"
 
 wait_pipelinerun_succeeded "${NS}" "${PR}" \
@@ -111,6 +120,13 @@ spec:
       volumeMounts:
         - name: sboms
           mountPath: /sboms
+          # The PVC carries both artifacts and sboms subdirs (Tekton
+          # subPath-mapped each workspace into its own dir). Mount
+          # only the sboms half here so existing /sboms/*.cdx.json
+          # paths still resolve. (Avoid backticks in this comment —
+          # the surrounding heredoc is unquoted, so bash would treat
+          # them as command substitution.)
+          subPath: sboms
   volumes:
     - name: sboms
       persistentVolumeClaim:
@@ -129,7 +145,12 @@ if [[ -z "${SBOM_NAMES}" ]]; then
   exit 1
 fi
 
-# Pull each one out and round-trip it through `syft scan cyclonedx-json:`.
+# Pull each one out and round-trip it through `syft convert`.
+# `syft scan` produces an SBOM from a SOURCE (image/dir/archive) — it
+# has no input scheme that reads an existing SBOM file. The subcommand
+# that parses an SBOM and re-renders it in another format is
+# `syft convert <file> -o <format>`. Round-tripping our CycloneDX
+# output through `convert` validates the format end-to-end.
 SBOM_DIR="${E2E_ARTIFACTS}/sboms"
 mkdir -p "${SBOM_DIR}"
 FAIL=0
@@ -140,7 +161,7 @@ for path in ${SBOM_NAMES}; do
   size="$(wc -c <"${local_path}")"
   log::info "extracted ${base} (${size} bytes)"
 
-  if syft scan "cyclonedx-json:${local_path}" -o table >/dev/null 2>"${SBOM_DIR}/${base}.syft.err"; then
+  if syft convert "${local_path}" -o table >/dev/null 2>"${SBOM_DIR}/${base}.syft.err"; then
     log::pass "syft round-trips ${base}"
   else
     log::fail "syft refused ${base} — see ${SBOM_DIR}/${base}.syft.err"

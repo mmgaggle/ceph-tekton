@@ -1,20 +1,15 @@
 # PVC backing the POSIX filesystem the zgw-posix RGW driver writes
-# objects into. On kind, the local-path-provisioner ships preconfigured
-# and the `local-path` StorageClass is the default — so 10Gi is a
-# hostPath dir under the kind node's container filesystem. That dir
-# dies with the kind cluster; reclaimPolicy on the PV itself is
-# Retain-vs-Delete handled by local-path-provisioner, but for a kind
-# cluster destroyed wholesale by `make dev-down` it's moot.
+# objects into. Bound by whatever default StorageClass the cluster
+# has — kind 0.24+ ships it as `standard` (backed by the
+# local-path-provisioner), older kind builds shipped it as
+# `local-path`, OpenShift typically has its own. Don't pin a
+# specific name here; downstream overlays can strategic-merge a
+# storageClassName if they need to target a non-default SC.
 #
 # Size: 10Gi covers the dev case comfortably — the Ceph artifact set
 # in the dev terraform env is small ( < 100MB of test objects across
 # the four buckets), and zgw-posix's POSIX layout doesn't multiply
 # the overhead the way bluestore would on a real RGW.
-#
-# StorageClass: a downstream overlay (e.g. a non-kind cluster that
-# doesn't ship local-path) can patch this to a different StorageClass
-# with strategic-merge. Don't burn an environment-specific choice
-# into the base.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -26,7 +21,6 @@ metadata:
 spec:
   accessModes:
     - ReadWriteOnce
-  storageClassName: local-path
   resources:
     requests:
       storage: 10Gi

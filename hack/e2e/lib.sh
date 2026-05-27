@@ -163,7 +163,16 @@ start_pipelinerun() {
   # `tkn pipeline start --output=name` prints just `pipelinerun.tekton.dev/<name>`
   # to stdout — the form `kubectl wait` expects. Trim to bare name so
   # downstream callers can also use bare-name jsonpath queries.
-  pr="$(tkn_ctx pipeline start "${pipeline}" -n "${ns}" --output=name "$@")"
+  #
+  # `--use-param-defaults` is required in non-interactive contexts: tkn
+  # 0.39 still prompts for every param without an explicit `-p value=...`
+  # flag, even when the Pipeline declares a default for it. In CI stdin
+  # is closed; the prompt fails with "Error: EOF" and tkn emits its
+  # half-rendered prompt text to stdout, which the caller then captures
+  # as the "PipelineRun name". The flag tells tkn to silently use each
+  # param's declared default for anything the caller didn't override.
+  pr="$(tkn_ctx pipeline start "${pipeline}" -n "${ns}" \
+        --output=name --use-param-defaults "$@")"
   pr="${pr##*/}"
   printf '%s\n' "${pr}"
 }
@@ -212,11 +221,24 @@ decode_attestation() {
   log::info "decoded attestation to ${outfile} ($(wc -c <"${outfile}") bytes)"
 }
 
-# decode_signature NAMESPACE TASKRUN OUTFILE
+# decode_envelope NAMESPACE TASKRUN OUTFILE
 #
-# Same as decode_attestation but pulls the signature blob (which lives
-# in a sibling annotation, signature-taskrun-<uid>).
-decode_signature() {
+# Chains 0.26's `chains.tekton.dev/signature-taskrun-<uid>` annotation
+# stores a base64-encoded DSSE envelope JSON:
+#
+#   { "payloadType": "application/vnd.in-toto+json",
+#     "payload":     "<base64 of in-toto Statement>",
+#     "signatures":  [ { "keyid": "...", "sig": "<base64 DER ECDSA>" } ] }
+#
+# The envelope itself is what `cosign verify-blob-attestation` expects
+# as its `--signature` argument — that command handles the DSSE PAE
+# reconstruction and the DER-vs-IEEE-P1363 quirk internally. Earlier
+# iterations of this helper tried to extract the raw signature for
+# `cosign verify-blob`; that path is fundamentally wrong for DSSE
+# (raw-sig verification skips the PAE, so the signature never matches
+# the payload bytes) and is replaced by the verify-blob-attestation
+# helper below.
+decode_envelope() {
   local ns="$1" tr="$2" outfile="$3"
   local ann_key
   ann_key="$(kube_ctx -n "${ns}" get taskrun "${tr}" -o json \
@@ -229,7 +251,7 @@ decode_signature() {
   kube_ctx -n "${ns}" get taskrun "${tr}" -o json \
     | jq -r --arg k "${ann_key}" '.metadata.annotations[$k]' \
     | base64 -d > "${outfile}"
-  log::info "decoded signature to ${outfile} ($(wc -c <"${outfile}") bytes)"
+  log::info "decoded DSSE envelope to ${outfile} ($(wc -c <"${outfile}") bytes)"
 }
 
 # fetch_cosign_pub OUTFILE
@@ -253,20 +275,38 @@ fetch_cosign_pub() {
 # Wraps `cosign verify-blob`. Returns 0 if cosign reports Verified OK.
 # Captures cosign's output to ${E2E_ARTIFACTS}/cosign-verify-blob.txt
 # so a CI failure has the full message to read.
-cosign_verify_blob() {
-  local keyfile="$1" sigfile="$2" payloadfile="$3"
-  local out="${E2E_ARTIFACTS}/cosign-verify-blob-$$.txt"
-  log::info "cosign verify-blob (key=${keyfile##*/} sig=${sigfile##*/} payload=${payloadfile##*/})"
-  if cosign verify-blob \
+cosign_verify_envelope() {
+  local keyfile="$1" envelopefile="$2" payloadfile="$3"
+  local out="${E2E_ARTIFACTS}/cosign-verify-blob-attestation-$$.txt"
+  log::info "cosign verify-blob-attestation (key=${keyfile##*/} envelope=${envelopefile##*/})"
+  # --check-claims=false: skip the "envelope's subject digest equals the
+  # supplied blob's hash" check. The assert harness already verifies the
+  # subject digest in a prior step against the TaskRun's IMAGE_DIGEST
+  # Result; here we only need cosign to verify the DSSE signature is
+  # valid for the supplied public key. The positional blob argument is
+  # still required by the CLI but its content is unused with
+  # --check-claims=false; pass payloadfile so the path is unambiguous.
+  # --insecure-ignore-tlog: dev Chains doesn't push to the public Rekor;
+  # the rekor_search helper below verifies Rekor presence independently
+  # when the cluster's transparency: rekor option is enabled.
+  # `--type slsaprovenance1` (cosign's alias for SLSA Provenance v1.0,
+  # predicateType `https://slsa.dev/provenance/v1`). The unsuffixed
+  # `slsaprovenance` alias is SLSA v0.2; passing it against a v1 payload
+  # makes cosign reject with `invalid predicate type, expected
+  # slsaprovenance got https://slsa.dev/provenance/v1`. Chains 0.26's
+  # slsa/v2alpha4 formatter emits v1, hence v1 here.
+  if cosign verify-blob-attestation \
       --key "${keyfile}" \
-      --signature "${sigfile}" \
+      --signature "${envelopefile}" \
+      --type slsaprovenance1 \
+      --check-claims=false \
       --insecure-ignore-tlog \
       "${payloadfile}" >"${out}" 2>&1; then
-    log::pass "cosign verify-blob OK"
+    log::pass "cosign verify-blob-attestation OK"
     return 0
   fi
-  log::fail "cosign verify-blob FAILED — see ${out}"
-  cp -f "${out}" "${E2E_ARTIFACTS}/cosign-verify-blob-fail.txt" 2>/dev/null || true
+  log::fail "cosign verify-blob-attestation FAILED — see ${out}"
+  cp -f "${out}" "${E2E_ARTIFACTS}/cosign-verify-blob-attestation-fail.txt" 2>/dev/null || true
   cat "${out}" >&2
   return 1
 }
@@ -285,16 +325,22 @@ rekor_search() {
   local keyfile="$1"
   local out="${E2E_ARTIFACTS}/rekor-search.txt"
   local attempt
+  # rekor-cli ≥ 1.3 switched its `search` output from integer log indexes
+  # (one numeric line per match) to a header `Found matching entries
+  # (listed by UUID):` followed by ≥40-hex-char UUIDs. Accept either form
+  # so the helper survives the format change.
   for attempt in 1 2 3; do
     log::info "rekor-cli search (attempt ${attempt}/3)"
     if rekor-cli search \
         --public-key="${keyfile}" \
         --pki-format=x509 >"${out}" 2>&1; then
-      if grep -Eq '^[0-9]+$' "${out}"; then
-        log::pass "rekor search returned $(grep -Ec '^[0-9]+$' "${out}") log index(es)"
+      local hits
+      hits=$(grep -Ec '^([0-9]+|[0-9a-f]{40,})$' "${out}" || true)
+      if [[ "${hits}" -gt 0 ]]; then
+        log::pass "rekor search returned ${hits} entry(ies)"
         return 0
       fi
-      log::warn "rekor search returned no log indexes; output:"
+      log::warn "rekor search returned no log indexes or UUIDs; output:"
       cat "${out}" >&2
     fi
     sleep $(( attempt * 5 ))

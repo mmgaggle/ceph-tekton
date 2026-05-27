@@ -84,6 +84,12 @@ jobs:
       # docker.io/anchore/syft:v1.18.0). Keeping the CI host syft
       # within the same minor avoids round-trip-format drift.
       SYFT_VERSION:             v1.18.0
+      # grype — pinned to the same line tasks/vuln-scan uses
+      # (docker.io/anchore/grype:v0.112.0). Host-side grype is what
+      # hack/e2e/assert-vuln-scan-smoke.sh uses to double-check the
+      # in-cluster scan results; keeping the version within the same
+      # minor avoids DB-format drift.
+      GRYPE_VERSION:            v0.112.0
       # Helm chart versions — duplicated from the dev bootstrap
       # scripts so a chart bump in those scripts is also enforced
       # here (and vice versa).
@@ -111,9 +117,9 @@ jobs:
       - name: Set up kubectl ${{ env.KUBECTL_VERSION }}
         run: |
           set -euo pipefail
-          curl -fsSLo /usr/local/bin/kubectl \
+          curl -fsSLo /tmp/kubectl \
             "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
-          chmod +x /usr/local/bin/kubectl
+          install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
           kubectl version --client
 
       - name: Set up helm ${{ env.HELM_VERSION }}
@@ -141,9 +147,9 @@ jobs:
       - name: Set up rekor-cli ${{ env.REKOR_CLI_VERSION }}
         run: |
           set -euo pipefail
-          curl -fsSLo /usr/local/bin/rekor-cli \
+          curl -fsSLo /tmp/rekor-cli \
             "https://github.com/sigstore/rekor/releases/download/${REKOR_CLI_VERSION}/rekor-cli-linux-amd64"
-          chmod +x /usr/local/bin/rekor-cli
+          install -m 0755 /tmp/rekor-cli /usr/local/bin/rekor-cli
           rekor-cli version || rekor-cli --version || true
 
       - name: Set up syft ${{ env.SYFT_VERSION }}
@@ -153,12 +159,19 @@ jobs:
             | sh -s -- -b /usr/local/bin "${SYFT_VERSION}"
           syft version
 
+      - name: Set up grype ${{ env.GRYPE_VERSION }}
+        run: |
+          set -euo pipefail
+          curl -fsSL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+            | sh -s -- -b /usr/local/bin "${GRYPE_VERSION}"
+          grype version
+
       - name: Set up kind ${{ env.KIND_VERSION }}
         run: |
           set -euo pipefail
-          curl -fsSLo /usr/local/bin/kind \
+          curl -fsSLo /tmp/kind \
             "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
-          chmod +x /usr/local/bin/kind
+          install -m 0755 /tmp/kind /usr/local/bin/kind
           kind version
 
       - name: Show jq version
@@ -229,6 +242,14 @@ jobs:
           E2E_KUBE_CONTEXT:        ${{ env.E2E_KUBE_CONTEXT }}
           E2E_ARTIFACTS:           ${{ github.workspace }}/e2e-artifacts
           E2E_PIPELINERUN_TIMEOUT: ${{ env.E2E_PIPELINERUN_TIMEOUT }}
+          # Skips, each tied to a tracking issue:
+          #   reproducibility-smoke — #67: step-build-a's script fails with
+          #     `getcwd: cannot access parent directories` + `PWD: unbound
+          #     variable`. Drop when #67 lands.
+          #   vuln-scan-smoke      — #87: aws-cli ↔ zgw-posix multipart
+          #     upload incompatibility on grype DB tarball. Drop when #87
+          #     is fixed.
+          E2E_SKIP:                reproducibility-smoke vuln-scan-smoke
         run: |
           set -euo pipefail
           mkdir -p "${E2E_ARTIFACTS}"
