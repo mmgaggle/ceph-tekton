@@ -40,12 +40,32 @@ require_cmd jq      "brew install jq"
 kube_ctx apply -f "${E2E_REPO_ROOT}/tasks/compute-matrix/task.yaml" >/dev/null
 kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/compute-matrix-smoke-test.yaml" >/dev/null
 
-# Source workspace is emptyDir — the seed Task writes matrix.yaml into
-# it inside the PipelineRun and compute-matrix reads from it. No PVC
-# bytes to extract afterwards; everything we care about is on the
-# TaskRun's Result surface.
+# Source workspace must be a PVC — Tekton gives each TaskRun pod its
+# own emptyDir, so the seed Task's matrix.yaml vanishes before the
+# compute-matrix Task can read it. Without this the matrix step quietly
+# falls back to the "documented default matrix" (centos10 + ubuntu-noble
+# x amd64/arm64, 4 cells) and the assert step rejects the cell count.
+# No bytes to extract after the PipelineRun completes; cleanup is just
+# the PVC delete in the trap.
+SRC_PVC_NAME="e2e-matrix-source-pvc-$(date +%s)"
+kube_ctx -n "${NS}" apply -f - <<EOF >/dev/null
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${SRC_PVC_NAME}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 100Mi
+EOF
+cleanup_src_pvc() {
+  kube_ctx -n "${NS}" delete pvc "${SRC_PVC_NAME}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+}
+trap cleanup_src_pvc EXIT
+
 PR="$(start_pipelinerun "${NS}" compute-matrix-smoke-test \
-        --workspace=name=source,emptyDir="")"
+        --workspace=name=source,claimName="${SRC_PVC_NAME}")"
 log::info "started PipelineRun: ${NS}/${PR}"
 
 wait_pipelinerun_succeeded "${NS}" "${PR}" \
