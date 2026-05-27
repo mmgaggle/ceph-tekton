@@ -189,7 +189,7 @@ spec:
           # mikefarah/yq 4.x.
           MATRIX_JSON="$(
             yq -o=json -I=0 '
-              .cells | map({distro: .distro, arch: .arch, gating: "\(.gating)"})
+              .cells | map({"distro": .distro, "arch": .arch, "gating": "\(.gating)"})
             ' "${MATRIX_PATH}"
           )"
 
