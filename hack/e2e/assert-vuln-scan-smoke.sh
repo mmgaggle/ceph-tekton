@@ -258,15 +258,25 @@ aws "${AWS_ARGS[@]}" s3api put-bucket-policy \
 rm -f "${POLICY_FILE}"
 
 log::info "uploading producer artefacts to s3://${BUCKET}/${S3_PREFIX}/"
-aws "${AWS_ARGS[@]}" s3 cp "${TARBALL}" \
-  "s3://${BUCKET}/${S3_PREFIX}/vulnerability.db.tar.zst"             >/dev/null
-aws "${AWS_ARGS[@]}" s3 cp "${BUNDLE}"  \
-  "s3://${BUCKET}/${S3_PREFIX}/vulnerability.db.tar.zst.cosign.bundle" >/dev/null
-aws "${AWS_ARGS[@]}" s3 cp "${PUBKEY}"  \
-  "s3://${BUCKET}/${S3_PREFIX}/cosign.pub"                            >/dev/null
-aws "${AWS_ARGS[@]}" s3 cp "${LATEST}"  \
-  "s3://${BUCKET}/${LATEST_KEY}" \
-  --content-type application/json                                    >/dev/null
+# Why s3api put-object and not s3 cp: zgw-posix's POSIX driver mints
+# the trailing dot-segment of the key as the multipart UploadId (so
+# `vulnerability.db.tar.zst` → UploadId=`zst`) and every UploadPart
+# against the bogus id 404s. aws s3 cp auto-switches to multipart at
+# 8 MiB, which is well below the tarball size. put-object forces a
+# single PUT (good to 5 GiB), sidestepping the bug entirely. Track:
+# https://github.com/mmgaggle/ceph-tekton/issues/87
+aws "${AWS_ARGS[@]}" s3api put-object \
+  --bucket "${BUCKET}" --key "${S3_PREFIX}/vulnerability.db.tar.zst" \
+  --body "${TARBALL}" >/dev/null
+aws "${AWS_ARGS[@]}" s3api put-object \
+  --bucket "${BUCKET}" --key "${S3_PREFIX}/vulnerability.db.tar.zst.cosign.bundle" \
+  --body "${BUNDLE}" >/dev/null
+aws "${AWS_ARGS[@]}" s3api put-object \
+  --bucket "${BUCKET}" --key "${S3_PREFIX}/cosign.pub" \
+  --body "${PUBKEY}" >/dev/null
+aws "${AWS_ARGS[@]}" s3api put-object \
+  --bucket "${BUCKET}" --key "${LATEST_KEY}" \
+  --body "${LATEST}" --content-type application/json >/dev/null
 log::info "published 4 objects (3 under ${S3_PREFIX}/, 1 latest.json pointer)"
 
 # The URL the IN-CLUSTER vuln-scan Task hits. Path-style S3 URL
