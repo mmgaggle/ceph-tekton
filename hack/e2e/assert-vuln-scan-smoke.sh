@@ -183,6 +183,12 @@ fi
 
 PF_LOG="$(mktemp)"
 PF_PID=""
+# PVC backing the `sboms` workspace. Must be a PVC (not emptyDir) so
+# the seed Task's log4j-shell.cdx.json reaches the vuln-scan Task's
+# pod — emptyDir is per-Pod in Tekton, so seed's files vanish before
+# vuln-scan looks. Same constraint and reasoning as
+# assert-generate-sbom-smoke.sh and assert-compute-matrix-smoke.sh.
+PVC_NAME="e2e-vuln-scan-pvc-$(date +%s)"
 
 cleanup() {
   # Best-effort: tear down the bucket so re-runs don't accumulate.
@@ -198,6 +204,11 @@ cleanup() {
     kill "${PF_PID}" 2>/dev/null || true
     wait "${PF_PID}" 2>/dev/null || true
   fi
+  # Drop the per-run PVC. --wait=false because PV reclaim can hang
+  # behind a still-mounted Pod when the test fails mid-flight; the
+  # kind cluster is torn down anyway.
+  kube_ctx -n "${NS}" delete pvc "${PVC_NAME}" \
+    --ignore-not-found --wait=false >/dev/null 2>&1 || true
   rm -f "${PF_LOG}"
 }
 trap cleanup EXIT
@@ -293,12 +304,26 @@ kube_ctx apply -f "${E2E_REPO_ROOT}/tasks/vuln-scan/task.yaml"             >/dev
 kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/vuln-scan-smoke-test.yaml"   >/dev/null
 
 # ---------------------------------------------------------------------
-# Run the smoke pipeline
+# Provision the shared workspace PVC, then run the smoke pipeline.
+# Sized for the unpacked grype DB (~1.6 GiB observed) + the .tar.zst
+# (~180 MiB) + the seed SBOM + findings.grype.json, with headroom.
 # ---------------------------------------------------------------------
+log::info "provisioning sboms workspace PVC ${PVC_NAME} (4Gi)"
+kube_ctx -n "${NS}" apply -f - <<EOF >/dev/null
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${PVC_NAME}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 4Gi
+EOF
 
 PR="$(start_pipelinerun "${NS}" vuln-scan-smoke-test \
         --param=db-pointer-url="${DB_POINTER_URL}" \
-        --workspace=name=sboms,emptyDir="")"
+        --workspace=name=sboms,claimName="${PVC_NAME}")"
 log::info "started PipelineRun: ${NS}/${PR}"
 
 wait_pipelinerun_succeeded "${NS}" "${PR}" \

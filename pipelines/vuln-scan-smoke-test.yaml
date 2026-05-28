@@ -389,8 +389,11 @@ spec:
       description: |
         Shared workspace where the seed Task drops the SBOM and the
         vuln-scan Task writes per-scan output + consolidated
-        `findings.grype.json`. emptyDir is fine for smoke; real
-        pipelines bind the build-output PVC from `generate-sbom`.
+        `findings.grype.json`. Must be a PVC (not emptyDir): in Tekton
+        each TaskRun gets its own Pod, and emptyDir Volumes are
+        Pod-scoped, so seed's SBOM would vanish before vuln-scan
+        looked. Real pipelines bind the build-output PVC from
+        `generate-sbom`; the smoke assert provisions a per-run PVC.
 
         The vuln-scan Task also fetches the producer DB tarball +
         bundle + pubkey into a `.grype-db/` subdirectory of this
