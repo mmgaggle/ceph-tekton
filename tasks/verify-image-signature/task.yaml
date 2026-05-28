@@ -1,0 +1,575 @@
+# verify-image-signature — in-pipeline cosign verify Task.
+#
+# Verifies that a container image (referenced BY DIGEST) carries a
+# trusted cosign signature. Two modes selected by which params are set:
+#
+#   * keyed   — cosign verify --key <pubkey>
+#               Pubkey is read from the `cosign-public-key` workspace
+#               (typically a Secret-backed projection of the same
+#               key-pair the `build-grype-db` Task signs with). Same
+#               long-lived-key-distribution posture; suitable for
+#               phase-1 where Sepia hasn't yet wired keyless Fulcio.
+#
+#   * keyless — cosign verify --certificate-identity <id>
+#                              --certificate-oidc-issuer <iss>
+#               No workspace required. Verifies that the signature was
+#               issued against a short-lived Fulcio certificate with
+#               the expected OIDC subject + issuer. This is the path
+#               Tekton Chains itself uses (#4 wired Chains keyless;
+#               #28 puts every attestation in Rekor; #62 is the
+#               keyless-signing Sepia overlay for build-grype-db).
+#
+# Mode is selected by which params are populated; the precheck step
+# rejects ambiguous combinations (both set, neither set, or keyless
+# missing the issuer).
+#
+# WHY ONE TASK INSTEAD OF TWO:
+#   A verify-only Task is much cheaper to support both modes in than a
+#   sign-only Task — cosign's `verify` command takes the same JSON
+#   output shape for both modes; the only difference is which flag set
+#   you pass. The mode branching is ~15 lines of shell in the verify
+#   step (vs duplicating the entire emit-results path across two
+#   Tasks). Keeping the consumer agnostic to producer mode means the
+#   Sepia keyless cutover doesn't require a Task-level rework.
+#
+# WHY HARD-FAIL ON VERIFY FAILURE (no warn mode):
+#   This is a security gate. A warn mode would let callers
+#   accidentally consume an unverified image while still seeing a
+#   Succeeded TaskRun (the gate-disabled-by-mistake failure mode). If
+#   a caller genuinely needs "best-effort verify", they should run the
+#   Task with a continue-on-error wrapper or use `cosign verify`
+#   directly in a script step — making the easy path the secure path
+#   is the explicit design choice.
+#
+# CHAINS-GRAMMAR RESULTS — INTENTIONALLY ABSENT:
+#   This Task CONSUMES a signed artifact; it does not produce a build
+#   artifact. Emitting `IMAGES` / `ARTIFACT_OUTPUTS` would cause Chains
+#   to attest THIS Task as if it produced the verified image, which
+#   would be a false provenance claim. The verified image's provenance
+#   already lives in the (already-verified) sigstore signature.
+#
+# WHY CHAINGUARD COSIGN-DEV AS THE DEFAULT IMAGE (not the sigstore
+# distroless pin used by attach-sbom + build-grype-db):
+#   This Task's verify step branches on MODE (keyed vs keyless) to
+#   pick a different cosign flag set at runtime. That requires a
+#   shell, which the canonical `ghcr.io/sigstore/cosign/cosign:v2.4.1`
+#   distroless image does not include. The sister sign-only Tasks
+#   (attach-sbom, build-grype-db) hard-code their cosign args via
+#   Tekton command/args substitution and so don't need a shell. The
+#   `cgr.dev/chainguard/cosign:latest-dev` image bundles cosign + a
+#   shell (busybox/bash) on a Wolfi base, with daily rebuilds for CVE
+#   currency. Same chainguard-dev posture issue #83 settled on for
+#   kubectl. The cosign-binary version inside chainguard's image
+#   tracks upstream cosign closely; we don't pin to a specific
+#   cosign version here (chainguard's `:latest-dev` is the contract).
+#
+# INVOCATION SHAPES:
+#
+#   Keyed:
+#     cosign verify \
+#       --key /workspace/cosign-public-key/cosign.pub \
+#       --insecure-ignore-tlog \                 # if ignore-tlog=true
+#       --allow-insecure-registry \              # if allow-http=true (dev only)
+#       --output json \
+#       quay.io/ceph/ceph@sha256:<digest>
+#
+#   Keyless:
+#     cosign verify \
+#       --certificate-identity 'https://github.com/.../release.yaml@refs/tags/v1' \
+#       --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+#       --rekor-url https://rekor.sigstore.dev \
+#       --output json \
+#       ghcr.io/sigstore/cosign/cosign@sha256:<digest>
+#
+# Single-resource file (no leading `---`) so PaC's remote-resolution
+# (`pipelinesascode.tekton.dev/task: verify-image-signature@URL`)
+# succeeds.
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: verify-image-signature
+spec:
+  description: |
+    Verify a container image (referenced by digest) carries a trusted
+    cosign signature. Supports both keyed (`--key`) and keyless
+    (`--certificate-identity` + `--certificate-oidc-issuer`) modes,
+    selected by which params are set.
+
+    Hard-fails on verify failure (no warn mode — this is a security
+    gate). Does NOT emit Chains-grammar Results: this Task consumes a
+    signed artifact, it does not produce a build artifact.
+  params:
+    - name: image
+      type: string
+      description: |
+        Container image reference, BY DIGEST. Example:
+        `quay.io/ceph/ceph@sha256:abc123...`. Tag-only references are
+        rejected — cosign verifies the signature against specific
+        image bytes, and a tag is a moving pointer the verifier
+        cannot pin.
+    - name: public-key
+      type: string
+      default: ""
+      description: |
+        Path to a cosign public key file. When non-empty, selects
+        KEYED mode (`cosign verify --key <path>`). Typically
+        `$(workspaces.cosign-public-key.path)/cosign.pub`, with the
+        workspace bound to a Secret containing the public half of the
+        keypair that signed the image. Mutually exclusive with
+        `certificate-identity` — the precheck step rejects setting
+        both.
+    - name: certificate-identity
+      type: string
+      default: ""
+      description: |
+        For KEYLESS mode: the expected signer identity URI. Example:
+        `https://github.com/sigstore/cosign/.github/workflows/release.yaml@refs/tags/v2.4.1`
+        for a GitHub Actions Fulcio identity, or a SPIFFE ID for a
+        cluster-internal keyless signer. When non-empty, selects
+        keyless mode and requires `certificate-oidc-issuer` to also
+        be set. Mutually exclusive with `public-key`.
+    - name: certificate-oidc-issuer
+      type: string
+      default: ""
+      description: |
+        For KEYLESS mode: the expected OIDC issuer URL. Examples:
+        `https://token.actions.githubusercontent.com` (GitHub
+        Actions), `https://accounts.google.com` (gcloud OIDC),
+        `https://oauth2.sigstore.dev/auth` (the public Sigstore OIDC
+        broker for interactive users). Required when
+        `certificate-identity` is set; ignored otherwise.
+    - name: rekor-url
+      type: string
+      default: "https://rekor.sigstore.dev"
+      description: |
+        Rekor transparency log endpoint. Default is the public
+        Sigstore Rekor instance. cosign verifies that the signature
+        is recorded in this Rekor instance unless `ignore-tlog=true`.
+        Override only when targeting a private Rekor (e.g., a future
+        in-Sepia transparency log).
+    - name: ignore-tlog
+      type: string
+      default: "false"
+      description: |
+        Opt-in escape hatch for offline / air-gapped environments.
+        When "true", cosign skips Rekor inclusion lookup (passes
+        `--insecure-ignore-tlog`). The precheck step logs a loud
+        warning so this is visible in CI logs. Production callers
+        SHOULD leave this "false"; the smoke test sets it "true"
+        because the in-cluster smoke uses an ephemeral cosign key
+        that was never recorded in any Rekor.
+    - name: allow-http
+      type: string
+      default: "false"
+      description: |
+        When "true", passes `--allow-insecure-registry` to cosign so
+        plaintext-HTTP registries (the in-cluster `registry:2`
+        smoke-test deployment) are accepted. Production callers MUST
+        leave this "false"; the smoke test sets it "true" because
+        the in-cluster registry:2 serves HTTP-only.
+    - name: cosign-image
+      type: string
+      default: cgr.dev/chainguard/cosign:latest-dev
+      description: |
+        Pinned cosign image. The `-dev` chainguard variant bundles
+        cosign + a shell (busybox) on a Wolfi base — needed because
+        this Task's verify step branches on mode (keyed vs keyless)
+        and constructs the cosign arg list at runtime. The sister
+        sign-only Tasks (attach-sbom, build-grype-db) hard-code
+        their cosign args and so use the distroless
+        `ghcr.io/sigstore/cosign/cosign:v2.4.1` pin instead. Same
+        chainguard-dev posture issue #83 settled on for kubectl.
+    - name: tools-image
+      type: string
+      default: docker.io/library/busybox:1.36
+      description: |
+        Pinned busybox image used by the precheck + emit-results
+        steps. Same pin as the rest of the cluster's smoke / utility
+        steps.
+  workspaces:
+    - name: cosign-public-key
+      description: |
+        Optional. In KEYED mode, expected to contain `cosign.pub`
+        (the public half of the keypair the producer signed the
+        image with). Typical binding: a Secret-backed workspace
+        projecting the `cosign.pub` of the producer's keypair (same
+        shape `attach-sbom` and `build-grype-db` expect for their
+        `cosign-key` workspaces). In KEYLESS mode this workspace is
+        unused.
+      optional: true
+    - name: verify-output
+      description: |
+        Optional. When mounted, the verify step writes its raw JSON
+        output to `cosign-verify.json` on this workspace, for
+        downstream Tasks / log capture. The Results carry the
+        canonical extracted fields; this is purely diagnostic.
+      optional: true
+      mountPath: /workspace/verify-output
+  results:
+    # ----------------------------------------------------------------
+    # `verified` — string "true" emitted IFF cosign verify exits 0.
+    #
+    # On verify failure the verify step exits non-zero and the
+    # emit-results step never runs, so the Result is ABSENT (not
+    # "false"). Downstream callers should gate on TaskRun status, not
+    # on this Result's value — the Result presence is a redundant
+    # signal that the gate fired.
+    # ----------------------------------------------------------------
+    - name: verified
+      type: string
+      description: |
+        Always the literal string "true" when present. Absent if
+        verification failed (the verify step's non-zero exit prevents
+        emit-results from running, so no Result file is written).
+    - name: subject-digest
+      type: string
+      description: |
+        sha256:<hex> digest of the verified image. Echoed from the
+        `image` param after extracting the digest portion. Lets
+        downstream Tasks reference the verified subject without
+        re-parsing the image param.
+    - name: certificate-identity
+      type: string
+      description: |
+        For keyless mode: the cert-identity that was verified against
+        (echoed from the `certificate-identity` param). Empty in
+        keyed mode. Lets downstream audit / dashboard consumers see
+        which identity signed without re-fetching the cosign output.
+    - name: signing-time
+      type: string
+      description: |
+        Rekor integratedTime, formatted as RFC 3339 UTC. Extracted
+        from cosign's verify output (the optional.Bundle.Payload
+        block). Empty when `ignore-tlog=true` (no Rekor inclusion
+        was checked).
+  steps:
+    # ----------------------------------------------------------------
+    # Step 1: precheck — validate params, extract subject-digest,
+    #                    pick mode, stash for downstream steps.
+    #
+    # Checks:
+    #   1. `image` is `<repo>@sha256:<64-hex>` (digest form). Tag-only
+    #      refs are racy and silently accepted by cosign verify, so we
+    #      catch them here with a clear error.
+    #   2. Exactly one of {public-key, certificate-identity} is set.
+    #     - Both set: ambiguous, refuse to guess intent.
+    #     - Neither set: nothing to verify against, hard fail.
+    #   3. If keyless, `certificate-oidc-issuer` is also set.
+    #   4. If keyed, the public-key file exists on the workspace
+    #      (catches the "forgot to mount the workspace" case with a
+    #      clear error rather than a cosign auth-failure stack trace).
+    #
+    # Extracts the subject digest from the image param and stashes it
+    # on /tekton/home, which is shared across this Task's steps. Same
+    # cross-step carrier pattern as build-grype-db (each step is a
+    # separate container; files on the shared /tekton/home are how
+    # state crosses).
+    # ----------------------------------------------------------------
+    - name: precheck
+      image: $(params.tools-image)
+      env:
+        - name: IMAGE
+          value: $(params.image)
+        - name: PUBLIC_KEY
+          value: $(params.public-key)
+        - name: CERT_IDENTITY
+          value: $(params.certificate-identity)
+        - name: CERT_OIDC_ISSUER
+          value: $(params.certificate-oidc-issuer)
+        - name: IGNORE_TLOG
+          value: $(params.ignore-tlog)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        # ---- image must be digest form ----
+        case "${IMAGE}" in
+          *@sha256:*) : ;;
+          *)
+            echo "[precheck] FATAL: image '${IMAGE}' is not a digest reference" >&2
+            echo "[precheck]        verify-image-signature requires <repo>@sha256:<hex>" >&2
+            echo "[precheck]        Tag-only refs are racy and rejected here." >&2
+            exit 1
+            ;;
+        esac
+
+        # Extract the digest portion. POSIX shell parameter expansion:
+        # ${IMAGE##*@} strips everything up to and including the last @.
+        SUBJECT_DIGEST="${IMAGE##*@}"
+        case "${SUBJECT_DIGEST}" in
+          sha256:*) : ;;
+          *)
+            echo "[precheck] FATAL: extracted digest '${SUBJECT_DIGEST}' is not sha256:..." >&2
+            exit 1
+            ;;
+        esac
+        # Validate digest hex length — 64 hex chars after sha256:.
+        HEX_PART="${SUBJECT_DIGEST#sha256:}"
+        HEX_LEN=$(printf '%s' "${HEX_PART}" | wc -c | tr -d ' ')
+        if [ "${HEX_LEN}" -ne 64 ]; then
+          echo "[precheck] FATAL: digest hex part is ${HEX_LEN} chars, expected 64" >&2
+          echo "[precheck]        got: ${SUBJECT_DIGEST}" >&2
+          exit 1
+        fi
+
+        # ---- mode selection ----
+        # Trailing-whitespace trim for params Tekton might normalise.
+        PK=$(printf '%s' "${PUBLIC_KEY}" | tr -d '[:space:]')
+        CI=$(printf '%s' "${CERT_IDENTITY}" | tr -d '[:space:]')
+        OI=$(printf '%s' "${CERT_OIDC_ISSUER}" | tr -d '[:space:]')
+
+        if [ -n "${PK}" ] && [ -n "${CI}" ]; then
+          echo "[precheck] FATAL: both 'public-key' and 'certificate-identity' are set" >&2
+          echo "[precheck]        Set exactly one to pick keyed or keyless mode." >&2
+          exit 1
+        fi
+        if [ -z "${PK}" ] && [ -z "${CI}" ]; then
+          echo "[precheck] FATAL: neither 'public-key' nor 'certificate-identity' is set" >&2
+          echo "[precheck]        Set 'public-key' for keyed mode, or" >&2
+          echo "[precheck]        'certificate-identity' + 'certificate-oidc-issuer' for keyless." >&2
+          exit 1
+        fi
+
+        if [ -n "${PK}" ]; then
+          MODE=keyed
+          if [ ! -f "${PUBLIC_KEY}" ]; then
+            echo "[precheck] FATAL: public-key file not found at '${PUBLIC_KEY}'" >&2
+            echo "[precheck]        Is the 'cosign-public-key' workspace mounted?" >&2
+            echo "[precheck]        Listing parent dir for diagnosis:" >&2
+            ls -la "$(dirname "${PUBLIC_KEY}")" >&2 2>/dev/null || true
+            exit 1
+          fi
+        else
+          MODE=keyless
+          if [ -z "${OI}" ]; then
+            echo "[precheck] FATAL: keyless mode requires 'certificate-oidc-issuer'" >&2
+            echo "[precheck]        (got certificate-identity='${CERT_IDENTITY}'" >&2
+            echo "[precheck]         but certificate-oidc-issuer is empty)" >&2
+            exit 1
+          fi
+        fi
+
+        # ---- ignore-tlog warning ----
+        if [ "${IGNORE_TLOG}" = "true" ]; then
+          echo "[precheck] WARN: ignore-tlog=true — skipping Rekor inclusion check."
+          echo "[precheck] WARN: This is an offline/dev escape hatch. Production"
+          echo "[precheck] WARN: callers SHOULD leave ignore-tlog=false."
+        fi
+
+        echo "[precheck] mode=${MODE}"
+        echo "[precheck] image=${IMAGE}"
+        echo "[precheck] subject-digest=${SUBJECT_DIGEST}"
+        [ "${MODE}" = "keyless" ] && echo "[precheck] cert-identity=${CERT_IDENTITY}"
+        [ "${MODE}" = "keyless" ] && echo "[precheck] cert-oidc-issuer=${CERT_OIDC_ISSUER}"
+
+        # Stash for verify + emit-results. /tekton/home is a per-TaskRun
+        # writable dir shared across this Task's steps (each step
+        # mounts it at the same path).
+        printf '%s' "${MODE}"           > /tekton/home/mode
+        printf '%s' "${SUBJECT_DIGEST}" > /tekton/home/subject-digest
+
+    # ----------------------------------------------------------------
+    # Step 2: verify — cosign verify on the chainguard cosign-dev
+    #                  image (which has a shell, unlike the sigstore
+    #                  distroless cosign image).
+    #
+    # Reads MODE from /tekton/home/mode (set by precheck) and
+    # constructs the cosign arg list at runtime. Writes JSON output
+    # to /tekton/home/cosign-verify.json for emit-results to parse.
+    #
+    # Hard-fails (non-zero exit) on any cosign verify failure: the
+    # default `set -e` plus the `if ! cosign ...` block surface both
+    # cosign's stderr (its diagnosis) and our own context.
+    # ----------------------------------------------------------------
+    - name: verify
+      image: $(params.cosign-image)
+      env:
+        - name: IMAGE
+          value: $(params.image)
+        - name: PUBLIC_KEY
+          value: $(params.public-key)
+        - name: CERT_IDENTITY
+          value: $(params.certificate-identity)
+        - name: CERT_OIDC_ISSUER
+          value: $(params.certificate-oidc-issuer)
+        - name: REKOR_URL
+          value: $(params.rekor-url)
+        - name: IGNORE_TLOG
+          value: $(params.ignore-tlog)
+        - name: ALLOW_HTTP
+          value: $(params.allow-http)
+        # Skip cosign's interactive Rekor-upload prompt (no-op for
+        # verify but cosign's prompt-machinery checks the var on
+        # every invocation).
+        - name: COSIGN_YES
+          value: "true"
+      script: |
+        #!/bin/sh
+        set -eu
+
+        MODE=$(cat /tekton/home/mode)
+        echo "[verify] mode=${MODE}"
+        echo "[verify] image=${IMAGE}"
+
+        # Build the arg list with the positional-param technique.
+        # Each `set --` operation appends/replaces $@; cosign sees
+        # the final result as its argv.
+        set -- \
+          --output json \
+          --rekor-url "${REKOR_URL}"
+
+        if [ "${IGNORE_TLOG}" = "true" ]; then
+          set -- "$@" --insecure-ignore-tlog
+        fi
+        if [ "${ALLOW_HTTP}" = "true" ]; then
+          set -- "$@" --allow-insecure-registry
+        fi
+
+        case "${MODE}" in
+          keyed)
+            set -- "$@" --key "${PUBLIC_KEY}"
+            ;;
+          keyless)
+            set -- "$@" \
+              --certificate-identity "${CERT_IDENTITY}" \
+              --certificate-oidc-issuer "${CERT_OIDC_ISSUER}"
+            ;;
+          *)
+            echo "[verify] FATAL: unknown mode '${MODE}' (precheck bug?)" >&2
+            exit 1
+            ;;
+        esac
+
+        # The image ref is the final positional arg.
+        set -- "$@" "${IMAGE}"
+
+        echo "[verify] cosign verify $*"
+
+        # Run cosign. Capture stdout (the JSON output) to a file so
+        # emit-results can parse it; let stderr through so cosign's
+        # diagnosis is visible in the Tekton step log on failure.
+        OUT=/tekton/home/cosign-verify.json
+        if ! cosign verify "$@" > "${OUT}"; then
+          rc=$?
+          echo "[verify] FATAL: cosign verify failed for ${IMAGE} (rc=${rc})" >&2
+          echo "[verify] FATAL: see stderr above for cosign's diagnosis." >&2
+          # Show cosign's stdout in case it wrote anything useful
+          # before bailing.
+          if [ -s "${OUT}" ]; then
+            echo "[verify] partial cosign stdout:" >&2
+            cat "${OUT}" >&2
+          fi
+          exit "${rc}"
+        fi
+
+        echo "[verify] cosign verify succeeded"
+        echo "[verify] output bytes: $(wc -c < "${OUT}")"
+
+        # If verify-output workspace is mounted, copy the JSON for
+        # downstream diagnostic consumers.
+        if [ -d /workspace/verify-output ]; then
+          cp "${OUT}" /workspace/verify-output/cosign-verify.json
+          echo "[verify] copied cosign output to /workspace/verify-output/cosign-verify.json"
+        fi
+
+    # ----------------------------------------------------------------
+    # Step 3: emit-results — parse cosign JSON output, write Results.
+    #
+    # cosign verify --output json emits an ARRAY of signature objects
+    # (one per signature attached to the image). Shape:
+    #   [
+    #     {
+    #       "critical": {
+    #         "identity": {"docker-reference": "..."},
+    #         "image":    {"docker-manifest-digest": "sha256:..."},
+    #         "type":     "cosign container image signature"
+    #       },
+    #       "optional": {
+    #         "Issuer":  "...",                  # keyless only
+    #         "Subject": "...",                  # keyless only
+    #         "Bundle":  {                       # present when tlog used
+    #           "Payload": {
+    #             "integratedTime": 1700000000,  # Unix seconds
+    #             ...
+    #           }
+    #         }
+    #       }
+    #     },
+    #     ...
+    #   ]
+    #
+    # We extract from the FIRST signature object (verify succeeded
+    # means at least one matched the policy; multiple matches are
+    # legitimate but for the Result we just need a representative).
+    #
+    # We parse with busybox grep/sed instead of jq for two reasons:
+    # (1) keeps tools-image as a single small busybox pull;
+    # (2) the JSON shape is stable across cosign 2.x and the
+    # integratedTime field is a simple scalar at a known path.
+    # ----------------------------------------------------------------
+    - name: emit-results
+      image: $(params.tools-image)
+      env:
+        - name: CERT_IDENTITY
+          value: $(params.certificate-identity)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        MODE=$(cat /tekton/home/mode)
+        SUBJECT_DIGEST=$(cat /tekton/home/subject-digest)
+        OUT=/tekton/home/cosign-verify.json
+
+        # ---- verified ----
+        printf '%s' "true" > "$(results.verified.path)"
+
+        # ---- subject-digest ----
+        printf '%s' "${SUBJECT_DIGEST}" > "$(results.subject-digest.path)"
+
+        # ---- certificate-identity ----
+        # Empty in keyed mode; echo-back of the param in keyless.
+        if [ "${MODE}" = "keyless" ]; then
+          printf '%s' "${CERT_IDENTITY}" > "$(results.certificate-identity.path)"
+        else
+          printf '' > "$(results.certificate-identity.path)"
+        fi
+
+        # ---- signing-time ----
+        # Extract optional.Bundle.Payload.integratedTime from the
+        # first signature object. The field is a JSON-number (Unix
+        # seconds) in cosign 2.x. Empty when ignore-tlog=true (no
+        # Rekor entry attached).
+        SIGNING_TIME=""
+        if [ -s "${OUT}" ]; then
+          # grep -o pulls just the matched substring; head -n1 picks
+          # the first signature's value (later signatures, if any,
+          # have their own integratedTime — we only emit one).
+          INT_TIME=$(grep -o '"integratedTime":[[:space:]]*[0-9]*' "${OUT}" \
+                     | head -n1 \
+                     | sed 's/.*://; s/[[:space:]]//g')
+          if [ -n "${INT_TIME}" ]; then
+            # busybox `date -d @<unixtime>` works on most builds.
+            # Fall back to printing the raw integer if not — better
+            # to surface a Unix timestamp than to silently drop the
+            # signal.
+            if SIGNING_TIME=$(date -u -d "@${INT_TIME}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null); then
+              :
+            else
+              SIGNING_TIME="${INT_TIME}"
+            fi
+          fi
+        fi
+        printf '%s' "${SIGNING_TIME}" > "$(results.signing-time.path)"
+
+        # ---- summary log ----
+        echo "[emit] verified=true"
+        echo "[emit] subject-digest=${SUBJECT_DIGEST}"
+        if [ "${MODE}" = "keyless" ]; then
+          echo "[emit] certificate-identity=${CERT_IDENTITY}"
+        fi
+        if [ -n "${SIGNING_TIME}" ]; then
+          echo "[emit] signing-time=${SIGNING_TIME}"
+        else
+          echo "[emit] signing-time=<empty> (ignore-tlog=true or no Rekor entry)"
+        fi
