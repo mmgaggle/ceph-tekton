@@ -479,9 +479,13 @@ spec:
         UNPACK_DIR="${DB_DIR}/db"
         mkdir -p "${UNPACK_DIR}"
 
-        tar --use-compress-program="zstd -d" \
-            -xf "${DB_DIR}/vulnerability.db.tar.zst" \
-            -C "${UNPACK_DIR}"
+        # Pipe form (not `tar --use-compress-program=...`): busybox tar,
+        # which is what alpine ships as /bin/tar, doesn't implement the
+        # GNU --use-compress-program long-option. Decompressing to a
+        # stdout stream and piping into `tar -xf -` works on busybox,
+        # GNU tar, and BSD tar alike.
+        zstd -d -c "${DB_DIR}/vulnerability.db.tar.zst" \
+          | tar -xf - -C "${UNPACK_DIR}"
 
         # The tarball's top-level dir is the schema version; surface
         # whichever schema we got and assert the expected vuln DB

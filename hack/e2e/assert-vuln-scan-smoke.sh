@@ -183,6 +183,12 @@ fi
 
 PF_LOG="$(mktemp)"
 PF_PID=""
+# PVC backing the `sboms` workspace. Must be a PVC (not emptyDir) so
+# the seed Task's log4j-shell.cdx.json reaches the vuln-scan Task's
+# pod — emptyDir is per-Pod in Tekton, so seed's files vanish before
+# vuln-scan looks. Same constraint and reasoning as
+# assert-generate-sbom-smoke.sh and assert-compute-matrix-smoke.sh.
+PVC_NAME="e2e-vuln-scan-pvc-$(date +%s)"
 
 cleanup() {
   # Best-effort: tear down the bucket so re-runs don't accumulate.
@@ -198,6 +204,11 @@ cleanup() {
     kill "${PF_PID}" 2>/dev/null || true
     wait "${PF_PID}" 2>/dev/null || true
   fi
+  # Drop the per-run PVC. --wait=false because PV reclaim can hang
+  # behind a still-mounted Pod when the test fails mid-flight; the
+  # kind cluster is torn down anyway.
+  kube_ctx -n "${NS}" delete pvc "${PVC_NAME}" \
+    --ignore-not-found --wait=false >/dev/null 2>&1 || true
   rm -f "${PF_LOG}"
 }
 trap cleanup EXIT
@@ -258,15 +269,25 @@ aws "${AWS_ARGS[@]}" s3api put-bucket-policy \
 rm -f "${POLICY_FILE}"
 
 log::info "uploading producer artefacts to s3://${BUCKET}/${S3_PREFIX}/"
-aws "${AWS_ARGS[@]}" s3 cp "${TARBALL}" \
-  "s3://${BUCKET}/${S3_PREFIX}/vulnerability.db.tar.zst"             >/dev/null
-aws "${AWS_ARGS[@]}" s3 cp "${BUNDLE}"  \
-  "s3://${BUCKET}/${S3_PREFIX}/vulnerability.db.tar.zst.cosign.bundle" >/dev/null
-aws "${AWS_ARGS[@]}" s3 cp "${PUBKEY}"  \
-  "s3://${BUCKET}/${S3_PREFIX}/cosign.pub"                            >/dev/null
-aws "${AWS_ARGS[@]}" s3 cp "${LATEST}"  \
-  "s3://${BUCKET}/${LATEST_KEY}" \
-  --content-type application/json                                    >/dev/null
+# Why s3api put-object and not s3 cp: zgw-posix's POSIX driver mints
+# the trailing dot-segment of the key as the multipart UploadId (so
+# `vulnerability.db.tar.zst` → UploadId=`zst`) and every UploadPart
+# against the bogus id 404s. aws s3 cp auto-switches to multipart at
+# 8 MiB, which is well below the tarball size. put-object forces a
+# single PUT (good to 5 GiB), sidestepping the bug entirely. Track:
+# https://github.com/mmgaggle/ceph-tekton/issues/87
+aws "${AWS_ARGS[@]}" s3api put-object \
+  --bucket "${BUCKET}" --key "${S3_PREFIX}/vulnerability.db.tar.zst" \
+  --body "${TARBALL}" >/dev/null
+aws "${AWS_ARGS[@]}" s3api put-object \
+  --bucket "${BUCKET}" --key "${S3_PREFIX}/vulnerability.db.tar.zst.cosign.bundle" \
+  --body "${BUNDLE}" >/dev/null
+aws "${AWS_ARGS[@]}" s3api put-object \
+  --bucket "${BUCKET}" --key "${S3_PREFIX}/cosign.pub" \
+  --body "${PUBKEY}" >/dev/null
+aws "${AWS_ARGS[@]}" s3api put-object \
+  --bucket "${BUCKET}" --key "${LATEST_KEY}" \
+  --body "${LATEST}" --content-type application/json >/dev/null
 log::info "published 4 objects (3 under ${S3_PREFIX}/, 1 latest.json pointer)"
 
 # The URL the IN-CLUSTER vuln-scan Task hits. Path-style S3 URL
@@ -283,12 +304,26 @@ kube_ctx apply -f "${E2E_REPO_ROOT}/tasks/vuln-scan/task.yaml"             >/dev
 kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/vuln-scan-smoke-test.yaml"   >/dev/null
 
 # ---------------------------------------------------------------------
-# Run the smoke pipeline
+# Provision the shared workspace PVC, then run the smoke pipeline.
+# Sized for the unpacked grype DB (~1.6 GiB observed) + the .tar.zst
+# (~180 MiB) + the seed SBOM + findings.grype.json, with headroom.
 # ---------------------------------------------------------------------
+log::info "provisioning sboms workspace PVC ${PVC_NAME} (4Gi)"
+kube_ctx -n "${NS}" apply -f - <<EOF >/dev/null
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${PVC_NAME}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 4Gi
+EOF
 
 PR="$(start_pipelinerun "${NS}" vuln-scan-smoke-test \
         --param=db-pointer-url="${DB_POINTER_URL}" \
-        --workspace=name=sboms,emptyDir="")"
+        --workspace=name=sboms,claimName="${PVC_NAME}")"
 log::info "started PipelineRun: ${NS}/${PR}"
 
 wait_pipelinerun_succeeded "${NS}" "${PR}" \

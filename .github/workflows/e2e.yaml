@@ -242,14 +242,10 @@ jobs:
           E2E_KUBE_CONTEXT:        ${{ env.E2E_KUBE_CONTEXT }}
           E2E_ARTIFACTS:           ${{ github.workspace }}/e2e-artifacts
           E2E_PIPELINERUN_TIMEOUT: ${{ env.E2E_PIPELINERUN_TIMEOUT }}
-          # Skips, each tied to a tracking issue:
-          #   reproducibility-smoke — #67: step-build-a's script fails with
-          #     `getcwd: cannot access parent directories` + `PWD: unbound
-          #     variable`. Drop when #67 lands.
-          #   vuln-scan-smoke      — #87: aws-cli ↔ zgw-posix multipart
-          #     upload incompatibility on grype DB tarball. Drop when #87
-          #     is fixed.
-          E2E_SKIP:                reproducibility-smoke vuln-scan-smoke
+          # Skip reproducibility-smoke pending #67: step-build-a's script
+          # fails with `getcwd: cannot access parent directories` +
+          # `PWD: unbound variable`. Remove this line when #67 lands.
+          E2E_SKIP:                reproducibility-smoke
         run: |
           set -euo pipefail
           mkdir -p "${E2E_ARTIFACTS}"
