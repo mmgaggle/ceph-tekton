@@ -15,8 +15,9 @@ This page covers:
 5. [Create a GitHub App for your dev cluster](#create-a-github-app-for-your-dev-cluster)
 6. [Wire the GitHub App to PaC](#wire-the-github-app-to-pac)
 7. [Smoke-test with the noop pipeline](#smoke-test-with-the-noop-pipeline)
-8. [Troubleshooting](#troubleshooting)
-9. [Bumping the pinned PaC version](#bumping-the-pinned-pac-version)
+8. [Daily sync of mmgaggle/ceph](#daily-sync-of-mmgaggleceph)
+9. [Troubleshooting](#troubleshooting)
+10. [Bumping the pinned PaC version](#bumping-the-pinned-pac-version)
 
 > The "real" GitHub App for `ceph/ceph` is tracked separately in #9 and
 > is a human-in-the-loop task. The walkthrough below is for a
@@ -503,9 +504,94 @@ PipelineRun start.
 
 ---
 
-## Troubleshooting
+## Daily sync of mmgaggle/ceph
 
-### Webhook fires on GitHub but never reaches the cluster
+`mmgaggle/ceph` `main` is the merge base for every PaC PR against the
+`ci-tekton` integration branch (which itself exists only to host
+`.tekton/PipelineRun-ceph-conf.yaml` — see Option B above). Without an
+ongoing sync, `mmgaggle/ceph` `main` drifts from upstream `ceph/ceph`
+`main`, and the PaC signal stops corresponding to "does this PR work
+against current upstream".
+
+[`.github/workflows/sync-mmgaggle-ceph.yml`](../.github/workflows/sync-mmgaggle-ceph.yml)
+in **this** repo runs daily at 06:00 UTC (plus a manual
+`workflow_dispatch`):
+
+1. Bare-clones `ceph/ceph` `main` (single-branch).
+2. Pushes that ref to `mmgaggle/ceph` `main` using a fine-grained PAT.
+3. Rebases `ci-tekton` onto the new `main` and `--force-with-lease`s
+   it back. A rebase conflict fails the job loudly — do not paper over.
+
+The workflow lives in `ceph-tekton` (not in `mmgaggle/ceph` itself)
+because anything shipped on `mmgaggle/ceph` `main` would be flattened
+on every sync, and a workflow that deletes itself is a debugging
+nightmare.
+
+### Prereq: `MMGAGGLE_CEPH_PAT` secret (HITL)
+
+The push needs a token with write access to `mmgaggle/ceph`. The
+`GITHUB_TOKEN` GitHub Actions hands the runner is scoped to the
+**workflow's own repo** (`mmgaggle/ceph-tekton`), so it cannot push to
+`mmgaggle/ceph`. We use a fine-grained PAT instead:
+
+1. <https://github.com/settings/personal-access-tokens/new>
+2. Resource owner: `mmgaggle`. Repository access: **Only select
+   repositories** → `mmgaggle/ceph` (only — not `ceph-tekton`).
+3. Repository permissions:
+
+   | Permission | Access         | Why                                |
+   |------------|----------------|------------------------------------|
+   | Contents   | Read & write   | Push `main`, force-push `ci-tekton`|
+   | Metadata   | Read-only      | Required by GitHub for any PAT     |
+
+   Leave everything else `No access`. No org/account permissions.
+
+4. Expiration: short (90 days is the GitHub maximum that still gives
+   you a calendar reminder). Renewal is a calendared HITL task —
+   when the PAT expires, the sync workflow fails loudly on the next
+   run and the on-call rotates it.
+
+5. Copy the token. In `mmgaggle/ceph-tekton`:
+   **Settings → Secrets and variables → Actions → New repository secret**.
+   Name: `MMGAGGLE_CEPH_PAT`. Value: the token. Save.
+
+6. Sanity-check: Actions tab →
+   "sync mmgaggle/ceph from upstream ceph/ceph" → **Run workflow**
+   (with `rebase_ci_tekton` unchecked the first time, so you only
+   prove the push half works). Expected: green run; `mmgaggle/ceph`
+   `main` advances to upstream's HEAD; no `ci-tekton` change.
+   Then re-run with `rebase_ci_tekton` checked to exercise the
+   second half.
+
+### When the rebase step conflicts
+
+The rebase replays `ci-tekton`'s commits (today: just the
+`.tekton/PipelineRun-ceph-conf.yaml` add) onto the new `main`. A
+conflict means upstream touched the same path — historically rare,
+but possible if `ceph/ceph` ever ships its own `.tekton/`. The
+workflow does not try to auto-resolve; it aborts the rebase, fails
+the job, and prints the manual-resolution recipe to the run log.
+
+If `rebase_ci_tekton` keeps failing while the main-mirror step is
+healthy, use the `workflow_dispatch` form with `rebase_ci_tekton`
+unchecked to keep the daily main-sync flowing while a human untangles
+`ci-tekton` separately.
+
+### The path-(c) plan
+
+Once [#68](https://github.com/mmgaggle/ceph-tekton/issues/68)
+(multi-doc remote-resolution in `.tekton/`) lands,
+`.tekton/PipelineRun-ceph-conf.yaml` becomes a thin stub that resolves
+the real Pipeline from `mmgaggle/ceph-tekton/pipelines/`. At that
+point `ci-tekton` is just one tiny stub file, and either: (a) the
+branch is so cheap to maintain that the rebase step is moot, or (b)
+the stub is upstream-mergeable into `ceph/ceph` itself, killing
+`ci-tekton`. The path-(c) migration is tracked in
+[#75](https://github.com/mmgaggle/ceph-tekton/issues/75); for now
+this workflow ships the option-(b) auto-rebase as the transitional
+answer.
+
+---
 
 - Open the smee.io channel page in a browser — incoming webhooks
   appear there in real time. If GitHub sends but smee doesn't show it,
