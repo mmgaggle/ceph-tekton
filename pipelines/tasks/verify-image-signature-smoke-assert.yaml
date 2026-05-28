@@ -1,0 +1,161 @@
+# verify-image-signature-smoke-test — `verify-image-signature-smoke-assert` Task.
+#
+# Asserts that `verify-image-signature` emitted the expected Results
+# in shapes downstream consumers (auditing dashboards, gating logic,
+# the ceph-builds-api shim) can rely on.
+#
+# We wire the upstream Results in as Pipeline params and grep them
+# in-pod, so this Task needs no cluster RBAC against TaskRuns and runs
+# on any dev SA. Same pattern as vuln-scan-smoke-assert.
+#
+# Pairs with pipelines/pipelines/verify-image-signature-smoke-test.yaml.
+#
+# Single-resource file (no leading `---`) so PaC's remote-resolution
+# (`pipelinesascode.tekton.dev/task: verify-image-signature-smoke-assert@URL`)
+# succeeds.
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: verify-image-signature-smoke-assert
+spec:
+  description: |
+    Assert that `verify-image-signature` emitted the expected Results
+    in shapes downstream consumers can rely on:
+      - `verified` is the literal string "true"
+      - `subject-digest` is `sha256:<64-hex>`
+      - `certificate-identity` is empty (keyed mode) or the expected
+        identity URI (keyless mode), as gated by `expected-mode`
+      - `signing-time` is empty (smoke uses ignore-tlog=true) or a
+        recognisable RFC 3339 / Unix-seconds value
+  params:
+    - name: verified
+      type: string
+      description: |
+        Upstream `verified` Result. MUST be the literal string "true";
+        absence (which Tekton would surface as the empty string here)
+        means the verify Task didn't emit it — which only happens on
+        verify failure (and the upstream Task would have failed the
+        PipelineRun before this assert ran).
+    - name: subject-digest
+      type: string
+      description: |
+        Upstream `subject-digest` Result. MUST match `sha256:<64-hex>`.
+        Echoed from the image param after digest extraction.
+    - name: certificate-identity
+      type: string
+      description: |
+        Upstream `certificate-identity` Result. Empty in keyed mode;
+        the echoed identity URI in keyless mode. Validated against
+        `expected-mode`.
+    - name: signing-time
+      type: string
+      description: |
+        Upstream `signing-time` Result. May be empty when the
+        upstream verify ran with `ignore-tlog=true` (no Rekor entry
+        attached). When non-empty, MUST look like either an RFC 3339
+        UTC timestamp (the dominant shape) or a Unix-seconds integer
+        (the busybox-date-failure fallback the upstream emit step
+        documents).
+    - name: expected-mode
+      type: string
+      default: "keyed"
+      description: |
+        "keyed" or "keyless". Selects which downstream-shape rules
+        the assert applies to `certificate-identity`. The smoke
+        pipeline ships keyed-mode by default; a future keyless smoke
+        would pass "keyless" here. Any other value is rejected.
+    - name: tools-image
+      type: string
+      default: docker.io/library/busybox:1.36
+  steps:
+    - name: assert
+      image: $(params.tools-image)
+      env:
+        - name: VERIFIED
+          value: $(params.verified)
+        - name: SUBJECT_DIGEST
+          value: $(params.subject-digest)
+        - name: CERT_IDENTITY
+          value: $(params.certificate-identity)
+        - name: SIGNING_TIME
+          value: $(params.signing-time)
+        - name: EXPECTED_MODE
+          value: $(params.expected-mode)
+      script: |
+        #!/bin/sh
+        set -eu
+        FAIL=0
+
+        echo "[assert] verified='${VERIFIED}'"
+        echo "[assert] subject-digest='${SUBJECT_DIGEST}'"
+        echo "[assert] certificate-identity='${CERT_IDENTITY}'"
+        echo "[assert] signing-time='${SIGNING_TIME}'"
+        echo "[assert] expected-mode='${EXPECTED_MODE}'"
+        echo
+
+        # ---- expected-mode is one of {keyed, keyless} ----
+        case "${EXPECTED_MODE}" in
+          keyed|keyless) : ;;
+          *)
+            echo "[assert] FAIL: expected-mode='${EXPECTED_MODE}' must be 'keyed' or 'keyless'" >&2
+            FAIL=1
+            ;;
+        esac
+
+        # ---- verified is the literal "true" ----
+        if [ "${VERIFIED}" != "true" ]; then
+          echo "[assert] FAIL: verified='${VERIFIED}'; expected literal 'true'" >&2
+          FAIL=1
+        fi
+
+        # ---- subject-digest is sha256:<64-hex> ----
+        if ! printf '%s' "${SUBJECT_DIGEST}" | grep -qE '^sha256:[0-9a-f]{64}$'; then
+          echo "[assert] FAIL: subject-digest='${SUBJECT_DIGEST}' is not sha256:<64-hex>" >&2
+          FAIL=1
+        fi
+
+        # ---- certificate-identity matches mode ----
+        # Keyed: MUST be empty (verify Task explicitly writes empty
+        # in keyed mode so downstream consumers can rely on the
+        # distinction).
+        # Keyless: MUST be non-empty (smoke flow would pass a
+        # specific identity URI).
+        case "${EXPECTED_MODE}" in
+          keyed)
+            if [ -n "${CERT_IDENTITY}" ]; then
+              echo "[assert] FAIL: certificate-identity='${CERT_IDENTITY}' should be empty in keyed mode" >&2
+              FAIL=1
+            fi
+            ;;
+          keyless)
+            if [ -z "${CERT_IDENTITY}" ]; then
+              echo "[assert] FAIL: certificate-identity is empty in keyless mode" >&2
+              FAIL=1
+            fi
+            ;;
+        esac
+
+        # ---- signing-time: empty OR (RFC3339 OR Unix seconds) ----
+        # Smoke uses ignore-tlog=true (no Rekor entry), so empty is
+        # the expected default. Non-empty is also fine when a real
+        # Rekor entry is present.
+        if [ -n "${SIGNING_TIME}" ]; then
+          # RFC 3339 UTC like "2026-05-28T12:34:56Z"
+          if printf '%s' "${SIGNING_TIME}" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'; then
+            echo "[assert] OK: signing-time is RFC 3339 UTC"
+          # Unix seconds (10-digit int as of 2001..2286)
+          elif printf '%s' "${SIGNING_TIME}" | grep -qE '^[0-9]{10}$'; then
+            echo "[assert] OK: signing-time is Unix seconds (busybox date fallback)"
+          else
+            echo "[assert] FAIL: signing-time='${SIGNING_TIME}' is neither RFC 3339 nor Unix seconds" >&2
+            FAIL=1
+          fi
+        else
+          echo "[assert] OK: signing-time is empty (ignore-tlog=true ⇒ no Rekor entry)"
+        fi
+
+        if [ "${FAIL}" -ne 0 ]; then
+          echo "[assert] one or more assertions failed" >&2
+          exit 1
+        fi
+        echo "[assert] all verify-image-signature Results present and well-formed"

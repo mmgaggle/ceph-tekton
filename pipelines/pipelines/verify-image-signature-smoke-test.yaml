@@ -1,0 +1,158 @@
+# verify-image-signature-smoke-test — smoke Pipeline for the
+# `verify-image-signature` Task.
+#
+# Wires verify-image-signature against a small test image that was
+# built and signed host-side by `hack/e2e/assert-verify-image-signature-smoke.sh`
+# and pushed to the in-cluster `registry:2` (reused from
+# `assert-build-builder-image.sh`'s registry deployment in
+# namespace `e2e-registry`).
+#
+# Pipeline shape: just two Tasks.
+#
+#   1. `verify` — the canonical `verify-image-signature` Task.
+#                 KEYED mode (smoke ships keyed-only for phase 1;
+#                 keyless follow-up is tracked in #92's body, gated
+#                 on selecting a stable public keyless-signed test
+#                 target). The cosign-public-key workspace is bound
+#                 by the PipelineRun directly to a Secret holding the
+#                 ephemeral cosign.pub the host-side flow generated.
+#                 ignore-tlog=true + allow-http=true because:
+#                   - the ephemeral key was never recorded in any
+#                     Rekor instance (no producer Pipeline ran);
+#                   - the in-cluster registry:2 serves plaintext.
+#
+#   2. `assert-results` — the smoke `verify-image-signature-smoke-assert`
+#                         Task. Pulls Results forward as Pipeline params
+#                         + greps shape conformance.
+#
+# Pairs with:
+#   - pipelines/tasks/verify-image-signature-smoke-assert.yaml
+#   - tasks/verify-image-signature/task.yaml  (the canonical Task)
+#   - hack/e2e/assert-verify-image-signature-smoke.sh  (the e2e driver)
+# Apply both Tasks before this Pipeline.
+#
+# Why no `seed` Task: the `cosign-public-key` workspace is Secret-bound
+# at PipelineRun time, so there's no file-staging Task work to do. The
+# verify Task's precheck step already validates the pubkey is present
+# and the image-ref is digest-form. Compare to the vuln-scan smoke,
+# which needs a seed Task because it stages deterministic SBOM content
+# (the synthetic Log4Shell SBOM) — content seeding is the seed Task's
+# job; pure workspace plumbing isn't.
+#
+# Single-resource file (no leading `---`) so PaC's remote-resolution
+# (`pipelinesascode.tekton.dev/pipeline: verify-image-signature-smoke-test@URL`)
+# succeeds.
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: verify-image-signature-smoke-test
+spec:
+  description: |
+    Two-Task pipeline exercising `verify-image-signature` in KEYED
+    mode end-to-end:
+
+      1. `verify`         — cosign-verify a test image that was
+                            built, signed, and pushed host-side
+                            against the in-cluster registry:2. The
+                            cosign-public-key workspace is bound to
+                            a Secret holding the ephemeral cosign.pub.
+                            ignore-tlog=true (ephemeral key, no Rekor)
+                            and allow-http=true (in-cluster registry
+                            is plaintext).
+      2. `assert-results` — verify each Result is shape-correct:
+                            verified="true", subject-digest matches
+                            sha256:<64-hex>, certificate-identity is
+                            empty in keyed mode, signing-time is
+                            empty (no Rekor entry under ignore-tlog).
+
+    Keyless mode is supported by the Task itself; the keyless smoke
+    is a follow-up (see #92) once a stable public keyless-signed test
+    target is selected.
+  params:
+    - name: image
+      type: string
+      description: |
+        The fully-qualified digest reference of the test image the
+        host-side driver built, signed, and pushed. Example:
+        `registry.e2e-registry.svc:5000/verify-smoke/test@sha256:<hex>`.
+        Bound by the e2e script after `crane append` reports the
+        pushed digest.
+    - name: public-key
+      type: string
+      default: /workspace/cosign-public-key/cosign.pub
+      description: |
+        Path to the cosign.pub on the cosign-public-key workspace.
+        Default targets the canonical filename a Secret-backed
+        workspace projects when the Secret key is `cosign.pub`.
+    - name: cosign-image
+      type: string
+      default: cgr.dev/chainguard/cosign:latest-dev
+    - name: tools-image
+      type: string
+      default: docker.io/library/busybox:1.36
+  workspaces:
+    - name: cosign-public-key
+      description: |
+        Workspace projecting the ephemeral cosign.pub. The
+        PipelineRun binds this to a Secret created host-side from
+        `cosign generate-key-pair` output. emptyDir would not work
+        — the verify Task's precheck reads cosign.pub by file path,
+        and an emptyDir workspace would be empty unless a seed Task
+        wrote into it (which we've deliberately skipped for this
+        smoke).
+  tasks:
+    - name: verify
+      taskRef:
+        name: verify-image-signature
+      params:
+        - name: image
+          value: $(params.image)
+        - name: public-key
+          value: $(params.public-key)
+        # Smoke gates: in-cluster registry is HTTP, ephemeral key
+        # has no Rekor entry. Both flags are clearly-labelled escape
+        # hatches in the Task; production callers leave them false.
+        - name: ignore-tlog
+          value: "true"
+        - name: allow-http
+          value: "true"
+        - name: cosign-image
+          value: $(params.cosign-image)
+        - name: tools-image
+          value: $(params.tools-image)
+      workspaces:
+        - name: cosign-public-key
+          workspace: cosign-public-key
+    - name: assert-results
+      runAfter: [verify]
+      taskRef:
+        name: verify-image-signature-smoke-assert
+      params:
+        - name: verified
+          value: $(tasks.verify.results.verified)
+        - name: subject-digest
+          value: $(tasks.verify.results.subject-digest)
+        - name: certificate-identity
+          value: $(tasks.verify.results.certificate-identity)
+        - name: signing-time
+          value: $(tasks.verify.results.signing-time)
+        - name: expected-mode
+          value: "keyed"
+        - name: tools-image
+          value: $(params.tools-image)
+  results:
+    # Re-expose the verify Task's Results at the Pipeline level so a
+    # PipelineRun-level Chains attestation (deep-inspection on or off)
+    # sees the same values that the TaskRun exposes. None of these are
+    # Chains-grammar Results (this Task consumes, doesn't produce),
+    # so re-exposure is purely for dashboards / the ceph-builds-api
+    # shim to read without following the child-TaskRun pointer.
+    - name: verified
+      description: Literal string "true" when verify succeeded.
+      value: $(tasks.verify.results.verified)
+    - name: subject-digest
+      description: sha256:<hex> of the verified image.
+      value: $(tasks.verify.results.subject-digest)
+    - name: signing-time
+      description: Rekor integratedTime as RFC 3339 UTC, or empty.
+      value: $(tasks.verify.results.signing-time)
