@@ -10,7 +10,7 @@ kind: Kustomization
 # README.md / architecture.md docs all reference them as distinct
 # targets, and because dev-kind is expected to grow kind-specific
 # patches (NodePort exposure for the PaC controller, image-pull
-# pre-load for the kind nodes, looser pod security so the bitnami/
+# pre-load for the kind nodes, looser pod security so the chainguard
 # kubectl cron pod runs unprivileged on the kind default PSA profile)
 # that don't apply to a plain `kubectl --context kind-...`-driven
 # dev-local flow.
