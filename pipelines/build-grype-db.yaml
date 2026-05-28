@@ -257,10 +257,15 @@ spec:
           serviceAccountName: build-grype-db-cron
           containers:
             - name: kubectl
-              # bitnami/kubectl is a small, well-maintained image with
-              # just the kubectl binary + a shell. Pinned to a minor
-              # for build determinism.
-              image: docker.io/bitnami/kubectl:1.30
+              # Chainguard's `kubectl` image ships kubectl + a busybox
+              # shell on the `-dev` variant, which the `/bin/sh -c`
+              # script below needs; the plain `:latest` tag is
+              # distroless and would not run the script. Chainguard
+              # images are rolling-tag-only — pin to the rolling tag
+              # and let upstream rebuilds carry CVE fixes. (Bitnami
+              # retired `bitnami/kubectl` from the public Docker Hub
+              # catalog in mid-2025, which is why we moved off it.)
+              image: cgr.dev/chainguard/kubectl:latest-dev
               command: ["/bin/sh", "-c"]
               args:
                 - |
