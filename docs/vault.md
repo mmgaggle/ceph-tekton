@@ -62,7 +62,9 @@ reconciles missing pieces.
 Run the smoke-test pipeline to prove the chain works end-to-end:
 
 ```sh
-kubectl apply -f pipelines/vault-smoke-test.yaml
+# Issue #68: single-resource files. Apply the Task first, then the Pipeline.
+kubectl -n vault-test apply -f pipelines/tasks/vault-sign-smoke.yaml
+kubectl -n vault-test apply -f pipelines/pipelines/vault-smoke-test.yaml
 tkn pipeline start vault-smoke-test \
   --serviceaccount ceph-test-signer \
   -n vault-test \
@@ -324,5 +326,6 @@ reasoning attached.
 | `charts/vault/values-sepia.yaml`           | Production HA stub (raft, TLS, no dev mode)      |
 | `charts/vault/README.md`                   | Install + day-2 ops quickstart                   |
 | `hack/dev-vault-up.sh`                     | Bootstrap script for local kind                  |
-| `pipelines/vault-smoke-test.yaml`          | SA-token → k8s auth → transit sign smoke test    |
+| `pipelines/pipelines/vault-smoke-test.yaml` | SA-token → k8s auth → transit sign smoke test   |
+| `pipelines/tasks/vault-sign-smoke.yaml`     | `vault-sign-smoke` Task referenced by the above |
 | `docs/vault.md`                            | This document                                    |

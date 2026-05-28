@@ -1,0 +1,101 @@
+# Kyverno smoke-test Pipeline.
+#
+# Proves the dev cluster's Kyverno install + verify-ceph-image-signatures-dev
+# ClusterPolicy reject unsigned Ceph images and admit signed ones. Two
+# TaskRuns run in parallel:
+#
+#   1. admit-signed-ceph: attempts to create a Pod referencing a
+#      quay.io/ceph/ceph image known to be signed by the dev cosign key
+#      (the same image the Chains smoke-test attested to, by tag).
+#      Expects admission; fails the Task if Kyverno blocks.
+#
+#   2. reject-unsigned: attempts to create a Pod referencing
+#      docker.io/library/busybox:1.36. That image is outside the
+#      `quay.io/ceph/*` glob, so the policy will skip it — wrong test.
+#      Instead we point at quay.io/ceph/ceph:does-not-exist-unsigned
+#      (a tag that has no Chains attestation in this cluster's
+#      signing-secrets Secret). That makes the policy fire and reject.
+#      The Task then asserts the rejection reason mentions cosign or
+#      signature verification.
+#
+# Pairs with:
+#   - manifests/smoke-setup/kyverno-smoke-rbac.yaml (Namespace + SA + Role + RoleBinding)
+#   - pipelines/tasks/try-pod-admit.yaml      (helper Task)
+# Apply the setup + Task before this Pipeline.
+#
+# Pre-req: hack/dev-kyverno-up.sh has already applied the dev policy
+# and Kyverno's admission webhook is ready.
+#
+# Run via:
+#   ./hack/dev-kyverno-up.sh   # one-time bootstrap (idempotent)
+#   kubectl apply -f manifests/smoke-setup/kyverno-smoke-rbac.yaml
+#   kubectl apply -f pipelines/tasks/try-pod-admit.yaml
+#   kubectl apply -f pipelines/pipelines/kyverno-smoke-test.yaml
+#   tkn pipeline start kyverno-smoke-test \
+#     --serviceaccount kyverno-smoke-sa \
+#     -n kyverno-smoke \
+#     --showlog
+#
+# The pipeline runs in its own `kyverno-smoke` namespace which is NOT
+# in the chart's webhook-exclusion list (intentional — the namespace
+# must be one the policy enforces in, or the test is vacuous). The
+# kyverno-smoke-sa ServiceAccount is given pods/create RBAC by the
+# Role + RoleBinding in the setup manifest.
+#
+# Single-resource file (no leading `---`) so PaC's remote-resolution
+# (`pipelinesascode.tekton.dev/pipeline: kyverno-smoke-test@URL`) succeeds.
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: kyverno-smoke-test
+spec:
+  description: >
+    End-to-end smoke test of the dev Kyverno install + the
+    verify-ceph-image-signatures-dev ClusterPolicy. Runs two TaskRuns
+    in parallel: one Pod-create expected to be admitted (signed Ceph
+    image), one expected to be rejected with a cosign/signature
+    error message (unsigned image under quay.io/ceph/*).
+  params:
+    # The signed-image tag the cluster's signing-secrets cosign.pub
+    # can verify. Override at `tkn pipeline start` time once the
+    # Chains-signed Ceph image lands at a known tag (issue #25).
+    # Until then, the admit-signed-ceph branch will FAIL by design —
+    # there is no real Chains-signed quay.io/ceph/ceph image yet
+    # that the dev cosign.pub can verify. That's intentional: this
+    # parameter is the integration seam between the kyverno policy
+    # workstream (#47) and the container-build workstream (#25 / #26).
+    - name: signed-ceph-image
+      type: string
+      default: "quay.io/ceph/ceph:v19.2.0"
+      description: >
+        A quay.io/ceph/* image reference whose cosign signature the
+        local signing-secrets Secret can verify. Until #25/#26 lands
+        a real Chains-signed image, expect this TaskRun to fail.
+    - name: unsigned-ceph-image
+      type: string
+      default: "quay.io/ceph/ceph:smoke-test-deliberately-unsigned"
+      description: >
+        A quay.io/ceph/* image reference that has no cosign signature
+        in the cluster's signing-secrets. Used to prove the policy
+        rejects on missing/invalid signatures.
+  tasks:
+    - name: admit-signed-ceph
+      taskRef:
+        name: try-pod-admit
+      params:
+        - name: image
+          value: $(params.signed-ceph-image)
+        - name: expect
+          value: admit
+        - name: pod-name
+          value: smoke-admit-signed
+    - name: reject-unsigned-ceph
+      taskRef:
+        name: try-pod-admit
+      params:
+        - name: image
+          value: $(params.unsigned-ceph-image)
+        - name: expect
+          value: reject
+        - name: pod-name
+          value: smoke-reject-unsigned

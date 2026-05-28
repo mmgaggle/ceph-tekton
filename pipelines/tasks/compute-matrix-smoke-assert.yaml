@@ -1,0 +1,176 @@
+# compute-matrix-smoke-test — `compute-matrix-smoke-assert` Task.
+#
+# Asserts that `compute-matrix` emitted a well-formed JSON array and that
+# the scalar Results agree with it. We thread the upstream Results in as
+# Pipeline params and re-parse them in-pod via yq, so this Task needs no
+# cluster RBAC against TaskRuns and runs on any dev SA. Same pattern as
+# vuln-scan-smoke-assert.
+#
+# Pairs with pipelines/pipelines/compute-matrix-smoke-test.yaml.
+#
+# Single-resource file (no leading `---`) so PaC's remote-resolution
+# (`pipelinesascode.tekton.dev/task: compute-matrix-smoke-assert@URL`) succeeds.
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: compute-matrix-smoke-assert
+spec:
+  description: |
+    Assert that `compute-matrix` emitted a well-formed JSON array and
+    that the scalar Results agree with it. We thread the upstream
+    Results in as Pipeline params and re-parse them in-pod via yq, so
+    this Task needs no cluster RBAC against TaskRuns and runs on any
+    dev SA. Same pattern as vuln-scan-smoke-assert.
+  params:
+    - name: matrix
+      type: string
+      description: |
+        Upstream `matrix` Result — JSON array of {distro, arch, gating}
+        objects.
+    - name: cell-count
+      type: string
+      description: |
+        Upstream `cell-count` Result. Must equal len(matrix) and must
+        be a positive integer.
+    - name: gating-count
+      type: string
+      description: |
+        Upstream `gating-count` Result. Must equal the count of cells
+        whose .gating == "true", and must be <= cell-count.
+    - name: expected-cell-count
+      type: string
+      default: "3"
+      description: |
+        Cell count the smoke seed wrote. Lets the assert step catch a
+        regression where compute-matrix silently dropped a cell.
+    - name: expected-gating-count
+      type: string
+      default: "2"
+      description: |
+        Gating-count the smoke seed implies (two cells with gating:true,
+        one with gating:false).
+    - name: tools-image
+      type: string
+      default: docker.io/mikefarah/yq:4.40.7
+      description: |
+        Same pin as the compute-matrix Task itself — yq is the cleanest
+        tool for re-validating the JSON shape inside a Tekton step.
+  steps:
+    - name: assert
+      image: $(params.tools-image)
+      env:
+        - name: MATRIX
+          value: $(params.matrix)
+        - name: CELL_COUNT
+          value: $(params.cell-count)
+        - name: GATING_COUNT
+          value: $(params.gating-count)
+        - name: EXPECTED_CELL_COUNT
+          value: $(params.expected-cell-count)
+        - name: EXPECTED_GATING_COUNT
+          value: $(params.expected-gating-count)
+      script: |
+        #!/bin/sh
+        set -eu
+        FAIL=0
+
+        echo "[assert] matrix=${MATRIX}"
+        echo "[assert] cell-count=${CELL_COUNT}"
+        echo "[assert] gating-count=${GATING_COUNT}"
+        echo "[assert] expected-cell-count=${EXPECTED_CELL_COUNT}"
+        echo "[assert] expected-gating-count=${EXPECTED_GATING_COUNT}"
+        echo
+
+        # ---- matrix parses as JSON array ----
+        if ! printf '%s' "${MATRIX}" | yq -p=json -o=json '.' >/dev/null 2>&1; then
+          echo "[assert] FAIL: matrix does not parse as JSON" >&2
+          FAIL=1
+        fi
+        # `yq tag` returns the YAML type tag of the document root.
+        # For a JSON array the tag is `!!seq`; for any other shape
+        # (object, string, scalar) it'll be something else and we
+        # fail loud.
+        TAG="$(printf '%s' "${MATRIX}" | yq -p=json '. | tag' 2>/dev/null || echo unknown)"
+        if [ "${TAG}" != "!!seq" ]; then
+          echo "[assert] FAIL: matrix root is not an array (yq tag=${TAG})" >&2
+          FAIL=1
+        fi
+
+        # ---- every entry has distro / arch / gating ----
+        # Length-after-filter trick: equal counts mean every cell
+        # passed the predicate. More robust across yq versions than
+        # `all(...)`.
+        TOTAL_LEN="$(printf '%s' "${MATRIX}" | yq -p=json '. | length' 2>/dev/null || echo 0)"
+        SHAPED_LEN="$(
+          printf '%s' "${MATRIX}" \
+            | yq -p=json '[.[] | select(.distro != null and .arch != null and .gating != null)] | length' 2>/dev/null \
+            || echo 0
+        )"
+        if [ "${SHAPED_LEN}" != "${TOTAL_LEN}" ]; then
+          echo "[assert] FAIL: ${TOTAL_LEN} cells but only ${SHAPED_LEN} carry distro/arch/gating" >&2
+          FAIL=1
+        fi
+
+        # ---- gating is "true" or "false" (string, not bool) ----
+        # Tekton matrix params are strings; the Task must coerce the
+        # YAML bool into a string. Same length-after-filter trick.
+        GATING_OK_LEN="$(
+          printf '%s' "${MATRIX}" \
+            | yq -p=json '[.[] | select(.gating == "true" or .gating == "false")] | length' 2>/dev/null \
+            || echo 0
+        )"
+        if [ "${GATING_OK_LEN}" != "${TOTAL_LEN}" ]; then
+          echo "[assert] FAIL: ${TOTAL_LEN} cells but only ${GATING_OK_LEN} carry gating in ('true','false') as string" >&2
+          FAIL=1
+        fi
+
+        # ---- cell-count is a positive integer ----
+        case "${CELL_COUNT}" in
+          ''|*[!0-9]*)
+            echo "[assert] FAIL: cell-count='${CELL_COUNT}' is not a non-negative integer" >&2
+            FAIL=1
+            ;;
+          *)
+            if [ "${CELL_COUNT}" -lt 1 ]; then
+              echo "[assert] FAIL: cell-count=${CELL_COUNT}; expected >= 1" >&2
+              FAIL=1
+            fi
+            ;;
+        esac
+
+        # ---- cell-count == len(matrix) ----
+        ACTUAL_LEN="$(printf '%s' "${MATRIX}" | yq -p=json '. | length' 2>/dev/null || echo 0)"
+        if [ "${ACTUAL_LEN}" != "${CELL_COUNT}" ]; then
+          echo "[assert] FAIL: cell-count=${CELL_COUNT} != len(matrix)=${ACTUAL_LEN}" >&2
+          FAIL=1
+        fi
+
+        # ---- gating-count <= cell-count ----
+        case "${GATING_COUNT}" in
+          ''|*[!0-9]*)
+            echo "[assert] FAIL: gating-count='${GATING_COUNT}' is not a non-negative integer" >&2
+            FAIL=1
+            ;;
+          *)
+            if [ "${GATING_COUNT}" -gt "${CELL_COUNT}" ]; then
+              echo "[assert] FAIL: gating-count=${GATING_COUNT} > cell-count=${CELL_COUNT}" >&2
+              FAIL=1
+            fi
+            ;;
+        esac
+
+        # ---- seeded values: 3 cells, 2 gating ----
+        if [ "${CELL_COUNT}" != "${EXPECTED_CELL_COUNT}" ]; then
+          echo "[assert] FAIL: cell-count=${CELL_COUNT} != expected ${EXPECTED_CELL_COUNT}" >&2
+          FAIL=1
+        fi
+        if [ "${GATING_COUNT}" != "${EXPECTED_GATING_COUNT}" ]; then
+          echo "[assert] FAIL: gating-count=${GATING_COUNT} != expected ${EXPECTED_GATING_COUNT}" >&2
+          FAIL=1
+        fi
+
+        if [ "${FAIL}" -ne 0 ]; then
+          echo "[assert] one or more assertions failed" >&2
+          exit 1
+        fi
+        echo "[assert] all matrix Result shape assertions passed"

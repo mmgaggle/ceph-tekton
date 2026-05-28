@@ -1,0 +1,58 @@
+# Kyverno smoke-test — Namespace + ServiceAccount + Role + RoleBinding.
+#
+# Multi-doc setup manifest applied alongside pipelines/tasks/try-pod-admit.yaml
+# and pipelines/pipelines/kyverno-smoke-test.yaml. These resources are NOT
+# Tekton Tasks/Pipelines, so they live under manifests/smoke-setup/ rather
+# than pipelines/ — pipelines/ is reserved for PaC-resolvable Task / Pipeline
+# files (one resource per file).
+#
+# The `kyverno-smoke` namespace is intentionally NOT in the chart's
+# webhook-exclusion list. The namespace must be one the dev policy
+# enforces in, or the test is vacuous. The `kyverno-smoke-sa` SA is
+# given pods/create RBAC by the Role + RoleBinding below.
+#
+# Apply this BEFORE the smoke pipeline so the namespace + RBAC exist
+# when `tkn pipeline start --serviceaccount kyverno-smoke-sa` runs.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kyverno-smoke
+  labels:
+    # Explicitly NOT labelled ceph-tekton.io/cluster=sepia so the dev
+    # policy enforces here. The dev policy's namespaceSelector uses
+    # NotIn [sepia], which matches namespaces that either lack the
+    # label entirely OR have it set to something other than `sepia`.
+    # The kyverno-smoke namespace lacks it → dev policy matches →
+    # verifyImages enforces.
+    ceph-tekton.io/scope: smoke-test
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kyverno-smoke-sa
+  namespace: kyverno-smoke
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kyverno-smoke-pods
+  namespace: kyverno-smoke
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kyverno-smoke-pods
+  namespace: kyverno-smoke
+subjects:
+  - kind: ServiceAccount
+    name: kyverno-smoke-sa
+    namespace: kyverno-smoke
+roleRef:
+  kind: Role
+  name: kyverno-smoke-pods
+  apiGroup: rbac.authorization.k8s.io

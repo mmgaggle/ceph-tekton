@@ -134,7 +134,9 @@ policy posture (dev):
 next:
   # run the smoke-test pipeline — one TaskRun pulls a signed image
   # (expects admission), one pulls an unsigned image (expects rejection).
-  kubectl apply -f pipelines/kyverno-smoke-test.yaml
+  kubectl apply -f manifests/smoke-setup/kyverno-smoke-rbac.yaml
+  kubectl apply -f pipelines/tasks/try-pod-admit.yaml
+  kubectl apply -f pipelines/pipelines/kyverno-smoke-test.yaml
   tkn pipeline start kyverno-smoke-test --showlog
 
   # inspect a policy decision after the fact:

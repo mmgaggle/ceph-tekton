@@ -1,0 +1,140 @@
+# compute-matrix-smoke-test — smoke Pipeline for the `compute-matrix` Task.
+#
+# Wires `compute-matrix` against the cheapest possible synthetic input
+# that still proves the Task end-to-end:
+#
+#   - A `compute-matrix-smoke-seed` Task writes a deterministic synthetic
+#     matrix.yaml into the shared `source` workspace. The matrix covers
+#     three cells with a mix of gating=true / gating=false, so the
+#     downstream assert has signal on both code paths. Hand-rolled bytes
+#     follow the same pattern as `vuln-scan-smoke-seed` — no upstream
+#     git-clone Task is needed (real pipelines wire one upstream; that's
+#     their concern, not the smoke's).
+#
+#   - `compute-matrix` parses the seeded matrix.yaml and emits the
+#     `matrix`, `cell-count`, `gating-count` Results.
+#
+#   - `compute-matrix-smoke-assert` consumes all three Results and
+#     re-validates the JSON array shape from inside the cluster:
+#       * `matrix` parses as a JSON array.
+#       * Every entry has distro / arch / gating keys.
+#       * `cell-count` is a positive integer and equals len(matrix).
+#       * `gating-count <= cell-count`.
+#       * For the synthetic seed specifically, cell-count == 3 and
+#         gating-count == 2 (two true + one false).
+#
+# Pairs with:
+#   - pipelines/tasks/compute-matrix-smoke-seed.yaml
+#   - pipelines/tasks/compute-matrix-smoke-assert.yaml
+#   - tasks/compute-matrix/task.yaml  (the canonical `compute-matrix` Task)
+# Apply all three Tasks before this Pipeline.
+#
+# Why a synthetic matrix instead of cloning ceph/ceph:
+#   The smoke MUST run offline in CI (no internet at the kind nodes by
+#   default, and even when there is, we don't want the smoke to depend
+#   on the live state of ceph/ceph's main branch). A hand-crafted
+#   matrix.yaml with a known cell count is the minimal input that proves
+#   the parse + JSON-emit + sanity-check path end-to-end.
+#
+# Single-resource file (no leading `---`) so PaC's remote-resolution
+# (`pipelinesascode.tekton.dev/pipeline: compute-matrix-smoke-test@URL`) succeeds.
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: compute-matrix-smoke-test
+spec:
+  description: |
+    Three-Task pipeline:
+      1. `seed`           — stage a deterministic synthetic matrix.yaml
+                            in the shared source workspace (3 cells, 2
+                            gating, 1 non-gating).
+      2. `compute-matrix` — parse it and emit the matrix /
+                            cell-count / gating-count Results.
+      3. `assert-results` — verify the JSON shape + that the scalar
+                            Results agree with the array length and the
+                            seeded values.
+
+    See docs/build-matrix.md for the matrix.yaml schema + the
+    compute-matrix Task contract + the documented fallback default
+    when matrix.yaml is absent.
+  params:
+    - name: matrix-file
+      type: string
+      default: matrix.yaml
+      description: |
+        Path (relative to the source workspace) for the synthetic
+        matrix.yaml. Threaded to both the seed Task and the
+        compute-matrix Task so they agree on where to read/write.
+    - name: tools-image
+      type: string
+      default: docker.io/mikefarah/yq:4.40.7
+      description: |
+        yq image, used by compute-matrix + the assert Task. Same pin
+        in both spots so the smoke only pulls one image beyond busybox.
+    - name: busybox-image
+      type: string
+      default: docker.io/library/busybox:1.36
+      description: |
+        Pinned busybox for the seed step. Same pin as the other smoke
+        tests in this repo.
+  workspaces:
+    - name: source
+      description: |
+        Shared workspace where the seed Task drops matrix.yaml and the
+        compute-matrix Task reads it. emptyDir is fine for smoke; real
+        pipelines bind the workspace a `git-clone` Task wrote into.
+  tasks:
+    - name: seed
+      taskRef:
+        name: compute-matrix-smoke-seed
+      params:
+        - name: tools-image
+          value: $(params.busybox-image)
+        - name: matrix-file
+          value: $(params.matrix-file)
+      workspaces:
+        - name: source
+          workspace: source
+    - name: compute-matrix
+      runAfter: [seed]
+      taskRef:
+        name: compute-matrix
+      params:
+        - name: source-ref
+          value: smoke-synthetic
+        - name: matrix-file
+          value: $(params.matrix-file)
+        - name: tools-image
+          value: $(params.tools-image)
+      workspaces:
+        - name: source
+          workspace: source
+    - name: assert-results
+      runAfter: [compute-matrix]
+      taskRef:
+        name: compute-matrix-smoke-assert
+      params:
+        - name: matrix
+          value: $(tasks.compute-matrix.results.matrix)
+        - name: cell-count
+          value: $(tasks.compute-matrix.results.cell-count)
+        - name: gating-count
+          value: $(tasks.compute-matrix.results.gating-count)
+        - name: tools-image
+          value: $(params.tools-image)
+  results:
+    # Re-expose the compute-matrix Results at the Pipeline level so a
+    # caller running this as a child Pipeline (or an e2e assert script
+    # pulling Results off the PipelineRun) can read them without
+    # following the child-TaskRun pointer.
+    - name: matrix
+      description: |
+        JSON array of {distro, arch, gating} cells, the same shape
+        downstream Tasks consume via `matrix: { include: ... }`.
+      value: $(tasks.compute-matrix.results.matrix)
+    - name: cell-count
+      description: Integer cell count (decimal string).
+      value: $(tasks.compute-matrix.results.cell-count)
+    - name: gating-count
+      description: Integer gating-cell count (decimal string).
+      value: $(tasks.compute-matrix.results.gating-count)

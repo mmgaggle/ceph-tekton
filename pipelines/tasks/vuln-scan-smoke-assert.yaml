@@ -1,0 +1,186 @@
+# vuln-scan-smoke-test — `vuln-scan-smoke-assert` Task.
+#
+# Asserts that `vuln-scan` emitted the expected Chains-grammar Results
+# and that the consolidated findings file is shape-valid.
+#
+# We wire the upstream Results in as Pipeline params and grep them
+# in-pod, so this Task needs no cluster RBAC against TaskRuns and runs
+# on any dev SA. Same pattern as sbom-pkg-smoke-assert.
+#
+# Pairs with pipelines/pipelines/vuln-scan-smoke-test.yaml.
+#
+# Single-resource file (no leading `---`) so PaC's remote-resolution
+# (`pipelinesascode.tekton.dev/task: vuln-scan-smoke-assert@URL`) succeeds.
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: vuln-scan-smoke-assert
+spec:
+  description: |
+    Assert that `vuln-scan` emitted the expected Chains-grammar
+    Results and that the consolidated findings file is shape-valid.
+
+    We wire the upstream Results in as Pipeline params and grep
+    them in-pod, so this Task needs no cluster RBAC against
+    TaskRuns and runs on any dev SA. Same pattern as
+    sbom-pkg-smoke-assert in pipelines/pipelines/sbom-pkg-smoke-test.yaml.
+  params:
+    - name: findings-uri
+      type: string
+      description: |
+        `.uri` of the upstream `findings-ARTIFACT_OUTPUTS` object
+        Result. Tekton object-Result references use per-key syntax
+        `$(tasks.<t>.results.<r>.<key>)`; the assert step
+        re-composes a sanity check from the three keys.
+    - name: findings-digest
+      type: string
+      description: |
+        `.digest` of the upstream `findings-ARTIFACT_OUTPUTS` object
+        Result. sha256:<hex>.
+    - name: findings-is-build-artifact
+      type: string
+      description: |
+        `.isBuildArtifact` of the upstream `findings-ARTIFACT_OUTPUTS`
+        object Result. MUST be the string "false" (Chains uses this
+        to classify the entry as a byproduct, not a subject).
+    - name: vuln-summary
+      type: string
+      description: |
+        Upstream `vuln-summary` Result. Shape:
+        `critical=N high=N medium=N low=N negligible=N unknown=N`.
+    - name: findings-count
+      type: string
+      description: |
+        Upstream `findings-count` Result. Total grype matches across
+        all scanned SBOMs.
+    - name: tools-image
+      type: string
+      default: docker.io/library/busybox:1.36
+  workspaces:
+    - name: sboms
+      description: |
+        Shared sboms workspace, re-bound here so we can sanity-check
+        that the consolidated findings file actually landed where
+        the URI Result claims.
+      mountPath: /workspace/sboms
+  steps:
+    - name: assert
+      image: $(params.tools-image)
+      env:
+        - name: FINDINGS_URI
+          value: $(params.findings-uri)
+        - name: FINDINGS_DIGEST
+          value: $(params.findings-digest)
+        - name: FINDINGS_IS_BUILD_ARTIFACT
+          value: $(params.findings-is-build-artifact)
+        - name: VULN_SUMMARY
+          value: $(params.vuln-summary)
+        - name: FINDINGS_COUNT
+          value: $(params.findings-count)
+      script: |
+        #!/bin/sh
+        set -eu
+        FAIL=0
+
+        echo "[assert] vuln-summary='${VULN_SUMMARY}'"
+        echo "[assert] findings-count='${FINDINGS_COUNT}'"
+        echo "[assert] findings-ARTIFACT_OUTPUTS.uri='${FINDINGS_URI}'"
+        echo "[assert] findings-ARTIFACT_OUTPUTS.digest='${FINDINGS_DIGEST}'"
+        echo "[assert] findings-ARTIFACT_OUTPUTS.isBuildArtifact='${FINDINGS_IS_BUILD_ARTIFACT}'"
+        echo
+
+        # ---- vuln-summary shape ----
+        for token in critical= high= medium= low= negligible= unknown=; do
+          if ! printf '%s' "${VULN_SUMMARY}" | grep -q "${token}"; then
+            echo "[assert] FAIL: vuln-summary missing '${token}' token" >&2
+            FAIL=1
+          fi
+        done
+
+        # ---- Critical findings present (Log4Shell on log4j-core 2.14.1) ----
+        # The shape is `critical=N high=N ...`, so we split on spaces
+        # and grep the critical token.
+        CRIT=$(printf '%s\n' "${VULN_SUMMARY}" \
+          | tr ' ' '\n' \
+          | grep '^critical=' \
+          | head -n1 \
+          | sed 's/^critical=//')
+        CRIT=${CRIT:-0}
+        echo "[assert] critical count: ${CRIT}"
+        if [ "${CRIT}" -lt 1 ]; then
+          echo "[assert] FAIL: expected at-least 1 critical finding (log4j-core 2.14.1 / CVE-2021-44228); got ${CRIT}" >&2
+          echo "[assert] NOTE: grype's vulnerability DB updates over time. If this becomes a false negative," >&2
+          echo "[assert]       check that the seed SBOM still references a CVE-bearing version." >&2
+          FAIL=1
+        fi
+
+        # ---- findings-count is a positive integer ----
+        case "${FINDINGS_COUNT}" in
+          ''|*[!0-9]*)
+            echo "[assert] FAIL: findings-count='${FINDINGS_COUNT}' is not a non-negative integer" >&2
+            FAIL=1
+            ;;
+          *)
+            if [ "${FINDINGS_COUNT}" -lt 1 ]; then
+              echo "[assert] FAIL: findings-count=${FINDINGS_COUNT}; expected > 0 for log4j-core 2.14.1" >&2
+              FAIL=1
+            fi
+            ;;
+        esac
+
+        # ---- findings-ARTIFACT_OUTPUTS keys ----
+        # uri must be non-empty and end in .grype.json
+        if [ -z "${FINDINGS_URI}" ]; then
+          echo "[assert] FAIL: findings-ARTIFACT_OUTPUTS.uri is empty" >&2
+          FAIL=1
+        elif ! printf '%s' "${FINDINGS_URI}" | grep -q '\.grype\.json$'; then
+          echo "[assert] FAIL: findings-ARTIFACT_OUTPUTS.uri must end in .grype.json (got '${FINDINGS_URI}')" >&2
+          FAIL=1
+        fi
+        # digest must be sha256:<64-hex>
+        if ! printf '%s' "${FINDINGS_DIGEST}" | grep -qE '^sha256:[0-9a-f]{64}$'; then
+          echo "[assert] FAIL: findings-ARTIFACT_OUTPUTS.digest must be sha256:<64-hex> (got '${FINDINGS_DIGEST}')" >&2
+          FAIL=1
+        fi
+        # isBuildArtifact MUST be "false" — Chains uses this to
+        # classify the entry as a byproduct, not a subject.
+        if [ "${FINDINGS_IS_BUILD_ARTIFACT}" != "false" ]; then
+          echo "[assert] FAIL: findings-ARTIFACT_OUTPUTS.isBuildArtifact must be 'false' (got '${FINDINGS_IS_BUILD_ARTIFACT}')" >&2
+          FAIL=1
+        fi
+
+        # ---- Consolidated findings JSON exists + parses (loosely) ----
+        AGG="/workspace/sboms/findings.grype.json"
+        if [ ! -f "${AGG}" ]; then
+          echo "[assert] FAIL: ${AGG} not present" >&2
+          FAIL=1
+        else
+          BYTES=$(wc -c < "${AGG}")
+          echo "[assert] ${AGG} size: ${BYTES} bytes"
+          if [ "${BYTES}" -lt 16 ]; then
+            echo "[assert] FAIL: ${AGG} suspiciously tiny" >&2
+            FAIL=1
+          fi
+          # Top-level shape: {"scans":[...],"summary":{...}}
+          for k in '"scans"' '"summary"' '"critical"' '"total"'; do
+            if ! grep -q "${k}" "${AGG}"; then
+              echo "[assert] FAIL: ${AGG} missing key ${k}" >&2
+              FAIL=1
+            fi
+          done
+          # The findings digest the Task surfaced should match the
+          # actual file content on disk.
+          ACTUAL="sha256:$(sha256sum "${AGG}" | awk '{print $1}')"
+          if [ "${ACTUAL}" != "${FINDINGS_DIGEST}" ]; then
+            echo "[assert] FAIL: findings.grype.json on-disk digest (${ACTUAL}) != Result digest (${FINDINGS_DIGEST})" >&2
+            FAIL=1
+          else
+            echo "[assert] OK: findings.grype.json on-disk digest matches Result digest"
+          fi
+        fi
+
+        if [ "${FAIL}" -ne 0 ]; then
+          echo "[assert] one or more assertions failed" >&2
+          exit 1
+        fi
+        echo "[assert] all Chains-grammar Results present and well-formed"

@@ -78,7 +78,12 @@ kustomize-validate: ## Render every kustomize overlay (no apply).
 
 .PHONY: pipelines-validate
 pipelines-validate: ## Server-side dry-run apply of pipeline manifests against the dev cluster.
-	@for f in pipelines/*.yaml; do \
+	@# Issue #68 split multi-doc smoke pipelines into single-resource
+	@# files under pipelines/{tasks,pipelines}/; setup bundles (non-Tekton
+	@# RBAC/Namespace prereqs) live under manifests/smoke-setup/. Validate
+	@# every layer + the legacy top-level files (build-grype-db, noop-pull-request).
+	@for f in pipelines/*.yaml pipelines/tasks/*.yaml pipelines/pipelines/*.yaml manifests/smoke-setup/*.yaml; do \
+	  [ -f "$$f" ] || continue; \
 	  echo "=== $$f ==="; \
 	  kubectl --context kind-$(KIND_CLUSTER_NAME) apply --dry-run=server -f "$$f"; \
 	done

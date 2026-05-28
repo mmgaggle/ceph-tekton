@@ -1,0 +1,156 @@
+# sbom-pkg-smoke-test — `sbom-pkg-smoke-assert` Task.
+#
+# Asserts that `generate-sbom` emitted the expected Chains-valid
+# Results — both the plural Results Chains promotes to subjects
+# (`IMAGES`, `SBOM_IMAGES`) and the byproduct object Result
+# (`sbom-ARTIFACT_OUTPUTS`).
+#
+# We wire the upstream Results in as Pipeline params and grep them
+# in-pod, so this Task needs no cluster RBAC against TaskRuns and runs
+# on any dev SA.
+#
+# Pairs with pipelines/pipelines/sbom-pkg-smoke-test.yaml.
+#
+# Single-resource file (no leading `---`) so PaC's remote-resolution
+# (`pipelinesascode.tekton.dev/task: sbom-pkg-smoke-assert@URL`) succeeds.
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: sbom-pkg-smoke-assert
+spec:
+  description: |
+    Assert that `generate-sbom` emitted the expected Chains-valid
+    Results — both the plural Results Chains promotes to subjects
+    (`IMAGES`, `SBOM_IMAGES`) and the byproduct object Result
+    (`sbom-ARTIFACT_OUTPUTS`).
+
+    We wire the upstream Results in as Pipeline params and grep them
+    in-pod, so this Task needs no cluster RBAC against TaskRuns and
+    runs on any dev SA.
+  params:
+    - name: images
+      type: string
+      description: |
+        Upstream `IMAGES` Result — newline-separated
+        `<artifact-url>@sha256:<digest>` pairs.
+    - name: sbom-images
+      type: string
+      description: |
+        Upstream `SBOM_IMAGES` Result — newline-separated
+        `<sbom-url>@sha256:<digest>` pairs, one per per-artifact
+        SBOM file. Same Chains grammar as IMAGES; distinct Result
+        name so verifier tooling can separate artifact subjects from
+        SBOM subjects.
+    - name: sbom-artifact-outputs-uri
+      type: string
+      description: |
+        `uri` field from the upstream `sbom-ARTIFACT_OUTPUTS` object
+        Result (the rollup SBOM file URL).
+    - name: sbom-artifact-outputs-digest
+      type: string
+      description: |
+        `digest` field from the upstream `sbom-ARTIFACT_OUTPUTS`
+        object Result.
+    - name: sbom-artifact-outputs-isbuildartifact
+      type: string
+      description: |
+        `isBuildArtifact` field from the upstream
+        `sbom-ARTIFACT_OUTPUTS` object Result. Must be `"false"` —
+        the SBOM is metadata about the build, not the build's
+        product.
+    - name: expected-count
+      type: string
+      default: "2"
+      description: |
+        Expected number of (artifact, SBOM) pairs. The seed Task
+        stages two .tar files, so the default is 2.
+    - name: tools-image
+      type: string
+      default: docker.io/library/busybox:1.36
+  steps:
+    - name: assert
+      image: $(params.tools-image)
+      env:
+        - name: IMAGES
+          value: $(params.images)
+        - name: SBOM_IMAGES
+          value: $(params.sbom-images)
+        - name: SBOM_AO_URI
+          value: $(params.sbom-artifact-outputs-uri)
+        - name: SBOM_AO_DIGEST
+          value: $(params.sbom-artifact-outputs-digest)
+        - name: SBOM_AO_ISBUILDARTIFACT
+          value: $(params.sbom-artifact-outputs-isbuildartifact)
+        - name: EXPECTED_COUNT
+          value: $(params.expected-count)
+      script: |
+        #!/bin/sh
+        set -eu
+        FAIL=0
+
+        # IMAGES Result: one `<artifact-url>@sha256:<hex>` line per artifact.
+        IMG_LINES=$(printf '%s\n' "${IMAGES}" | grep -c '@sha256:' || true)
+        echo "[assert] IMAGES line count: ${IMG_LINES} (expected ${EXPECTED_COUNT})"
+        if [ "${IMG_LINES}" != "${EXPECTED_COUNT}" ]; then
+          echo "[assert] FAIL: IMAGES must have one <url>@sha256:<hex> line per artifact" >&2
+          echo "[assert] got IMAGES:" >&2
+          printf '%s\n' "${IMAGES}" >&2
+          FAIL=1
+        fi
+
+        # SBOM_IMAGES Result: one `<sbom-url>@sha256:<hex>` line per SBOM file.
+        SBOM_LINES=$(printf '%s\n' "${SBOM_IMAGES}" | grep -c '@sha256:' || true)
+        echo "[assert] SBOM_IMAGES line count: ${SBOM_LINES} (expected ${EXPECTED_COUNT})"
+        if [ "${SBOM_LINES}" != "${EXPECTED_COUNT}" ]; then
+          echo "[assert] FAIL: SBOM_IMAGES must have one <url>@sha256:<hex> line per SBOM file" >&2
+          echo "[assert] got SBOM_IMAGES:" >&2
+          printf '%s\n' "${SBOM_IMAGES}" >&2
+          FAIL=1
+        fi
+
+        # Every SBOM_IMAGES entry must end in `.cdx.json@sha256:<hex>`,
+        # so smoke-time the file extension is the mediaType signal
+        # (mediaType isn't carried in the Chains object Result schema).
+        BAD_SUFFIX=$(printf '%s\n' "${SBOM_IMAGES}" \
+          | grep -v '\.cdx\.json@sha256:' \
+          | grep -c '@sha256:' || true)
+        if [ "${BAD_SUFFIX}" != "0" ]; then
+          echo "[assert] FAIL: SBOM_IMAGES entries must end in .cdx.json@sha256:<hex>" >&2
+          FAIL=1
+        fi
+
+        # sbom-ARTIFACT_OUTPUTS object Result: shape-check the three
+        # required keys (Chains 0.26 schema: uri, digest,
+        # isBuildArtifact). No mediaType, no nested sbom.
+        echo "[assert] sbom-ARTIFACT_OUTPUTS.uri='${SBOM_AO_URI}'"
+        echo "[assert] sbom-ARTIFACT_OUTPUTS.digest='${SBOM_AO_DIGEST}'"
+        echo "[assert] sbom-ARTIFACT_OUTPUTS.isBuildArtifact='${SBOM_AO_ISBUILDARTIFACT}'"
+
+        case "${SBOM_AO_URI}" in
+          workspace://sboms/*.cdx.json|https://*/sboms/*.cdx.json)
+            : ;;
+          *)
+            echo "[assert] FAIL: sbom-ARTIFACT_OUTPUTS.uri must point at a .cdx.json under sboms/" >&2
+            FAIL=1
+            ;;
+        esac
+
+        case "${SBOM_AO_DIGEST}" in
+          sha256:[0-9a-f]*)
+            : ;;
+          *)
+            echo "[assert] FAIL: sbom-ARTIFACT_OUTPUTS.digest must be sha256:<hex>" >&2
+            FAIL=1
+            ;;
+        esac
+
+        if [ "${SBOM_AO_ISBUILDARTIFACT}" != "false" ]; then
+          echo "[assert] FAIL: sbom-ARTIFACT_OUTPUTS.isBuildArtifact must be 'false' (SBOM is metadata, not product)" >&2
+          FAIL=1
+        fi
+
+        if [ "${FAIL}" -ne 0 ]; then
+          echo "[assert] one or more assertions failed" >&2
+          exit 1
+        fi
+        echo "[assert] all Chains-valid Results present and well-formed"

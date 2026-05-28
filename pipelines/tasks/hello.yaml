@@ -1,0 +1,25 @@
+# Smoke-test Task. Companion to pipelines/pipelines/hello-world.yaml.
+# Echoes a greeting; used to prove the dev cluster's Tekton install is
+# functional end-to-end. See `make dev-test` and the contributor
+# onboarding guide.
+#
+# Single-resource file (no leading `---`) so PaC's remote-resolution
+# (`pipelinesascode.tekton.dev/task: hello@URL`) succeeds — PaC reads
+# the URI as exactly one Task.
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: hello
+spec:
+  description: Echo a greeting.
+  params:
+    - name: who
+      type: string
+      default: world
+      description: Who to greet.
+  steps:
+    - name: say-hello
+      image: docker.io/library/busybox:1.36
+      script: |
+        #!/bin/sh
+        echo "hello, $(params.who) — from ceph-tekton"

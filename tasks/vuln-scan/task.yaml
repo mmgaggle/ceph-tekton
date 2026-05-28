@@ -156,7 +156,7 @@ spec:
         Canonical HTTPS URL of the producer's `latest.json` pointer.
         Default points at the production prefix on artifacts.ceph.com;
         smoke pipelines running against vstart override this to a
-        dev RGW URL (see `pipelines/vuln-scan-smoke-test.yaml`).
+        dev RGW URL (see `pipelines/pipelines/vuln-scan-smoke-test.yaml`).
         The pointer's `tarball` / `bundle` / `pubkey` fields are
         relative paths; the consumer rebases them onto the host +
         path prefix of this URL.

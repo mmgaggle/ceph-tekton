@@ -123,7 +123,7 @@ kubectl run unsigned-test --image=quay.io/ceph/ceph:smoke-test-deliberately-unsi
 The expected output is a rejection from
 `validation.kyverno.svc.cluster.local` mentioning cosign / signature
 verification. The full smoke-test pipeline this repo ships at
-`pipelines/kyverno-smoke-test.yaml` exercises both admit and reject
+`pipelines/pipelines/kyverno-smoke-test.yaml` exercises both admit and reject
 paths and asserts the rejection reason.
 
 ## Rolling out safely
@@ -293,4 +293,4 @@ otherwise excluded from.
 - Sigstore cosign: <https://docs.sigstore.dev/cosign/>
 - ceph-tekton Chains config: [`docs/provenance.md`](provenance.md)
 - This policy's chart pin + day-2 ops: [`charts/kyverno/README.md`](../charts/kyverno/README.md)
-- Smoke-test pipeline: [`pipelines/kyverno-smoke-test.yaml`](../pipelines/kyverno-smoke-test.yaml)
+- Smoke-test pipeline: [`pipelines/pipelines/kyverno-smoke-test.yaml`](../pipelines/pipelines/kyverno-smoke-test.yaml)

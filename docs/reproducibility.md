@@ -82,13 +82,13 @@ fail the build), pass `fail-on-diff: "true"` to the Task.
 
 ### Against the bundled smoke target
 
-The `pipelines/reproducibility-check.yaml` Pipeline defaults to the
-cheapest possible "build" that still proves the harness mechanism
+The `pipelines/pipelines/reproducibility-check.yaml` Pipeline defaults
+to the cheapest possible "build" that still proves the harness mechanism
 end-to-end — a deterministic tar of `/etc/os-release`:
 
 ```sh
 kubectl apply -f tasks/reproducibility-check/task.yaml
-kubectl apply -f pipelines/reproducibility-check.yaml
+kubectl apply -f pipelines/pipelines/reproducibility-check.yaml
 
 cat <<'EOF' | kubectl create -f -
 apiVersion: tekton.dev/v1

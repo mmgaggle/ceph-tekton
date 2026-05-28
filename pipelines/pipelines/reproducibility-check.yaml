@@ -1,4 +1,4 @@
-# Reproducibility-check smoke test pipeline.
+# Reproducibility-check smoke test Pipeline.
 #
 # Wires `reproducibility-check` Task against the cheapest possible "build"
 # that still proves the harness mechanism: produce a deterministic tar of
@@ -7,6 +7,10 @@
 # the other classic sources of tar non-determinism (FS iteration order,
 # host uid/gid lookup). If THIS pipeline doesn't go 100% reproducible,
 # the harness itself is broken — not the build it's measuring.
+#
+# Pairs with tasks/reproducibility-check/task.yaml (the canonical Task);
+# this Pipeline only references it, doesn't redefine it. Apply the Task
+# first.
 #
 # Why not a cmake hello-world for the smoke test:
 #   - Adds gcc/cmake to the builder image (or pulls a heavier base) for
@@ -21,7 +25,9 @@
 # different `source-repo`, `build-command`, and `output-glob` params
 # from the calling PipelineRun. See `docs/reproducibility.md` for the
 # wiring patterns.
----
+#
+# Single-resource file (no leading `---`) so PaC's remote-resolution
+# (`pipelinesascode.tekton.dev/pipeline: reproducibility-check@URL`) succeeds.
 apiVersion: tekton.dev/v1
 kind: Pipeline
 metadata:
