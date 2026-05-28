@@ -22,8 +22,18 @@
 # daily delta is small even on a multi-GB ceph tree. The clone is
 # bare + single-branch — no submodules, no working tree.
 #
-# Manual run: Actions tab -> "sync mmgaggle/ceph from upstream ceph/ceph"
-# -> "Run workflow".
+# Manual run:
+#   - GitHub Actions tab -> "sync mmgaggle/ceph from upstream ceph/ceph"
+#     -> "Run workflow".
+#   - Or from a shell with `gh`:
+#       # main-only sync (skip ci-tekton rebase — use when ci-tekton
+#       # has pending hand-edits you don't want force-with-leased over):
+#       gh workflow run sync-mmgaggle-ceph.yml \
+#         -R mmgaggle/ceph-tekton --ref main \
+#         -f rebase_ci_tekton=false
+#       # full sync incl. ci-tekton rebase (same shape as the 06:00 UTC cron):
+#       gh workflow run sync-mmgaggle-ceph.yml \
+#         -R mmgaggle/ceph-tekton --ref main
 
 name: sync mmgaggle/ceph from upstream ceph/ceph
 
