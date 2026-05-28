@@ -44,6 +44,12 @@ source "${SCRIPT_DIR}/lib.sh"
 # standing up its own busybox httpd Pod. Failing fast on zgw-posix
 # saves us a multi-minute grype-DB stage that won't have anywhere
 # to land.
+#
+# verify-image-signature-smoke runs after build-builder-image because
+# both depend on the in-cluster registry:2 deployment in ns/e2e-registry.
+# build-builder-image is the first to bring it up; running the verify
+# smoke after means the registry image is already pulled and the
+# verify script's idempotent re-apply is a no-op.
 ASSERTIONS=(
   hello-world
   chains-smoke
@@ -55,6 +61,7 @@ ASSERTIONS=(
   zgw-posix-up
   vuln-scan-smoke
   build-builder-image
+  verify-image-signature-smoke
 )
 
 SKIP="${E2E_SKIP:-}"
