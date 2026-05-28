@@ -1,0 +1,121 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pac-ingress-caddy
+spec:
+  # Single replica is intentional. Caddy's ACME state is on a single
+  # RWO PVC, and the dev cluster's PaC webhook throughput is one POST
+  # per GitHub event — well within a single Caddy pod's capacity.
+  # Scaling out would require an RWX volume + shared ACME storage
+  # plugin; out of scope for phase 1.
+  replicas: 1
+  strategy:
+    # Recreate (not RollingUpdate) so the PVC isn't claimed by two
+    # Pods at once during a roll. Brief downtime on a config change
+    # is acceptable for the webhook path.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pac-ingress
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pac-ingress
+    spec:
+      # No special SA — Caddy doesn't need to talk to the kube API.
+      # It hits the PaC controller via in-cluster DNS like any
+      # other pod.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: caddy
+          # Pin a specific Caddy minor. Bump in a focused PR after
+          # confirming the Caddyfile still parses + ACME still works.
+          image: caddy:2.8.4-alpine
+          imagePullPolicy: IfNotPresent
+          args:
+            - caddy
+            - run
+            - --config
+            - /etc/caddy/Caddyfile
+            - --adapter
+            - caddyfile
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+            - name: https
+              containerPort: 443
+              protocol: TCP
+          # The 2.8 caddy image binds :80 and :443 directly. Drop all
+          # capabilities except the two needed to bind privileged
+          # ports as a non-root UID.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - NET_BIND_SERVICE
+          volumeMounts:
+            - name: caddyfile
+              mountPath: /etc/caddy
+              readOnly: true
+            - name: data
+              mountPath: /data
+            # Caddy writes a small amount of runtime state (e.g. the
+            # auto-https locks) to $XDG_CONFIG_HOME which defaults to
+            # /home/$USER/.config. With a read-only root FS we need
+            # a writable scratch dir for it.
+            - name: config-cache
+              mountPath: /config
+          env:
+            - name: XDG_CONFIG_HOME
+              value: /config
+          # Use Caddy's local admin endpoint disabled (admin off in
+          # the Caddyfile); fall back to a TCP probe on :443. We use
+          # TCP rather than HTTPS because Caddy serves a self-signed
+          # cert until ACME completes, and the kubelet has no way
+          # to skip cert validation on a probe.
+          readinessProbe:
+            tcpSocket:
+              port: https
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            tcpSocket:
+              port: https
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              # Caddy idles at ~20MB; bursts during ACME issuance.
+              # 256Mi is well above peak observed in similar
+              # deployments.
+              cpu: 500m
+              memory: 256Mi
+      volumes:
+        - name: caddyfile
+          configMap:
+            name: pac-ingress-caddy
+            items:
+              - key: Caddyfile
+                path: Caddyfile
+        - name: data
+          persistentVolumeClaim:
+            claimName: pac-ingress-caddy-data
+        - name: config-cache
+          emptyDir:
+            sizeLimit: 32Mi

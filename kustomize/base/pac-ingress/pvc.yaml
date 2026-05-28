@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pac-ingress-caddy-data
+spec:
+  # ACME state is tiny (a few KB of account key + per-cert
+  # private key + chain), but 1Gi is the smallest sensible PVC and
+  # leaves headroom for Caddy's on-disk state machine.
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  # storageClassName intentionally unset — let the cluster's default
+  # provisioner pick. On the k3s EC2 cluster that's local-path
+  # (Rancher); on kind it's standard; on OpenShift it'll be whatever
+  # the cluster admin made default. If a cluster has no default class,
+  # the overlay must add one via a patch.

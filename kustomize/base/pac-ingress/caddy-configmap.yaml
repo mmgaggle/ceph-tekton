@@ -1,0 +1,74 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pac-ingress-caddy
+data:
+  # Caddyfile reverse-proxying PAC_HOSTNAME_PLACEHOLDER to the
+  # in-cluster PaC controller Service.
+  #
+  # Why Caddy: built-in ACME (Let's Encrypt) means TLS termination,
+  # cert issuance, and renewal are all the same single process. No
+  # cert-manager, no ingress-controller, no separate Issuer + Certificate
+  # CRs.
+  #
+  # Caddy auto-HTTPS rules (https://caddyserver.com/docs/automatic-https):
+  #   * Any site address that's a hostname (not 'localhost', not an
+  #     IP, not ':PORT') triggers automatic certificate management.
+  #   * HTTP-01 ACME challenge requires port :80 reachable from the
+  #     public internet on the same hostname; we expose :80 on the
+  #     Service for this reason (and Caddy auto-redirects :80 -> :443
+  #     for normal traffic).
+  #
+  # OVERLAY MUST REPLACE `PAC_HOSTNAME_PLACEHOLDER` with the real DNS
+  # name. Leaving the placeholder will not break Caddy startup parse
+  # (it's a syntactically-valid hostname) but will prevent ACME from
+  # ever succeeding and obviously won't match real DNS — so it's
+  # easy to spot in `kubectl logs`.
+  #
+  # ACME_EMAIL is the contact address Let's Encrypt uses for expiry
+  # warnings + ToS acceptance. Default to a placeholder; overlay
+  # should substitute a real address.
+  Caddyfile: |
+    {
+      email ACME_EMAIL_PLACEHOLDER
+      # Persistent storage for issued certs, account keys, and the
+      # ACME state machine. Mounted from a PVC by the Deployment.
+      storage file_system /data
+      # Disable the built-in admin endpoint — we don't use it and it
+      # otherwise listens on :2019 on all interfaces inside the pod.
+      admin off
+    }
+
+    PAC_HOSTNAME_PLACEHOLDER {
+      # Reverse-proxy every request to the PaC controller. PaC's
+      # webhook handler is mounted at /, so a path-prefix match is
+      # not needed. The controller Service is ClusterIP :8080.
+      reverse_proxy pipelines-as-code-controller.pipelines-as-code.svc.cluster.local:8080 {
+        # Preserve the original Host header so PaC sees the public
+        # hostname (some PaC log lines include it; harmless if
+        # ignored).
+        header_up Host {host}
+        # Default Caddy timeouts are generous; the PaC controller
+        # responds in milliseconds for normal webhook deliveries, so
+        # no tuning needed here. Add transport directives in the
+        # future if GitHub starts retrying on slow responses.
+      }
+
+      # A small JSON 200 on GET / so casual browser hits and uptime
+      # probes don't see a confusing 404 from the PaC handler (which
+      # only knows POST). GitHub itself only sends POST so this
+      # doesn't affect deliveries.
+      @get_root {
+        method GET
+        path /
+      }
+      respond @get_root `{"service":"pac-ingress","ok":true}` 200 {
+        close
+      }
+
+      # Structured logs to stdout for `kubectl logs`.
+      log {
+        output stdout
+        format json
+      }
+    }
