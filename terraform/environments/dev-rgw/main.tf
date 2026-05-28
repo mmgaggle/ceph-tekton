@@ -18,9 +18,15 @@
 # ---------------------------------------------------------------------------
 
 provider "aws" {
-  region     = var.rgw_region
-  access_key = var.rgw_access_key
-  secret_key = var.rgw_secret_key
+  region = var.rgw_region
+
+  # Auth via a standard AWS credentials file (`~/.aws/credentials` by
+  # default) keyed by a named profile. Keeps long-lived test-user
+  # keys out of shell env / history; profile-per-cluster makes
+  # juggling several Ceph endpoints natural. pathexpand() so the
+  # `~/.aws/credentials` default resolves the tilde.
+  shared_credentials_files = [pathexpand(var.credentials_path)]
+  profile                  = var.credentials_profile
 
   # RGW STS / IAM surfaces differ from AWS — skip the validations
   # that would otherwise hit unsupported endpoints.

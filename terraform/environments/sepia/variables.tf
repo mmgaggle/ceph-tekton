@@ -14,22 +14,34 @@ variable "rgw_region" {
   default     = "default"
 }
 
-variable "rgw_access_key" {
+variable "credentials_path" {
   description = <<-EOT
-    Bootstrap RGW access key. Source from env (`TF_VAR_rgw_access_key`)
-    or a one-time credential issued by the RGW admin; do NOT commit a
-    value here. Once the RGW OIDC trust + role from issue #2 lands,
-    this gets replaced with `AssumeRoleWithWebIdentity` from a CI SA
-    token and these long-lived keys go away.
+    Path to an AWS-format credentials file (the same format the
+    `aws` CLI reads from `~/.aws/credentials`). Tilde-expanded by
+    `pathexpand()` in main.tf.
+
+    Bootstrap a profile section with the admin-issued one-time
+    credential:
+
+      [sepia-bootstrap]
+      aws_access_key_id = ...
+      aws_secret_access_key = ...
+
+    Then set `credentials_profile = "sepia-bootstrap"` here. Once
+    the RGW OIDC trust + role from issue #7 lands, the long-lived
+    bootstrap profile goes away and this provider switches to
+    `AssumeRoleWithWebIdentity` from a CI SA token.
   EOT
   type        = string
-  default     = ""
-  sensitive   = true
+  default     = "~/.aws/credentials"
 }
 
-variable "rgw_secret_key" {
-  description = "Bootstrap RGW secret key. See rgw_access_key."
+variable "credentials_profile" {
+  description = <<-EOT
+    Named profile inside `credentials_path` to authenticate against.
+    Sepia bootstrap-grade — the profile maps to the admin-issued
+    one-time credential while #7's OIDC trust isn't yet wired.
+  EOT
   type        = string
-  default     = ""
-  sensitive   = true
+  default     = "default"
 }

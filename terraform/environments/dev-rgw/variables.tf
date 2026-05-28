@@ -14,24 +14,38 @@ variable "rgw_region" {
   default     = "default"
 }
 
-variable "rgw_access_key" {
+variable "credentials_path" {
   description = <<-EOT
-    Test-user RGW access key. Source from env (`TF_VAR_rgw_access_key`)
-    or a per-dev credential issued by the RGW admin; do NOT commit a
-    value here. This is bootstrap-grade — a long-lived key for the
-    test user. Production Sepia gets STS via OIDC (#7); dev-rgw uses
-    static creds to keep the bootstrap shallow.
+    Path to an AWS-format credentials file (the same format the
+    `aws` CLI reads from `~/.aws/credentials`). Tilde-expanded by
+    `pathexpand()` in main.tf.
+
+    Bootstrap a profile section for your test RGW:
+
+      [my-test-rgw]
+      aws_access_key_id = ...
+      aws_secret_access_key = ...
+
+    Then set `credentials_profile = "my-test-rgw"` here (or scope
+    via `TF_VAR_credentials_profile`). Production Sepia will get
+    STS via OIDC (#7); dev-rgw uses long-lived test-user keys to
+    keep the bootstrap shallow — same posture as before, just
+    sourced via the standard AWS credentials chain instead of
+    `TF_VAR_rgw_*` env vars.
   EOT
   type        = string
-  default     = ""
-  sensitive   = true
+  default     = "~/.aws/credentials"
 }
 
-variable "rgw_secret_key" {
-  description = "Test-user RGW secret key. See rgw_access_key."
+variable "credentials_profile" {
+  description = <<-EOT
+    Named profile inside `credentials_path` to authenticate against.
+    Per-cluster profiles (e.g. `kyle-rgw-test`, `team-rgw-shared`)
+    let devs juggle multiple Ceph endpoints without juggling env
+    vars.
+  EOT
   type        = string
-  default     = ""
-  sensitive   = true
+  default     = "default"
 }
 
 variable "bucket_prefix" {

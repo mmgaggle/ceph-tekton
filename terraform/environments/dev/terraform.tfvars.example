@@ -1,7 +1,21 @@
 # Copy to terraform.tfvars to customize. All values shown are defaults.
 #
-# rgw_endpoint   = "http://127.0.0.1:8000"
-# rgw_access_key = "cephtekton"
-# rgw_secret_key = "cephtekton"
-# rgw_region     = "default"
-# bucket_prefix  = ""
+# rgw_endpoint        = "http://127.0.0.1:8000"
+# rgw_region          = "default"
+# bucket_prefix       = ""
+#
+# Auth via AWS credentials file (the same shape `aws` CLI reads). To
+# bootstrap a local profile for zgw-posix:
+#
+#   mkdir -p ~/.aws
+#   cat >> ~/.aws/credentials <<'EOF'
+#   [zgw-posix]
+#   aws_access_key_id = cephtekton
+#   aws_secret_access_key = cephtekton
+#   EOF
+#
+# Then either set `credentials_profile = "zgw-posix"` or copy the same
+# pair to a `[default]` section.
+#
+# credentials_path    = "~/.aws/credentials"
+# credentials_profile = "default"

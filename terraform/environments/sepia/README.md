@@ -7,10 +7,20 @@ Bringing it up requires four prerequisites that are out of scope for
 issue #6:
 
 1. **A Sepia RGW endpoint and admin-issued bootstrap credential.**
-   The endpoint URL, region, and a single-use access/secret pair must
-   be set via `TF_VAR_rgw_endpoint`, `TF_VAR_rgw_access_key`, and
-   `TF_VAR_rgw_secret_key` (or a `terraform.tfvars` file kept out of
-   git). These long-lived keys are temporary — see prerequisite 4.
+   The endpoint URL goes in `TF_VAR_rgw_endpoint`. The access/secret
+   pair lands in an AWS credentials file as a named profile:
+
+   ```sh
+   cat >> ~/.aws/credentials <<'EOF'
+   [sepia-bootstrap]
+   aws_access_key_id = <admin-issued key>
+   aws_secret_access_key = <admin-issued secret>
+   EOF
+   ```
+
+   Then `export TF_VAR_credentials_profile="sepia-bootstrap"` (or set
+   it in a `terraform.tfvars` kept out of git). These long-lived keys
+   are temporary — see prerequisite 4.
 
 2. **A pre-created `ceph-tekton-tfstate` bucket on the same RGW.**
    Chicken-and-egg: the state backend for *this* terraform lives on
