@@ -1,0 +1,36 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# pac-repositories — Pipelines-as-Code Repository CRs (issue #71).
+#
+# Scope of THIS base: one Namespace + one Repository CR per ceph fork
+# that PaC should route webhooks for. Today that's just mmgaggle/ceph;
+# adding ceph/ceph (or other forks) is a one-file change here plus a
+# corresponding GitHub App install on the new repo.
+#
+# WHY a dedicated base (rather than colocating the Repository CRs with
+# `kustomize/base/pipelines-as-code/`): that base pins the PaC release
+# manifest (controller / webhook / watcher Deployments + CRDs); this
+# base is the per-fork application config that USES those CRDs. Two
+# different things, different change cadences:
+#   - pipelines-as-code: bump when PaC releases a new version.
+#   - pac-repositories: add/remove when a new fork comes under CI, or
+#     when settings (concurrency_limit, etc.) need tuning per fork.
+# Keeping them separate makes each PR's blast radius obvious.
+#
+# Apply order: this base requires the Repository CRD that
+# kustomize/base/pipelines-as-code/ installs. Overlays MUST apply the
+# pipelines-as-code base first (and wait for the CRD to be Established)
+# before applying this base. See the dev-local overlay decision in the
+# issue #71 PR body for why we DON'T auto-wire this into dev-local
+# today — the PaC install needs cluster-side Secret bootstrap that
+# isn't kustomize-managed yet.
+#
+# WHY kustomize at the base level (rather than helm or terraform):
+# this is three small YAMLs with no parametrization — kustomize is the
+# right tool. Helm would add a values.yaml + template dance for zero
+# net flexibility.
+
+resources:
+  - namespace.yaml
+  - ceph-mmgaggle.yaml

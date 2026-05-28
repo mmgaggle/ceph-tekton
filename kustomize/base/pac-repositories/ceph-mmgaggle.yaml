@@ -1,0 +1,33 @@
+# Pipelines-as-Code Repository CR for mmgaggle/ceph.
+#
+# This is the binding that tells PaC "events from this GitHub repo land
+# as PipelineRuns in this namespace". PaC's controller routes inbound
+# webhook deliveries by matching the event's repo URL against every
+# Repository CR's spec.url in the cluster — no match, no PipelineRun.
+#
+# WHY mmgaggle/ceph (vs ceph/ceph): mmgaggle/ceph is the
+# integration fork that carries the `ceph-tekton-integration` branch.
+# PRs against that branch are the surface we drive PaC against in
+# phase 1 — the production ceph/ceph wiring is tracked separately in
+# #9 (real GitHub App, real org-approved install) and is HITL.
+#
+# WHY namespace=ceph-builds-ci: see namespace.yaml in this directory
+# for the split-namespace rationale. tl;dr — keep the heavy ceph build
+# workspaces + their per-namespace policies scoped to a namespace
+# that's distinct from this repo's own lightweight noop CI
+# (ceph-tekton-ci).
+#
+# WHY no settings.params / concurrency_limit / pipelineruns_history /
+# webhook block here: spec.url + namespace is the minimum viable
+# Repository for PaC to start routing. Settings layer on later as the
+# PaC pipelines mature — separate PR per knob, same Repository CR.
+apiVersion: pipelinesascode.tekton.dev/v1alpha1
+kind: Repository
+metadata:
+  name: ceph-mmgaggle
+  namespace: ceph-builds-ci
+  labels:
+    app.kubernetes.io/name: ceph-mmgaggle
+    app.kubernetes.io/part-of: ceph-tekton
+spec:
+  url: https://github.com/mmgaggle/ceph

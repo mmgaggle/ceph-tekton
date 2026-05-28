@@ -1,0 +1,35 @@
+# Namespace for ceph build PipelineRuns spawned by Pipelines-as-Code
+# from PRs against mmgaggle/ceph (and, in time, other ceph forks under
+# test). PaC matches inbound webhook events to a Repository CR; the
+# Repository's namespace is where the resulting PipelineRun lands.
+#
+# WHY a separate namespace (ceph-builds-ci) vs colocating with the
+# repo-self CI (ceph-tekton-ci, used by .tekton/noop-pull-request.yaml
+# for this repo's own smoke tests):
+#   - Ceph builds are heavy (multi-GB workspaces, debug binaries,
+#     long-running configure+ninja steps). Keeping them in their own
+#     namespace lets per-namespace ResourceQuota, NetworkPolicy, and
+#     LimitRange scope to "ceph builds" without throttling the
+#     lightweight noop runs that gate this repo's own PRs.
+#   - PaC's per-Repository concurrency limit and max-keep-runs settings
+#     are namespace-scoped — separating ceph build runs from the
+#     repo-self runs keeps each policy independent.
+#   - When phase-2 lands on Sepia, the executor ServiceAccount + Secret
+#     wiring (cosign-signing-key, S3 STS via projected SA token) for
+#     ceph builds will be materially different from the repo-self
+#     posture. Splitting now avoids a rename later.
+#
+# Labels:
+#   app.kubernetes.io/name=ceph-builds-ci  — what's in here
+#   app.kubernetes.io/part-of=ceph-tekton  — which stack it belongs to
+#
+# The kyverno ClusterPolicies + the observability stack both select
+# namespaces by `app.kubernetes.io/part-of=ceph-tekton`, so this label
+# is what enrolls the namespace in those cluster-wide flows.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ceph-builds-ci
+  labels:
+    app.kubernetes.io/name: ceph-builds-ci
+    app.kubernetes.io/part-of: ceph-tekton
