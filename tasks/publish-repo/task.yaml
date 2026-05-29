@@ -1,0 +1,696 @@
+# publish-repo — repository-publish Task (DEB path; #20).
+#
+# Builds a Debian-format apt repository from a workspace full of `.deb`
+# artefacts, signs the Release file via Vault transit (key never leaves
+# Vault), and uploads the resulting `dists/<codename>/` tree to a
+# staging prefix in S3 under
+#
+#   s3://${S3_BUCKET}/${S3_BRANCH}/${S3_SHA}-staging/${S3_DISTRO}/${S3_ARCH}/dists/${CODENAME}/
+#
+# matching the S3 layout the issue tracker calls out for the DEB
+# variant.
+#
+# SCOPE
+# -----
+# This Task ships the `mode=deb` (reprepro) path for issue #20. The
+# `mode=rpm` (createrepo_c) path is the sibling issue (#19); the
+# dispatching skeleton at step 0 below is intentionally explicit so
+# the RPM path can land alongside this one without restructuring the
+# Task. Today, `mode=rpm` exits with a non-zero "not yet implemented"
+# error.
+#
+# WHAT REPREPRO DOES HERE
+# -----------------------
+# `reprepro` is the canonical apt-repository builder. Given a `conf/`
+# directory describing one or more `Codename:` distributions and a
+# bag of `.deb` files, it emits a Debian-format tree:
+#
+#   dists/<codename>/Release
+#   dists/<codename>/InRelease           (cleartext-signed Release)
+#   dists/<codename>/Release.gpg         (detached Release signature)
+#   dists/<codename>/<component>/binary-<arch>/Packages
+#   dists/<codename>/<component>/binary-<arch>/Packages.gz
+#   pool/<component>/<initial>/<src>/<basename>.deb
+#
+# reprepro normally signs `Release` itself by shelling out to `gpg`
+# with the key referenced in `SignWith:`. We cannot do that here
+# because the GPG private key lives in Vault transit and never leaves
+# Vault. Instead this Task runs reprepro WITHOUT a `SignWith:` field
+# (reprepro emits unsigned `Release` + `Packages` + `Packages.gz`),
+# then a follow-on step asks Vault to sign the `Release` file via the
+# transit API and writes the two signed artefacts apt expects
+# (`Release.gpg` and `InRelease`).
+#
+# VAULT TRANSIT FOR REPO SIGNING — WHAT'S REAL, WHAT'S STUBBED
+# ------------------------------------------------------------
+# Vault transit signs raw bytes with the configured key (`rsa-4096`
+# for the real ceph repo signing key — see docs/vault.md "For the
+# production GPG-signing flow"). It returns a Vault-native
+# `vault:v<n>:<base64-sig>` string. apt-get on the consumer side
+# requires those bytes to be wrapped in an OpenPGP packet
+# (RFC 4880) and a cleartext-signed framing (RFC 4880 §7) for
+# `Release.gpg` and `InRelease` respectively.
+#
+# For the #20 tracer this Task does the Vault-side half end-to-end
+# (k8s SA-token → vault login → transit/sign), and writes:
+#
+#   Release.gpg   — the raw `vault:v<n>:<b64>` bytes returned by
+#                   transit/sign of sha256(Release). This is NOT yet
+#                   a valid OpenPGP detached signature; apt-get will
+#                   reject it. The OpenPGP packet wrapping is the
+#                   follow-up that makes AC bullet 4 ("`apt-get
+#                   update` against the staging URL works") pass.
+#
+#   InRelease     — same bytes wrapped in the RFC-4880-§7 cleartext
+#                   framing (`-----BEGIN PGP SIGNED MESSAGE-----`
+#                   header + Release contents + `-----BEGIN PGP
+#                   SIGNATURE-----` footer). Same caveat as above —
+#                   the signature block itself is the raw vault
+#                   token, not an OpenPGP packet.
+#
+# This shape proves:
+#   * reprepro runs and emits the expected tree
+#   * the SA-token → k8s-auth → transit/sign chain works under the
+#     same identity model as the existing vault-sign-smoke Task
+#   * the resulting bytes land at the AC-specified S3 key prefix
+#   * `gpg --verify` against an OpenPGP-wrapped signature is a
+#     mechanical follow-up (open as #20-followup once the wrapping
+#     helper lands)
+#
+# The Task header is the contract: if you bump the Vault call to
+# return wrapped OpenPGP packets, you can flip the two TODO markers
+# below and AC bullet 4/5 start passing without changing the Task
+# interface.
+#
+# OUTPUT LAYOUT
+# -------------
+#   /workspace/repo/conf/distributions          reprepro conf
+#   /workspace/repo/dists/<codename>/Release    unsigned summary
+#   /workspace/repo/dists/<codename>/Release.gpg detached sig (vault)
+#   /workspace/repo/dists/<codename>/InRelease   cleartext-signed
+#   /workspace/repo/pool/...                    .debs reprepro moved
+#
+# After the sign step the upload step `aws s3 cp --recursive`s the
+# `dists/<codename>/` subtree into the staging prefix. The `pool/`
+# tree is not uploaded by this Task in #20 — pool publication is the
+# build-package Task's responsibility (#16); publish-repo only owns
+# the metadata under `dists/`.
+#
+# CREDENTIALS
+# -----------
+# Same dual-path pattern as `tasks/generate-sbom`, `tasks/make-check`,
+# and `tasks/reproducibility-check`:
+#
+#   1. The `s3-credentials` workspace (dev / smoke) supplies static
+#      `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / optional
+#      `AWS_SESSION_TOKEN` files.
+#
+#   2. In Sepia the workspace is left empty and a projected SA token
+#      at /var/run/secrets/openshift/serviceaccount/token is exchanged
+#      for short-lived RGW creds via
+#      `aws sts assume-role-with-web-identity`. `AWS_ROLE_ARN` must
+#      be set by the calling Pipeline.
+#
+# The Vault auth side uses the standard projected SA token
+# (`/var/run/secrets/kubernetes.io/serviceaccount/token`) — same
+# mechanism as `pipelines/tasks/vault-sign-smoke.yaml`. The calling
+# Pipeline MUST run this Task with a ServiceAccount that's bound to
+# the Vault role passed via `vault-role`.
+#
+# FAIL-CLOSED
+# -----------
+# The Task fails non-zero if:
+#   * `mode` is not one of {deb, rpm}
+#   * `mode=rpm` (until #19 lands the createrepo_c half)
+#   * the artifacts workspace contains zero `.deb` files
+#   * Vault is unreachable, returns an empty client_token, or refuses
+#     the transit/sign call
+#   * S3 upload of the signed `dists/<codename>/` tree fails
+# There is no path through this Task that publishes an unsigned
+# Release file to S3.
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: publish-repo
+spec:
+  description: |
+    Build a Debian-format apt repository from `.deb` artefacts in the
+    artifacts workspace, sign the `Release` file via Vault transit,
+    and upload the `dists/<codename>/` tree to a staging S3 prefix.
+
+    `mode=deb` (this PR / #20) runs reprepro. `mode=rpm` (sibling
+    issue #19) will run createrepo_c — until #19 lands the Task
+    exits non-zero on `mode=rpm`.
+  params:
+    - name: mode
+      type: string
+      default: "deb"
+      description: |
+        Repository format to publish. `deb` runs reprepro
+        (this PR). `rpm` is reserved for #19's createrepo_c
+        path and currently exits with "not yet implemented".
+    - name: codename
+      type: string
+      default: "noble"
+      description: |
+        Debian/Ubuntu codename for the `dists/<codename>/` subtree
+        (e.g. `noble`, `jammy`, `bookworm`). reprepro's
+        `conf/distributions` `Codename:` field. Must be a single
+        codename — multi-suite publish (one Task per codename or a
+        matrix fan-out) is the calling Pipeline's job (#22).
+    - name: component
+      type: string
+      default: "main"
+      description: |
+        reprepro `Components:` field. `main` matches the upstream
+        ceph apt repo layout.
+    - name: architectures
+      type: string
+      default: "amd64"
+      description: |
+        Space-separated reprepro `Architectures:` list. `amd64`
+        only for this tracer; the build-package matrix (#16) will
+        thread `arm64` etc. through here.
+    - name: origin
+      type: string
+      default: "Ceph"
+      description: reprepro `Origin:` field on the published Release.
+    - name: label
+      type: string
+      default: "Ceph"
+      description: reprepro `Label:` field on the published Release.
+    - name: reprepro-image
+      type: string
+      default: "docker.io/library/ubuntu:noble"
+      description: |
+        Base image used by the build-repo step. We install reprepro,
+        gnupg, and ca-certificates at runtime (apt-get update +
+        install). Pinning to ubuntu:noble matches the codename
+        default and the build-builder-image matrix's ubuntu-noble
+        entry, so the e2e cluster reuses an image layer that's
+        already in cache.
+    - name: vault-image
+      type: string
+      default: "docker.io/hashicorp/vault:1.17.2"
+      description: |
+        Image providing the `vault` CLI for the sign step. Same pin
+        as `pipelines/tasks/vault-sign-smoke.yaml`.
+    - name: uploader-image
+      type: string
+      default: "docker.io/amazon/aws-cli:2.17.0"
+      description: |
+        Image providing the AWS CLI for the S3 upload step. Same pin
+        as `tasks/generate-sbom/task.yaml`.
+    - name: vault-addr
+      type: string
+      default: "http://vault.vault.svc.cluster.local:8200"
+      description: In-cluster Vault API endpoint.
+    - name: vault-role
+      type: string
+      default: "ceph-repo-signer"
+      description: |
+        Vault k8s-auth role bound to the (namespace,
+        serviceaccount) running this Task. Must have `update` on
+        `transit/sign/<transit-key>`. The dev cluster's role
+        (`ceph-test-signer`, transit/sign/ceph-test-key) can be
+        passed through for smoke; production overlays use the real
+        `ceph-repo-signer` role + key.
+    - name: transit-key
+      type: string
+      default: "ceph-repo-signing-key"
+      description: |
+        Vault transit key path component (`transit/sign/<this>`).
+        In dev/smoke this can be overridden to `ceph-test-key`
+        (the key hack/dev-vault-up.sh creates).
+    - name: s3-bucket
+      type: string
+      default: ""
+      description: |
+        S3 bucket name to upload the signed `dists/<codename>/`
+        tree into. Empty string disables upload (smoke runs
+        offline; signed metadata stays in the repo workspace).
+        Real pipelines pass `ceph-artifacts-dev` (matches
+        terraform/environments/sepia/main.tf).
+    - name: s3-endpoint
+      type: string
+      default: ""
+      description: |
+        Optional S3 endpoint URL (Sepia RGW or any S3-compatible
+        backend). Empty = AWS S3 default.
+    - name: s3-branch
+      type: string
+      default: "dev"
+      description: |
+        Branch component of the S3 key prefix. Real pipelines
+        thread the actual git branch through; smoke uses `dev`.
+    - name: s3-sha
+      type: string
+      default: "smoke"
+      description: |
+        Commit SHA component of the S3 key prefix. The published
+        path is `<branch>/<sha>-staging/<distro>/<arch>/dists/...`
+        per the issue tracker; the `-staging` suffix is appended
+        automatically by the upload step (callers pass the bare
+        SHA, NOT `<sha>-staging`).
+    - name: s3-distro
+      type: string
+      default: "ubuntu-noble"
+      description: |
+        Distro component of the S3 key prefix
+        (e.g. `ubuntu-noble`, `ubuntu-jammy`).
+    - name: s3-arch
+      type: string
+      default: "x86_64"
+      description: |
+        Arch component of the S3 key prefix (e.g. `x86_64`,
+        `aarch64`). Note: this is the S3-LAYOUT arch
+        (`x86_64`), distinct from reprepro's `Architectures:`
+        list (`amd64`) — Debian and the Ceph S3 layout use
+        different arch names and we don't conflate them.
+  results:
+    - name: REPO_URL
+      type: string
+      description: |
+        Final S3 URL of the published `dists/<codename>/`
+        directory. Empty when `s3-bucket` is unset (smoke /
+        no-upload).
+    - name: RELEASE_DIGEST
+      type: string
+      description: |
+        `sha256:<hex>` of the (unsigned) Release file the sign
+        step asked Vault to sign. Useful for downstream verifiers
+        that want to recompute the digest and compare against the
+        Vault audit log entry.
+  workspaces:
+    - name: artifacts
+      description: |
+        Workspace containing `.deb` files to import into the apt
+        repo. The Task discovers them via `find … -name '*.deb'`,
+        so subdirectory layout doesn't matter. In real pipelines
+        this is the build-output workspace produced by
+        build-package (#16); in smoke the e2e harness seeds a
+        single tiny `.deb` synthetically.
+      mountPath: /workspace/artifacts
+    - name: repo
+      description: |
+        Workspace where reprepro materialises the `dists/`,
+        `pool/`, and `conf/` subtrees. Must be writable across
+        steps (reprepro writes here; sign reads/writes
+        `dists/<codename>/Release{.gpg,}` + `InRelease`; upload
+        reads). emptyDir is fine for smoke; real pipelines use a
+        PVC so a follow-up `swap-staging-to-live` Task (#21) can
+        see the same tree.
+      mountPath: /workspace/repo
+    - name: s3-credentials
+      description: |
+        Optional. If mounted, expected to contain `AWS_ACCESS_KEY_ID`,
+        `AWS_SECRET_ACCESS_KEY`, and optionally `AWS_SESSION_TOKEN`
+        as files (one secret value per file). Same shape as the
+        reproducibility-check / generate-sbom Tasks.
+
+        In Sepia the workspace is left empty and a projected SA
+        token is exchanged for short-lived RGW creds via STS — same
+        precedence as the other S3-uploading Tasks (see
+        docs/architecture.md "S3 credentials: STS OIDC via
+        SA-token").
+
+        In dev/smoke the workspace is empty AND `s3-bucket` is
+        empty, so the upload step short-circuits.
+      optional: true
+  # Shared in-memory scratch volume for the Vault-side handoff: the
+  # `write-sa-token` step drops the projected SA JWT here, vault-login
+  # writes the client_token, and the sign step reads both. Mirrors
+  # the pattern in pipelines/tasks/vault-sign-smoke.yaml.
+  volumes:
+    - name: vault-scratch
+      emptyDir:
+        medium: Memory
+  stepTemplate:
+    volumeMounts:
+      - name: vault-scratch
+        mountPath: /vault-scratch
+  steps:
+    # ----------------------------------------------------------------
+    # Step 0: dispatch on `mode`. `deb` falls through; `rpm` aborts
+    # with the documented "not yet implemented" error pointing at #19.
+    # An unrecognised mode is also fatal — silently no-op'ing would
+    # let a typo'd Pipeline produce empty staging dirs.
+    # ----------------------------------------------------------------
+    - name: dispatch
+      image: docker.io/library/busybox:1.36
+      env:
+        - name: MODE
+          value: $(params.mode)
+      script: |
+        #!/bin/sh
+        set -eu
+        case "${MODE}" in
+          deb)
+            echo "[dispatch] mode=deb → reprepro path (this Task)"
+            ;;
+          rpm)
+            echo "FATAL: mode=rpm is not yet implemented in this Task." >&2
+            echo "       The createrepo_c path is sibling issue #19;"   >&2
+            echo "       this PR (#20) implements only the reprepro"    >&2
+            echo "       (DEB) path. Pass mode=deb."                     >&2
+            exit 1
+            ;;
+          *)
+            echo "FATAL: unknown mode '${MODE}' — expected 'deb' or 'rpm'" >&2
+            exit 1
+            ;;
+        esac
+
+    # ----------------------------------------------------------------
+    # Step 1: build the apt repo with reprepro.
+    #
+    # Materialises `conf/distributions`, runs `reprepro includedeb`
+    # against every `.deb` discovered in the artifacts workspace, and
+    # produces an UNSIGNED `dists/<codename>/Release` (no `SignWith:`
+    # field). The Vault sign step downstream wraps `Release` into the
+    # `Release.gpg` + `InRelease` artefacts apt expects.
+    # ----------------------------------------------------------------
+    - name: build-repo
+      image: $(params.reprepro-image)
+      workingDir: /workspace/repo
+      env:
+        - name: CODENAME
+          value: $(params.codename)
+        - name: COMPONENT
+          value: $(params.component)
+        - name: ARCHITECTURES
+          value: $(params.architectures)
+        - name: ORIGIN
+          value: $(params.origin)
+        - name: LABEL
+          value: $(params.label)
+        - name: DEBIAN_FRONTEND
+          value: noninteractive
+      script: |
+        #!/bin/bash
+        set -euo pipefail
+
+        # The ubuntu:noble image is bare — install reprepro + gnupg
+        # (gnupg pulls in the libraries reprepro links against even
+        # though we don't sign here) + ca-certificates so apt over
+        # https works in case the image's apt sources resolve to a
+        # mirror that requires it.
+        echo "[build-repo] installing reprepro + gnupg..."
+        apt-get update -qq
+        apt-get install -y --no-install-recommends \
+          reprepro gnupg ca-certificates >/dev/null
+        reprepro --version
+
+        # conf/distributions — single Codename:, single Component:,
+        # whatever Architectures: were passed. No `SignWith:` because
+        # signing is done by the sign step below using Vault transit
+        # (reprepro's built-in SignWith: shells out to gpg with a
+        # local secret key, which we can't have — the GPG key lives
+        # in Vault).
+        mkdir -p conf
+        cat > conf/distributions <<EOF
+        Origin: ${ORIGIN}
+        Label: ${LABEL}
+        Codename: ${CODENAME}
+        Architectures: ${ARCHITECTURES}
+        Components: ${COMPONENT}
+        Description: Ceph apt repository (staging)
+        EOF
+        echo "[build-repo] conf/distributions:"
+        cat conf/distributions
+
+        # Discover .debs. Empty match is fatal — publishing an empty
+        # repo is never useful and is almost certainly a misconfigured
+        # upstream build-package matrix.
+        mapfile -t DEBS < <(find /workspace/artifacts -type f -name '*.deb' | sort)
+        if [ "${#DEBS[@]}" -eq 0 ]; then
+          echo "FATAL: no .deb files found under /workspace/artifacts" >&2
+          ls -la /workspace/artifacts >&2 || true
+          exit 1
+        fi
+        echo "[build-repo] importing ${#DEBS[@]} .deb(s) into ${CODENAME}/${COMPONENT}:"
+        for d in "${DEBS[@]}"; do
+          echo "  - ${d}"
+        done
+
+        # `includedeb` is the per-deb import. reprepro deduplicates
+        # by (package, version, arch) so re-runs against the same
+        # input are idempotent.
+        for d in "${DEBS[@]}"; do
+          reprepro --basedir /workspace/repo \
+                   --component "${COMPONENT}" \
+                   includedeb "${CODENAME}" "${d}"
+        done
+
+        # Sanity check — the Release file must exist after `includedeb`
+        # for the sign step to have something to sign.
+        REL="/workspace/repo/dists/${CODENAME}/Release"
+        if [ ! -s "${REL}" ]; then
+          echo "FATAL: reprepro did not emit ${REL}" >&2
+          find /workspace/repo -maxdepth 4 >&2 || true
+          exit 1
+        fi
+        echo "[build-repo] Release emitted ($(wc -c <"${REL}") bytes):"
+        head -20 "${REL}"
+
+    # ----------------------------------------------------------------
+    # Step 2: write the projected SA token into the shared scratch
+    # volume so the Vault login step can present it. Same shape as
+    # pipelines/tasks/vault-sign-smoke.yaml step 1.
+    # ----------------------------------------------------------------
+    - name: write-sa-token
+      image: docker.io/library/busybox:1.36
+      script: |
+        #!/bin/sh
+        set -eu
+        TOKEN_PATH=/var/run/secrets/kubernetes.io/serviceaccount/token
+        if [ ! -s "${TOKEN_PATH}" ]; then
+          echo "FATAL: no SA token at ${TOKEN_PATH} — is this pod running with a real SA?" >&2
+          exit 1
+        fi
+        cp "${TOKEN_PATH}" /vault-scratch/sa.jwt
+        chmod 0400 /vault-scratch/sa.jwt
+        echo "[sa-token] captured SA token ($(wc -c < /vault-scratch/sa.jwt) bytes)"
+
+    # ----------------------------------------------------------------
+    # Step 3: log in to Vault via the k8s auth method. Same shape as
+    # pipelines/tasks/vault-sign-smoke.yaml step 2. The returned
+    # client_token lands in /vault-scratch/client.token for the sign
+    # step.
+    # ----------------------------------------------------------------
+    - name: vault-login
+      image: $(params.vault-image)
+      env:
+        - name: VAULT_ADDR
+          value: $(params.vault-addr)
+      script: |
+        #!/bin/sh
+        set -eu
+        SA_JWT="$(cat /vault-scratch/sa.jwt)"
+        TOKEN=$(vault write -field=token \
+                  auth/kubernetes/login \
+                  role=$(params.vault-role) \
+                  jwt="${SA_JWT}")
+        if [ -z "${TOKEN}" ]; then
+          echo "FATAL: vault login returned an empty client_token" >&2
+          exit 1
+        fi
+        printf '%s' "${TOKEN}" > /vault-scratch/client.token
+        chmod 0400 /vault-scratch/client.token
+        echo "[vault-login] OK: vault login succeeded for role $(params.vault-role)"
+
+    # ----------------------------------------------------------------
+    # Step 4: sign Release via Vault transit and write Release.gpg +
+    # InRelease.
+    #
+    # Vault transit signs the sha256 of the Release contents (base64
+    # input) and returns `vault:v<n>:<b64>`. We write that string as
+    # `Release.gpg` and wrap it in the RFC-4880-§7 cleartext-signed
+    # framing as `InRelease`.
+    #
+    # TODO (#20 follow-up): the bytes Vault returns are not a valid
+    # OpenPGP packet. AC bullets 4 ("apt-get update works") and 5
+    # ("gpg --verify succeeds") require wrapping the raw RSA
+    # signature into an OpenPGP signature packet (RFC 4880 §5.2.3)
+    # before writing Release.gpg / InRelease. The Vault call site is
+    # the only thing that has to change — emit packet-wrapped bytes
+    # here and the upload step downstream is already correct. Tracked
+    # in a follow-up issue.
+    # ----------------------------------------------------------------
+    - name: sign-release
+      image: $(params.vault-image)
+      env:
+        - name: VAULT_ADDR
+          value: $(params.vault-addr)
+        - name: CODENAME
+          value: $(params.codename)
+        - name: TRANSIT_KEY
+          value: $(params.transit-key)
+      script: |
+        #!/bin/sh
+        set -eu
+        VAULT_TOKEN="$(cat /vault-scratch/client.token)"
+        export VAULT_TOKEN
+
+        REL="/workspace/repo/dists/${CODENAME}/Release"
+        if [ ! -s "${REL}" ]; then
+          echo "FATAL: ${REL} missing or empty — did build-repo run?" >&2
+          exit 1
+        fi
+
+        # Base64-encode the Release contents for the transit/sign
+        # input field. The vault CLI does not chunk input on stdin,
+        # so we keep it inline — Release files are O(few KB) even
+        # for large repos.
+        PAYLOAD_B64=$(base64 -w0 < "${REL}")
+        echo "[sign] signing $(wc -c <"${REL}") bytes of Release via transit/${TRANSIT_KEY}"
+
+        SIG=$(vault write -field=signature \
+                "transit/sign/${TRANSIT_KEY}" \
+                input="${PAYLOAD_B64}")
+        case "${SIG}" in
+          vault:v*:*)
+            echo "[sign] OK: transit signature shape valid"
+            ;;
+          *)
+            echo "FATAL: transit/sign returned unexpected shape: ${SIG}" >&2
+            exit 1
+            ;;
+        esac
+
+        # Belt-and-suspenders: round-trip through transit/verify so
+        # we catch a silent key-version mismatch before we publish.
+        VERIFIED=$(vault write -field=valid \
+                     "transit/verify/${TRANSIT_KEY}" \
+                     input="${PAYLOAD_B64}" \
+                     signature="${SIG}")
+        if [ "${VERIFIED}" != "true" ]; then
+          echo "FATAL: vault could not verify the signature it just produced" >&2
+          exit 1
+        fi
+        echo "[sign] OK: transit/verify accepted the signature"
+
+        # Release.gpg — detached signature. TODO #20-followup: wrap
+        # the raw RSA signature in an OpenPGP packet so apt-get
+        # accepts this. Today this is the raw vault: token, written
+        # so the upload-side and reviewer can see the publish-path
+        # is wired through.
+        printf '%s\n' "${SIG}" > "/workspace/repo/dists/${CODENAME}/Release.gpg"
+
+        # InRelease — cleartext-signed Release. Same TODO as
+        # Release.gpg: the signature block inside the framing is the
+        # raw vault: token rather than an OpenPGP packet. The framing
+        # itself is correct so the file shape is recognisable.
+        {
+          printf -- '-----BEGIN PGP SIGNED MESSAGE-----\n'
+          printf 'Hash: SHA256\n\n'
+          cat "${REL}"
+          printf -- '-----BEGIN PGP SIGNATURE-----\n\n'
+          printf '%s\n' "${SIG}"
+          printf -- '-----END PGP SIGNATURE-----\n'
+        } > "/workspace/repo/dists/${CODENAME}/InRelease"
+
+        echo "[sign] wrote Release.gpg + InRelease:"
+        ls -la "/workspace/repo/dists/${CODENAME}/" \
+          | grep -E 'Release(.gpg|$)|InRelease' || true
+
+        # RELEASE_DIGEST result — sha256 of the (unsigned) Release
+        # file. Verifiers cross-reference this with the Vault audit
+        # log entry for the transit/sign call.
+        REL_SHA="sha256:$(sha256sum "${REL}" | awk '{print $1}')"
+        printf '%s' "${REL_SHA}" > "$(results.RELEASE_DIGEST.path)"
+        echo "[sign] RELEASE_DIGEST=${REL_SHA}"
+
+    # ----------------------------------------------------------------
+    # Step 5: upload the signed `dists/<codename>/` subtree to S3.
+    #
+    # Output path matches the issue:
+    #   s3://${S3_BUCKET}/${S3_BRANCH}/${S3_SHA}-staging/${S3_DISTRO}/${S3_ARCH}/dists/${CODENAME}/
+    #
+    # Callers pass the bare SHA in `s3-sha`; this step appends the
+    # `-staging` suffix so a future swap-to-live Task (#21) only has
+    # to rewrite that one segment.
+    #
+    # Same credentials precedence as tasks/generate-sbom +
+    # tasks/make-check: workspace-mounted static creds first,
+    # AWS_ROLE_ARN + projected SA token (STS AssumeRoleWithWebIdentity)
+    # second, no-op if s3-bucket is empty.
+    # ----------------------------------------------------------------
+    - name: upload
+      image: $(params.uploader-image)
+      workingDir: /workspace/repo
+      env:
+        - name: S3_BUCKET
+          value: $(params.s3-bucket)
+        - name: S3_ENDPOINT
+          value: $(params.s3-endpoint)
+        - name: S3_BRANCH
+          value: $(params.s3-branch)
+        - name: S3_SHA
+          value: $(params.s3-sha)
+        - name: S3_DISTRO
+          value: $(params.s3-distro)
+        - name: S3_ARCH
+          value: $(params.s3-arch)
+        - name: CODENAME
+          value: $(params.codename)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        if [ -z "${S3_BUCKET}" ]; then
+          echo "[upload] s3-bucket empty; skipping upload (smoke / no-upload run)"
+          # Emit an empty REPO_URL result so downstream Pipelines
+          # never see a nil result reference.
+          printf '' > "$(results.REPO_URL.path)"
+          exit 0
+        fi
+
+        # Credentials precedence (matches tasks/generate-sbom):
+        # 1. Static creds from the s3-credentials workspace, if mounted.
+        CRED_DIR="$(workspaces.s3-credentials.path)"
+        if [ -d "${CRED_DIR}" ]; then
+          for k in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN; do
+            if [ -f "${CRED_DIR}/${k}" ]; then
+              export "${k}=$(cat "${CRED_DIR}/${k}")"
+            fi
+          done
+        fi
+
+        # 2. STS AssumeRoleWithWebIdentity (Sepia / production path).
+        SA_TOKEN_FILE="${AWS_WEB_IDENTITY_TOKEN_FILE:-/var/run/secrets/openshift/serviceaccount/token}"
+        if [ -z "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_ROLE_ARN:-}" ] && [ -f "${SA_TOKEN_FILE}" ]; then
+          echo "[upload] minting STS creds via AssumeRoleWithWebIdentity (role=${AWS_ROLE_ARN})"
+          ENDPOINT_ARG=""
+          [ -n "${S3_ENDPOINT}" ] && ENDPOINT_ARG="--endpoint-url ${S3_ENDPOINT}"
+          # shellcheck disable=SC2086
+          CREDS_JSON=$(aws sts assume-role-with-web-identity \
+            --role-arn "${AWS_ROLE_ARN}" \
+            --role-session-name "tekton-publish-repo" \
+            --web-identity-token "$(cat "${SA_TOKEN_FILE}")" \
+            ${ENDPOINT_ARG})
+          export AWS_ACCESS_KEY_ID=$(echo "${CREDS_JSON}"     | sed -n 's/.*"AccessKeyId": *"\([^"]*\)".*/\1/p')
+          export AWS_SECRET_ACCESS_KEY=$(echo "${CREDS_JSON}" | sed -n 's/.*"SecretAccessKey": *"\([^"]*\)".*/\1/p')
+          export AWS_SESSION_TOKEN=$(echo "${CREDS_JSON}"     | sed -n 's/.*"SessionToken": *"\([^"]*\)".*/\1/p')
+        fi
+
+        if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+          echo "FATAL: no S3 credentials available (no s3-credentials workspace, no STS path)" >&2
+          exit 1
+        fi
+
+        # Per-issue path: <branch>/<sha>-staging/<distro>/<arch>/dists/<codename>/
+        KEY_PREFIX="${S3_BRANCH}/${S3_SHA}-staging/${S3_DISTRO}/${S3_ARCH}/dists/${CODENAME}"
+        DEST="s3://${S3_BUCKET}/${KEY_PREFIX}/"
+        SRC="/workspace/repo/dists/${CODENAME}/"
+
+        ENDPOINT_ARG=""
+        [ -n "${S3_ENDPOINT}" ] && ENDPOINT_ARG="--endpoint-url ${S3_ENDPOINT}"
+
+        echo "[upload] uploading ${SRC} → ${DEST}"
+        # shellcheck disable=SC2086
+        aws s3 cp --recursive "${SRC}" "${DEST}" ${ENDPOINT_ARG}
+
+        printf '%s' "${DEST}" > "$(results.REPO_URL.path)"
+        echo "[upload] REPO_URL=${DEST}"
