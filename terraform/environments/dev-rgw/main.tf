@@ -50,6 +50,7 @@ module "artifacts" {
   release_bucket_name  = "${var.bucket_prefix}ceph-artifacts-release"
   grype_db_bucket_name = "${var.bucket_prefix}ceph-grype-db"
   events_bucket_name   = "${var.bucket_prefix}ceph-tekton-events"
+  sccache_bucket_name  = "${var.bucket_prefix}ceph-builder-cache"
 
   # Short retention windows make test cycles cheap. The release bucket
   # keeps the minimum legal object-lock retention (1y on RGW; bumpable
@@ -61,6 +62,7 @@ module "artifacts" {
   branch_expiration_days    = 180
   grype_db_expiration_days  = 30
   events_expiration_days    = 30
+  sccache_expiration_days   = 30
   release_object_lock_mode  = "GOVERNANCE"
   release_object_lock_years = var.release_object_lock_years
 

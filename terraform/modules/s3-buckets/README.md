@@ -11,6 +11,7 @@ Creates the artifact, tooling, and analytics buckets ceph-tekton needs
 | `ceph-artifacts-release` | indefinite (object-lock retention)                             | GOVERNANCE, 7y default   | yes (mirror) |
 | `ceph-grype-db`          | 30d expiry (≈ keep last 30 dailies)                            | none, no versioning      | yes (consumers) |
 | `ceph-tekton-events`     | configurable (default 0 = never expire); issue #63             | none, no versioning      | **no — private** |
+| `ceph-builder-cache`     | 30d lastmod expiry (LRU-ish — hits refresh stamp); issue #14   | none, no versioning      | **no — private** |
 
 ## Why the AWS provider against every backend
 
@@ -177,8 +178,10 @@ module "artifacts" {
 
 ## Outputs
 
-- `dev_bucket`, `branch_bucket`, `release_bucket` — individual names.
-- `buckets` — map keyed by class (`dev` / `branch` / `release`).
+- `dev_bucket`, `branch_bucket`, `release_bucket`, `grype_db_bucket`,
+  `events_bucket`, `sccache_bucket` — individual names.
+- `buckets` — map keyed by class (`dev` / `branch` / `release` /
+  `grype_db` / `events` / `sccache`).
 - `release_object_lock` — effective `{mode, years}` on the release
   bucket, so the calling env can echo it in its outputs.
 - `public_read` — `{buckets, prefixes}` where `buckets` is the

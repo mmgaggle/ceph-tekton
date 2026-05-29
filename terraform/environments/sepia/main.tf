@@ -44,11 +44,13 @@ module "artifacts" {
   release_bucket_name  = "ceph-artifacts-release"
   grype_db_bucket_name = "ceph-grype-db"
   events_bucket_name   = "ceph-tekton-events"
+  sccache_bucket_name  = "ceph-builder-cache"
 
   dev_expiration_days                       = 30
   branch_expiration_days                    = 180
   branch_noncurrent_version_expiration_days = 7
   grype_db_expiration_days                  = 30
+  sccache_expiration_days                   = 30
   # 0 = never expire. Long-window trend queries (build success rate by
   # branch over the release cycle, queue-time trend across the year)
   # want as much history as we can afford. Override here if Sepia

@@ -1,0 +1,592 @@
+# make-check — run ceph's `run-make-check.sh` inside the matching
+# ceph-builder image, with an S3-backed sccache wrapping the C/C++
+# compiler.
+#
+# Sibling to #13 (end-to-end make-check tracer) and #14 (sccache S3
+# wiring). #13 proves the "we can compile + ctest one PR" loop; #14
+# (this file) adds the cache layer that makes the loop fast enough to
+# gate PRs on. The Task ships with the sccache wiring on day 1 because
+# the cold-cache 2-4 hour wall time is the thing #14 exists to fix —
+# there is no useful "make-check without sccache" mode for repeat runs,
+# only for the first run on a fresh branch.
+#
+# WHAT IT RUNS:
+#   ceph's own src/script/run-make-check.sh — the same script the
+#   upstream `make check` flow has converged on. The script does the
+#   cmake configure, ninja build, and ctest -j$(nproc) phases in one
+#   go, with the right env for unit-test runners (vstart-based shell
+#   tests, etc.). We do NOT re-implement cmake/ctest invocation here —
+#   that's an explicit decision: when upstream changes the make-check
+#   contract (component additions, ctest label filters, --no-X flags),
+#   we get it for free; if we forked the invocation we'd have to track
+#   it ourselves.
+#
+# WHY sccache (not ccache):
+#   - ccache is fundamentally a local-filesystem cache. Sharing it
+#     across PipelineRuns needs an RWX PVC (single-writer hotspot on
+#     OpenShift + HA/upgrade headache) or NFS.
+#   - sccache talks S3 natively, is multi-writer-safe (objects are
+#     content-addressed), and reuses the same RGW STS path the rest of
+#     the pipeline uses for artifact upload. See
+#     docs/architecture.md "Build cache: sccache on S3 (not a PVC)" for
+#     the full ADR.
+#
+# WHY INSTALL sccache AT RUNTIME (not in the builder image):
+#   The centos10/ubuntu-noble/etc. builder images (images/builders/)
+#   pre-install `ccache` because do_cmake.sh runs ccache unconditionally
+#   if it's on PATH; sccache is a separate decision specific to the
+#   S3-backed cache layer, and pinning the version here lets the cache
+#   layer evolve (e.g. bumping sccache for a bugfix) without rebuilding
+#   every builder image across the matrix. Tradeoff: one-time ~30s
+#   download per TaskRun. The setup step caches the binary under
+#   /usr/local/bin so subsequent steps within the same pod share it.
+#
+# CREDENTIALS MODEL (matches generate-sbom / build-grype-db):
+#   1. Static creds via the `s3-credentials` workspace (dev / smoke).
+#      Files: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, optionally
+#      AWS_SESSION_TOKEN. Same shape every other Task uses.
+#   2. STS AssumeRoleWithWebIdentity via projected SA token (Sepia
+#      production overlay). AWS_ROLE_ARN must be set on the Task
+#      (typically the `ceph-builder-cache` role from #8) AND a
+#      projected SA token mounted at
+#      /var/run/secrets/openshift/serviceaccount/token. The pre-build
+#      step exchanges the token for short-lived S3 creds and exports
+#      them into the env the make-check step inherits.
+#   3. Empty `sccache-bucket` short-circuits sccache entirely — the
+#      Task still runs run-make-check.sh, just without the cache. This
+#      is the smoke / dev-kind path; useful for validating the Task
+#      surface itself without standing up an S3 endpoint.
+#
+# KEY-PREFIX NAMESPACING (#14 AC):
+#   SCCACHE_S3_KEY_PREFIX = <branch>/<distro>/<arch>/
+#   so a hit on `wip-foo`'s cache can't accidentally serve objects
+#   compiled with a different toolchain or arch. Branch builds fill;
+#   wip-*/PR builds reuse (sccache treats the prefix as a namespace,
+#   not a partition — multiple writers under the same prefix is fine).
+#
+# RESOURCE NOTES:
+#   `run-make-check.sh` uses every CPU it can find. The Task itself
+#   doesn't set resource requests — the calling Pipeline / PipelineRun
+#   pins them (the issue #13 brief calls for 32 CPU / 64 GB RAM /
+#   ephemeral-storage sized for the build tree). This Task is the
+#   library piece; sizing is the Pipeline's call.
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: make-check
+spec:
+  description: |
+    Clone ceph/ceph at the given ref and run `src/script/run-make-check.sh`
+    inside the matching ceph-builder image, with an S3-backed sccache
+    wrapping the C/C++ compiler. The sccache layer is namespaced per
+    `(branch, distro, arch)` so branch builds fill the cache and
+    wip-*/PR builds reuse it.
+
+    Empty `sccache-bucket` disables the cache (smoke / dev-kind path);
+    in that mode run-make-check.sh still runs but every compile is
+    cold.
+  params:
+    - name: git-url
+      type: string
+      default: https://github.com/ceph/ceph.git
+      description: |
+        Upstream ceph repo URL. Default tracks the canonical
+        github.com/ceph/ceph; the PaC trigger threads the PR's head
+        repo here for fork-originated PRs.
+    - name: git-ref
+      type: string
+      default: main
+      description: |
+        Git ref to build. Branch, tag, or commit SHA. The PaC trigger
+        pins to the PR's head SHA; manual `tkn pipeline start` invocations
+        pin to a topic branch.
+    - name: branch
+      type: string
+      default: main
+      description: |
+        Branch component of the sccache S3 key prefix. The cache is
+        namespaced per `(branch, distro, arch)` so a hit can't serve
+        objects compiled against a different toolchain. PaC threads
+        the PR base branch here (so wip-*/PR builds reuse the base
+        branch's cache); manual runs default to `main`.
+    - name: distro
+      type: string
+      default: centos10
+      description: |
+        Distro slug. Threaded into both the builder image tag and the
+        sccache S3 key prefix. Phase-1 only ships centos10; the matrix
+        expansion adds ubuntu-noble / centos9 / fedora-rawhide on top
+        without disturbing the Task surface.
+    - name: arch
+      type: string
+      default: x86_64
+      description: |
+        Architecture slug. Threaded into the builder image tag and the
+        sccache S3 key prefix. Mismatched-arch cache reuse would
+        silently produce wrong-arch object files; the prefix scope
+        prevents that.
+    - name: builder-image
+      type: string
+      default: localhost/ceph-builder:centos10-x86_64
+      description: |
+        Full image reference for the ceph-builder. Defaults to the
+        kind-local tag produced by `tasks/build-builder-image` so a
+        fresh dev cluster (`make dev-up`) has a working default.
+        Overlays / Pipelines override this with the registry-pushed
+        image (image-registry.openshift-image-registry.svc in Sepia,
+        ghcr.io for the matrix-builder).
+    - name: sccache-bucket
+      type: string
+      default: ""
+      description: |
+        S3 bucket for the sccache backend. Empty disables sccache
+        entirely (smoke / dev-kind path) and the Task runs
+        run-make-check.sh against a cold cache. In Sepia the calling
+        Pipeline threads the `ceph-builder-cache` bucket from the
+        terraform/modules/s3-buckets module.
+    - name: sccache-endpoint
+      type: string
+      default: ""
+      description: |
+        Optional S3 endpoint URL (Sepia RGW or any local S3-compatible
+        backend). Empty = AWS S3 default. Threaded into both
+        `SCCACHE_ENDPOINT` for sccache itself AND `--endpoint-url`
+        for the `aws sts assume-role-with-web-identity` call.
+    - name: sccache-region
+      type: string
+      default: us-east-1
+      description: |
+        Region threaded into `SCCACHE_REGION`. RGW ignores this
+        functionally but sccache (and the AWS SDK underneath it)
+        requires a non-empty value to satisfy the request signer.
+    - name: sccache-version
+      type: string
+      default: v0.8.2
+      description: |
+        Pinned sccache release. Bumping this is a deliberate
+        supply-chain decision (the binary is downloaded at TaskRun
+        start from github.com/mozilla/sccache releases). v0.8.2 is
+        the current stable that handles the S3 backend cleanly and
+        supports CMAKE_C/CXX_COMPILER_LAUNCHER without env-var
+        gymnastics.
+    - name: aws-cli-image
+      type: string
+      default: docker.io/amazon/aws-cli:2.17.0
+      description: |
+        Pinned image with the AWS CLI for the STS AssumeRoleWithWebIdentity
+        call in the assume-role step. Same pin as generate-sbom /
+        build-grype-db so all three Tasks evolve the AWS CLI together.
+  results:
+    - name: source-sha
+      type: string
+      description: |
+        Full git SHA the build actually ran against. Resolved
+        post-clone — `git-ref=main` resolves to a moving target, this
+        Result captures what was built. Downstream Tasks (Chains
+        attestation, GitHub Check posting) consume this as the
+        upstream-side input pin.
+    - name: sccache-hit-rate
+      type: string
+      description: |
+        sccache cache hit rate at end of build, formatted as a
+        percentage with two decimals (e.g. `87.42`). 0 when sccache
+        is disabled OR the run found no cacheable compile units.
+        AC for #14: > 80 on the second build of the same source.
+    - name: sccache-stats
+      type: string
+      description: |
+        Full `sccache --show-stats` output, verbatim. Useful for
+        debugging cache-miss patterns (e.g. a code change that
+        flipped a header dep and invalidated half the cache). Empty
+        when sccache is disabled.
+  workspaces:
+    - name: source
+      description: |
+        Workspace that holds the cloned ceph tree + the build/ dir.
+        Layout after this Task:
+          $(workspaces.source.path)/ceph/         — git working tree
+          $(workspaces.source.path)/ceph/build/   — cmake build tree
+        Binding shape: a volumeClaimTemplate (PVC per PipelineRun)
+        sized for the issue #13 ephemeral-storage budget. emptyDir is
+        not viable here — the build tree is 4-8GB compiled plus the
+        ctest scratch space.
+      mountPath: /workspace/source
+    - name: sccache-bin
+      description: |
+        Workspace where the sccache binary is downloaded and then
+        consumed by the build step. emptyDir is the expected binding
+        (no cross-run reuse needed — the binary is content-addressed
+        by the `sccache-version` param). Lives on its own workspace
+        rather than on `source` so the binary survives a hypothetical
+        `git clean -fdx` in the source tree without re-downloading.
+      mountPath: /workspace/sccache-bin
+    - name: s3-credentials
+      description: |
+        Optional. If mounted, expected to contain `AWS_ACCESS_KEY_ID`,
+        `AWS_SECRET_ACCESS_KEY`, and optionally `AWS_SESSION_TOKEN`
+        as files (one secret value per file). Same shape as the
+        generate-sbom / reproducibility-check / build-grype-db Tasks
+        use.
+
+        In Sepia the calling Pipeline leaves this workspace empty and
+        instead binds a projected SA token; the assume-role step then
+        runs `aws sts assume-role-with-web-identity` against the
+        `ceph-builder-cache` role to mint short-lived S3 creds (see
+        docs/architecture.md "S3 credentials: STS OIDC via SA-token").
+
+        In smoke / dev-kind both this workspace AND `sccache-bucket`
+        are empty, so the entire credential block short-circuits and
+        sccache is disabled.
+      optional: true
+  steps:
+    # ------------------------------------------------------------------
+    # Step 1: clone — fetch ceph/ceph at the requested ref.
+    #
+    # Same shape as build-from-source's clone step (shallow + submodule
+    # init). Duplicated rather than factored into a shared script
+    # because Tekton step composition has no clean "include" mechanism
+    # and the clone is cheap enough that re-implementing it twice is
+    # less surprising than reaching across Tasks for a shared shell
+    # snippet.
+    # ------------------------------------------------------------------
+    - name: clone
+      image: docker.io/library/alpine/git:2.45.2
+      workingDir: $(workspaces.source.path)
+      env:
+        - name: GIT_URL
+          value: $(params.git-url)
+        - name: GIT_REF
+          value: $(params.git-ref)
+        - name: RESULT_SOURCE_SHA
+          value: $(results.source-sha.path)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        echo "[clone] git-url=${GIT_URL}"
+        echo "[clone] git-ref=${GIT_REF}"
+
+        if [ -d ceph/.git ]; then
+          echo "[clone] reusing existing ceph/ working tree"
+          cd ceph
+          git fetch --depth=1 origin "${GIT_REF}"
+          git checkout -q FETCH_HEAD
+        else
+          mkdir -p ceph
+          cd ceph
+          git init -q
+          git remote add origin "${GIT_URL}"
+          git fetch --depth=1 origin "${GIT_REF}"
+          git checkout -q FETCH_HEAD
+          # ceph uses several submodules — run-make-check.sh expects
+          # them all populated.
+          git submodule update --init --recursive --recommend-shallow
+        fi
+
+        RESOLVED_SHA="$(git rev-parse HEAD)"
+        echo "[clone] resolved ${GIT_REF} -> ${RESOLVED_SHA}"
+        printf '%s' "${RESOLVED_SHA}" > "${RESULT_SOURCE_SHA}"
+
+    # ------------------------------------------------------------------
+    # Step 2: install-sccache — download the pinned sccache binary into
+    # the `sccache-bin` workspace.
+    #
+    # Mozilla publishes prebuilt linux-musl tarballs per release at:
+    #   https://github.com/mozilla/sccache/releases/download/<ver>/
+    #     sccache-<ver>-<arch>-unknown-linux-musl.tar.gz
+    # We use the musl variant because it has no glibc dependency — the
+    # same binary runs on every distro the builder-image matrix covers
+    # (centos10, ubuntu-noble, fedora-rawhide, etc.).
+    #
+    # The download is gated on a non-empty `sccache-bucket`. With no
+    # bucket, sccache won't be used; skip the download to keep the
+    # smoke / dev-kind path offline-friendly.
+    # ------------------------------------------------------------------
+    - name: install-sccache
+      image: docker.io/library/alpine:3.20
+      workingDir: $(workspaces.sccache-bin.path)
+      env:
+        - name: SCCACHE_VERSION
+          value: $(params.sccache-version)
+        - name: SCCACHE_BUCKET
+          value: $(params.sccache-bucket)
+        - name: ARCH
+          value: $(params.arch)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        if [ -z "${SCCACHE_BUCKET}" ]; then
+          echo "[install-sccache] sccache-bucket empty; skipping sccache install"
+          exit 0
+        fi
+
+        # Map the Task's distro-style arch slug to sccache's release
+        # naming. sccache publishes:
+        #   sccache-<ver>-x86_64-unknown-linux-musl.tar.gz
+        #   sccache-<ver>-aarch64-unknown-linux-musl.tar.gz
+        case "${ARCH}" in
+          x86_64)  SCCACHE_ARCH=x86_64 ;;
+          aarch64) SCCACHE_ARCH=aarch64 ;;
+          *)
+            echo "[install-sccache] FAIL: unsupported arch ${ARCH}" >&2
+            exit 1
+            ;;
+        esac
+
+        apk add --no-cache curl tar >/dev/null
+
+        TARBALL="sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl.tar.gz"
+        URL="https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/${TARBALL}"
+
+        echo "[install-sccache] downloading ${URL}"
+        curl -fsSL -o "${TARBALL}" "${URL}"
+        tar -xzf "${TARBALL}"
+        mv "sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl/sccache" sccache
+        chmod +x sccache
+        rm -rf "sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl" "${TARBALL}"
+
+        ./sccache --version
+
+    # ------------------------------------------------------------------
+    # Step 3: assume-role — exchange the projected SA token for
+    # short-lived S3 creds (Sepia path), or read static creds from the
+    # `s3-credentials` workspace (dev path), or short-circuit (smoke).
+    #
+    # Output: a single sourceable env file at
+    #   $(workspaces.sccache-bin.path)/sccache-creds.env
+    # which the make-check step `source`s before invoking
+    # run-make-check.sh. This keeps the AWS CLI image (with sed for
+    # JSON parsing) separate from the builder image (where sed is
+    # present but the AWS CLI is not — and we don't want to bloat the
+    # builder image just for STS).
+    #
+    # Same precedence as generate-sbom's upload step:
+    #   1. s3-credentials workspace files (dev / smoke).
+    #   2. STS-OIDC via projected SA token (Sepia production).
+    #   3. Empty file (sccache disabled).
+    # ------------------------------------------------------------------
+    - name: assume-role
+      image: $(params.aws-cli-image)
+      workingDir: $(workspaces.sccache-bin.path)
+      env:
+        - name: SCCACHE_BUCKET
+          value: $(params.sccache-bucket)
+        - name: SCCACHE_ENDPOINT
+          value: $(params.sccache-endpoint)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        CREDS_ENV="$(workspaces.sccache-bin.path)/sccache-creds.env"
+        : > "${CREDS_ENV}"
+
+        if [ -z "${SCCACHE_BUCKET}" ]; then
+          echo "[assume-role] sccache-bucket empty; sccache disabled, no creds needed"
+          exit 0
+        fi
+
+        # 1. Static creds from the s3-credentials workspace (dev path).
+        CRED_DIR="$(workspaces.s3-credentials.path)"
+        if [ -d "${CRED_DIR}" ]; then
+          for k in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN; do
+            if [ -f "${CRED_DIR}/${k}" ]; then
+              VALUE="$(cat "${CRED_DIR}/${k}")"
+              printf 'export %s=%s\n' "${k}" "${VALUE}" >> "${CREDS_ENV}"
+              export "${k}=${VALUE}"
+            fi
+          done
+        fi
+
+        # 2. STS-OIDC fallback (Sepia production path) — same logic as
+        #    generate-sbom's upload step.
+        SA_TOKEN_FILE="${AWS_WEB_IDENTITY_TOKEN_FILE:-/var/run/secrets/openshift/serviceaccount/token}"
+        if [ -z "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_ROLE_ARN:-}" ] && [ -f "${SA_TOKEN_FILE}" ]; then
+          echo "[assume-role] minting STS creds via AssumeRoleWithWebIdentity (role=${AWS_ROLE_ARN})"
+          ENDPOINT_ARG=""
+          [ -n "${SCCACHE_ENDPOINT}" ] && ENDPOINT_ARG="--endpoint-url ${SCCACHE_ENDPOINT}"
+          # shellcheck disable=SC2086
+          CREDS_JSON=$(aws sts assume-role-with-web-identity \
+            --role-arn "${AWS_ROLE_ARN}" \
+            --role-session-name "tekton-make-check" \
+            --web-identity-token "$(cat "${SA_TOKEN_FILE}")" \
+            ${ENDPOINT_ARG})
+          AKID=$(echo "${CREDS_JSON}"   | sed -n 's/.*"AccessKeyId": *"\([^"]*\)".*/\1/p')
+          SECRET=$(echo "${CREDS_JSON}" | sed -n 's/.*"SecretAccessKey": *"\([^"]*\)".*/\1/p')
+          TOKEN=$(echo "${CREDS_JSON}"  | sed -n 's/.*"SessionToken": *"\([^"]*\)".*/\1/p')
+          {
+            printf 'export AWS_ACCESS_KEY_ID=%s\n'     "${AKID}"
+            printf 'export AWS_SECRET_ACCESS_KEY=%s\n' "${SECRET}"
+            printf 'export AWS_SESSION_TOKEN=%s\n'     "${TOKEN}"
+          } > "${CREDS_ENV}"
+        fi
+
+        # If we got here with the env file still empty AND no creds
+        # available, that's a misconfiguration (bucket set, but no
+        # creds path worked). Fail loud rather than silently doing
+        # uncached builds — uncached make-check takes 2-4h, way too
+        # expensive to mask a creds bug.
+        if [ ! -s "${CREDS_ENV}" ]; then
+          echo "[assume-role] FAIL: sccache-bucket=${SCCACHE_BUCKET} set but no creds available" >&2
+          echo "[assume-role]   - s3-credentials workspace: $([ -d "${CRED_DIR}" ] && echo mounted || echo absent)" >&2
+          echo "[assume-role]   - AWS_ROLE_ARN: ${AWS_ROLE_ARN:-unset}" >&2
+          echo "[assume-role]   - SA token: $([ -f "${SA_TOKEN_FILE}" ] && echo present || echo absent)" >&2
+          exit 1
+        fi
+
+        echo "[assume-role] credentials staged at ${CREDS_ENV}"
+
+    # ------------------------------------------------------------------
+    # Step 4: make-check — run `src/script/run-make-check.sh` inside
+    # the ceph-builder image, with sccache wrapping the C/C++ compiler.
+    #
+    # The sccache integration follows the same CMake-launcher mechanism
+    # the build-from-source Task uses for ccache:
+    #   CMAKE_C_COMPILER_LAUNCHER=<path-to-sccache>
+    #   CMAKE_CXX_COMPILER_LAUNCHER=<path-to-sccache>
+    # so we don't need to wrap CC/CXX directly — cmake handles the
+    # invocation rewrite at configure time. run-make-check.sh calls
+    # do_cmake.sh under the hood, which in turn calls cmake; the
+    # launcher vars propagate via env into both layers.
+    #
+    # AWS_SDK_LOAD_CONFIG=1 enables sccache's AWS profile loading,
+    # which it needs to honour STS session tokens passed via env.
+    # ------------------------------------------------------------------
+    - name: make-check
+      image: $(params.builder-image)
+      workingDir: $(workspaces.source.path)/ceph
+      env:
+        - name: SCCACHE_BUCKET
+          value: $(params.sccache-bucket)
+        - name: SCCACHE_ENDPOINT
+          value: $(params.sccache-endpoint)
+        - name: SCCACHE_REGION
+          value: $(params.sccache-region)
+        - name: BRANCH
+          value: $(params.branch)
+        - name: DISTRO
+          value: $(params.distro)
+        - name: ARCH
+          value: $(params.arch)
+        - name: SCCACHE_BIN_DIR
+          value: $(workspaces.sccache-bin.path)
+        - name: RESULT_HIT_RATE
+          value: $(results.sccache-hit-rate.path)
+        - name: RESULT_STATS
+          value: $(results.sccache-stats.path)
+      script: |
+        #!/bin/bash
+        set -euo pipefail
+
+        # ------------------------------------------------------------
+        # sccache wiring — gated on a non-empty bucket. Empty bucket
+        # means "smoke / dev-kind": just run run-make-check.sh, no
+        # cache. The Result files are written empty so consumers
+        # don't crash on a missing path.
+        # ------------------------------------------------------------
+        if [ -n "${SCCACHE_BUCKET}" ]; then
+          if [ ! -x "${SCCACHE_BIN_DIR}/sccache" ]; then
+            echo "[make-check] FAIL: sccache binary missing at ${SCCACHE_BIN_DIR}/sccache" >&2
+            exit 1
+          fi
+
+          # Source the creds env file produced by the assume-role step.
+          if [ -f "${SCCACHE_BIN_DIR}/sccache-creds.env" ]; then
+            # shellcheck disable=SC1091
+            . "${SCCACHE_BIN_DIR}/sccache-creds.env"
+          fi
+
+          # Key prefix per the #14 AC: namespace per (branch, distro,
+          # arch) so a hit on `wip-foo`'s cache can't serve objects
+          # compiled with a different toolchain.
+          export SCCACHE_S3_KEY_PREFIX="${BRANCH}/${DISTRO}/${ARCH}/"
+          export SCCACHE_BUCKET
+          [ -n "${SCCACHE_ENDPOINT}" ] && export SCCACHE_ENDPOINT
+          export SCCACHE_REGION
+          # AWS_SDK_LOAD_CONFIG=1 lets sccache honour STS session
+          # tokens passed via env (AWS_SESSION_TOKEN).
+          export AWS_SDK_LOAD_CONFIG=1
+
+          # CMake launcher wiring. do_cmake.sh / cmake invoke the
+          # compiler via the launcher when these are set; same
+          # mechanism build-from-source uses for ccache.
+          export CMAKE_C_COMPILER_LAUNCHER="${SCCACHE_BIN_DIR}/sccache"
+          export CMAKE_CXX_COMPILER_LAUNCHER="${SCCACHE_BIN_DIR}/sccache"
+
+          echo "[make-check] sccache enabled"
+          echo "[make-check]   bucket=${SCCACHE_BUCKET}"
+          echo "[make-check]   endpoint=${SCCACHE_ENDPOINT:-<aws-default>}"
+          echo "[make-check]   prefix=${SCCACHE_S3_KEY_PREFIX}"
+
+          # Start the sccache server so `--show-stats` at the end
+          # reports the totals for *this* TaskRun. Without an
+          # explicit start, sccache spawns the server on first
+          # compile call and the stats accumulate from there anyway,
+          # but starting it explicitly here gives a clean baseline.
+          "${SCCACHE_BIN_DIR}/sccache" --start-server || true
+          "${SCCACHE_BIN_DIR}/sccache" --zero-stats || true
+        else
+          echo "[make-check] sccache-bucket empty; running run-make-check.sh against a cold cache"
+        fi
+
+        # ------------------------------------------------------------
+        # Surface which builder image we're running inside (the env
+        # file is baked at image-build time — see
+        # images/builders/Dockerfile.centos10).
+        # ------------------------------------------------------------
+        if [ -f /etc/ceph-builder-image.env ]; then
+          echo "[make-check] builder image identity:"
+          sed 's/^/[make-check]   /' /etc/ceph-builder-image.env
+        else
+          echo "[make-check] WARNING: /etc/ceph-builder-image.env missing — non-ceph-tekton builder?" >&2
+        fi
+
+        # ------------------------------------------------------------
+        # Run the upstream make-check entrypoint. The script is the
+        # contract — when ceph/ceph changes how `make check` is
+        # invoked (component additions, ctest label filters), we
+        # inherit the change for free.
+        # ------------------------------------------------------------
+        if [ ! -x src/script/run-make-check.sh ]; then
+          echo "[make-check] FAIL: src/script/run-make-check.sh missing or non-executable" >&2
+          exit 1
+        fi
+
+        echo "[make-check] invoking src/script/run-make-check.sh"
+        ./src/script/run-make-check.sh
+
+        # ------------------------------------------------------------
+        # sccache stats — emit to the Tekton Results. Issue #14 AC:
+        # hit rate logged at end of task, > 80% on the second build
+        # of the same source. The hit-rate result is parsed from
+        # sccache's own output (line "Cache hits  ...." and
+        # "Cache misses ...").
+        # ------------------------------------------------------------
+        if [ -n "${SCCACHE_BUCKET}" ]; then
+          STATS_OUT="$("${SCCACHE_BIN_DIR}/sccache" --show-stats || true)"
+          echo "[make-check] sccache stats:"
+          printf '%s\n' "${STATS_OUT}" | sed 's/^/[make-check]   /'
+
+          # Parse hit/miss counts. sccache --show-stats emits, among
+          # other lines:
+          #   Cache hits                    N
+          #   Cache misses                  M
+          # Both are whitespace-separated. awk parses on the label.
+          HITS=$(printf '%s\n' "${STATS_OUT}" | awk '/^Cache hits/{print $NF; exit}')
+          MISSES=$(printf '%s\n' "${STATS_OUT}" | awk '/^Cache misses/{print $NF; exit}')
+          HITS="${HITS:-0}"
+          MISSES="${MISSES:-0}"
+          TOTAL=$(( HITS + MISSES ))
+          if [ "${TOTAL}" -gt 0 ]; then
+            HIT_RATE=$(awk -v h="${HITS}" -v t="${TOTAL}" 'BEGIN { printf "%.2f", (h*100.0)/t }')
+          else
+            HIT_RATE="0.00"
+          fi
+          echo "[make-check] hit-rate=${HIT_RATE} (hits=${HITS} misses=${MISSES})"
+          printf '%s' "${HIT_RATE}" > "${RESULT_HIT_RATE}"
+          printf '%s' "${STATS_OUT}" > "${RESULT_STATS}"
+        else
+          printf '%s' "0.00" > "${RESULT_HIT_RATE}"
+          : > "${RESULT_STATS}"
+        fi
