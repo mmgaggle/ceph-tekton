@@ -80,10 +80,12 @@ EVENT_TYPE="dev.tekton.event.pipelinerun.successful.v1"
 PIPELINERUN_NAME="e2e-${RUN_ID}"
 PIPELINE_NAME="e2e-cloudevents-sink-assert"
 
-# Port-forwards. Use distinct high ports from the zgw-posix-up assert
-# script so an interleaved test run doesn't EADDRINUSE.
-SINK_LOCAL_PORT="${SINK_LOCAL_PORT:-18082}"
-S3_LOCAL_PORT="${S3_LOCAL_PORT:-18083}"
+# Port-forwards. Use distinct high ports from the zgw-posix-up and
+# vuln-scan-smoke assert scripts (which both use 18082 for zgw-posix)
+# so a sequential run doesn't EADDRINUSE if our trap is slow to free
+# the listener on a GH runner.
+SINK_LOCAL_PORT="${SINK_LOCAL_PORT:-18084}"
+S3_LOCAL_PORT="${S3_LOCAL_PORT:-18085}"
 
 log::info "=== assert-cloudevents-sink ==="
 
