@@ -1,0 +1,148 @@
+# syntax=docker/dockerfile:1.6
+#
+# ceph-builder:rocky10-<arch> — Containerfile for the Rocky Linux 10
+# Ceph build environment.
+#
+# Companion to Dockerfile.centos10. Same Stage 0–3 structure; the
+# deltas vs centos10 are:
+#   - FROM docker.io/rockylinux/rockylinux:10 (the official Rocky
+#     Linux 10 image, maintained by the Rocky Enterprise Software
+#     Foundation) vs centos10's quay.io/centos/centos:stream10.
+#   - The OCI title / distro labels are `rocky10`.
+#   - install-deps.sh treats centos / rocky / almalinux / rhel
+#     identically (`almalinux|rocky|centos|fedora|rhel` case-arm in
+#     ceph/ceph install-deps.sh), so the toolchain + repo-enablement
+#     dance (epel-release → dnf-plugins-core → crb → install) is
+#     byte-for-byte the same as centos10's. The only behavioural
+#     difference is that Rocky tracks the rebuild of a tagged RHEL
+#     point release rather than CentOS Stream's rolling tip — i.e.
+#     Rocky 10 lags Stream 10's gcc/glibc/python tip slightly,
+#     which is the point: a near-RHEL anchor for the Sepia release
+#     builds, complementing centos10's "what main HEAD needs" angle.
+#
+# See Dockerfile.centos10 for the cross-cutting rationale (toolchain
+# package list, UID 1000, sudo shim, install-deps.sh pin, OCI label
+# set, reproducibility posture) — duplicated comments are NOT
+# replayed here to keep this file scannable.
+
+# --- Stage 0: base ----------------------------------------------------
+# `docker.io/rockylinux/rockylinux:10` is the official Rocky Linux 10
+# image, published by the Rocky Enterprise Software Foundation. As
+# with centos10's stream10 tag, we do NOT pin by digest — the rolling
+# `:10` tag is the right anchor for nightly rebuilds (#12).
+FROM docker.io/rockylinux/rockylinux:10 AS builder-base
+
+# --- Build args -------------------------------------------------------
+ARG CEPH_REPO=https://github.com/ceph/ceph.git
+ARG CEPH_SHA=8f95d0ea294fe1f063cd1c46ca7ddcb48f6f223e
+ARG INSTALL_DEPS_FOR_MAKE_CHECK=true
+ARG SOURCE_DATE_EPOCH
+ARG BUILDER_IMAGE_VERSION=0.1.0-rocky10
+ARG OCI_IMAGE_SOURCE=https://github.com/mmgaggle/ceph-tekton
+ARG OCI_IMAGE_REVISION=unknown
+ARG OCI_IMAGE_CREATED=unknown
+
+# --- Stage 1: install build deps + ceph toolchain ---------------------
+# Same two-phase dance as centos10: phase A registers EPEL + enables
+# CRB; phase B installs the toolchain that those repos make reachable.
+# See Dockerfile.centos10 for the per-package rationale.
+RUN set -eux; \
+    dnf -y update --setopt=install_weak_deps=False; \
+    dnf -y install --setopt=install_weak_deps=False \
+        epel-release \
+        dnf-plugins-core \
+        ca-certificates; \
+    dnf -y config-manager --set-enabled crb; \
+    dnf -y install --setopt=install_weak_deps=False \
+        sudo \
+        git \
+        wget \
+        curl \
+        which \
+        tar \
+        xz \
+        bzip2 \
+        zstd \
+        diffutils \
+        findutils \
+        file \
+        make \
+        cmake \
+        ninja-build \
+        ccache \
+        gcc \
+        gcc-c++ \
+        python3 \
+        python3-pip \
+        python3-devel \
+        rpm-build \
+        rpmdevtools; \
+    dnf clean all; \
+    rm -rf /var/cache/dnf /var/cache/yum /tmp/* /var/tmp/*
+
+# --- Stage 2: fetch ceph/ceph at pinned SHA + run install-deps.sh -----
+RUN set -eux; \
+    mkdir -p /usr/src/ceph; \
+    cd /usr/src/ceph; \
+    git init -q; \
+    git remote add origin "${CEPH_REPO}"; \
+    git fetch --depth=1 origin "${CEPH_SHA}"; \
+    git checkout -q FETCH_HEAD; \
+    git log -1 --pretty='format:ceph/ceph @ %H (%ci)%n  %s' >&2; \
+    printf '#!/bin/sh\nexec "$@"\n' > /usr/local/bin/sudo; \
+    chmod +x /usr/local/bin/sudo; \
+    export FOR_MAKE_CHECK="${INSTALL_DEPS_FOR_MAKE_CHECK}"; \
+    export DEBIAN_FRONTEND=noninteractive; \
+    ./install-deps.sh; \
+    dnf clean all; \
+    rm -rf /var/cache/dnf /var/cache/yum /tmp/* /var/tmp/*; \
+    find /usr/src/ceph -maxdepth 1 -mindepth 1 \
+        ! -name 'ceph.spec.in' \
+        ! -name 'install-deps.sh' \
+        ! -name '.git' \
+        -exec rm -rf {} +; \
+    rm -rf /usr/src/ceph/.git
+
+# --- Stage 3: build user + entrypoint ---------------------------------
+RUN set -eux; \
+    groupadd --system --gid 1000 builder; \
+    useradd  --system --uid 1000 --gid builder \
+             --home-dir /home/builder --create-home --shell /bin/bash builder; \
+    mkdir -p /home/builder/build /home/builder/ccache; \
+    chown -R builder:builder /home/builder; \
+    install -d -o builder -g builder /home/builder/.ccache; \
+    printf 'max_size = 5G\ncache_dir = /home/builder/.ccache\n' \
+        > /home/builder/.ccache/ccache.conf; \
+    chown builder:builder /home/builder/.ccache/ccache.conf
+
+COPY --chown=root:root build-package.sh /usr/local/bin/build-package.sh
+RUN chmod 0755 /usr/local/bin/build-package.sh
+
+RUN set -eux; \
+    { \
+      printf 'CEPH_BUILDER_IMAGE_TITLE=ceph-builder-rocky10\n'; \
+      printf 'CEPH_BUILDER_IMAGE_VERSION=%s\n' "${BUILDER_IMAGE_VERSION}"; \
+      printf 'CEPH_BUILDER_CEPH_SHA=%s\n'      "${CEPH_SHA}"; \
+      printf 'CEPH_BUILDER_DISTRO=rocky10\n'; \
+      printf 'CEPH_BUILDER_FOR_MAKE_CHECK=%s\n' "${INSTALL_DEPS_FOR_MAKE_CHECK}"; \
+      printf 'CEPH_BUILDER_SOURCE_DATE_EPOCH=%s\n' "${SOURCE_DATE_EPOCH:-}"; \
+    } > /etc/ceph-builder-image.env
+
+LABEL org.opencontainers.image.source="${OCI_IMAGE_SOURCE}" \
+      org.opencontainers.image.revision="${OCI_IMAGE_REVISION}" \
+      org.opencontainers.image.created="${OCI_IMAGE_CREATED}" \
+      org.opencontainers.image.title="ceph-builder-rocky10" \
+      org.opencontainers.image.description="Rocky Linux 10 builder image for ceph/ceph, pre-baked with install-deps.sh output." \
+      org.opencontainers.image.licenses="LGPL-2.1-or-later" \
+      org.opencontainers.image.url="https://github.com/mmgaggle/ceph-tekton" \
+      org.opencontainers.image.documentation="https://github.com/mmgaggle/ceph-tekton/blob/main/docs/builder-images.md" \
+      org.ceph.builder-image.version="${BUILDER_IMAGE_VERSION}" \
+      org.ceph.builder-image.ceph-sha="${CEPH_SHA}" \
+      org.ceph.builder-image.distro="rocky10" \
+      org.ceph.builder-image.for-make-check="${INSTALL_DEPS_FOR_MAKE_CHECK}"
+
+USER builder
+WORKDIR /home/builder/build
+
+ENTRYPOINT ["/usr/local/bin/build-package.sh"]
+CMD []

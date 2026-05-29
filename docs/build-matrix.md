@@ -197,6 +197,8 @@ emits a documented default matrix and logs a warning to stderr:
 [
   {"distro": "centos10",     "arch": "x86_64",  "gating": "true"},
   {"distro": "centos10",     "arch": "aarch64", "gating": "true"},
+  {"distro": "rocky10",      "arch": "x86_64",  "gating": "true"},
+  {"distro": "rocky10",      "arch": "aarch64", "gating": "true"},
   {"distro": "ubuntu-noble", "arch": "x86_64",  "gating": "true"},
   {"distro": "ubuntu-noble", "arch": "aarch64", "gating": "true"}
 ]
@@ -211,9 +213,11 @@ PipelineRun loudly would make every CI run on those branches red until
 someone hand-backports a YAML file.
 
 Instead, the Task picks "the modern long-term-support cell set" as a
-graceful default: centos10 + ubuntu-noble cover the actively-supported
-RPM and DEB distros, on both arches, all gating. That gets a sensible
-build out the door without requiring a backport.
+graceful default: centos10 + rocky10 cover the actively-supported
+RPM-family targets (Stream's rolling tip and the tagged-RHEL rebuild
+that Sepia release builds anchor to), and ubuntu-noble covers the
+actively-supported DEB target. All on both arches, all gating. That
+gets a sensible build out the door without requiring a backport.
 
 When a release branch backports an explicit `matrix.yaml`, it
 overrides the default — same code path either way.

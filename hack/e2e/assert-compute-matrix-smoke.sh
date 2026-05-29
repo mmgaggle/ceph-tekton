@@ -50,8 +50,9 @@ kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/pipelines/compute-matrix-smoke-tes
 # Source workspace must be a PVC — Tekton gives each TaskRun pod its
 # own emptyDir, so the seed Task's matrix.yaml vanishes before the
 # compute-matrix Task can read it. Without this the matrix step quietly
-# falls back to the "documented default matrix" (centos10 + ubuntu-noble
-# x amd64/arm64, 4 cells) and the assert step rejects the cell count.
+# falls back to the "documented default matrix" (centos10 + rocky10 +
+# ubuntu-noble x amd64/arm64, 6 cells) and the assert step rejects the
+# cell count.
 # No bytes to extract after the PipelineRun completes; cleanup is just
 # the PVC delete in the trap.
 SRC_PVC_NAME="e2e-matrix-source-pvc-$(date +%s)"
