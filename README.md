@@ -365,6 +365,24 @@ For Sepia operators, see `docs/runbook.md` once #37 lands.
 
 ---
 
+## Observability
+
+Grafana dashboard JSON for the build system lives in
+[`charts/ceph-tekton-stack/dashboards/`](charts/ceph-tekton-stack/dashboards/).
+The on-call "is the build system healthy?" view is
+[`build-health.json`](charts/ceph-tekton-stack/dashboards/build-health.json)
+(#42) — builds-per-hour, success rate, p50/p95/p99 wall-clock, in-flight
+PipelineRuns, success rate per `(distro, arch)`, and failures per
+Pipeline. It queries the Tekton Pipelines controller metrics that the
+ServiceMonitor in `kustomize/overlays/sepia/` exposes (#41); panels
+that depend on the `ceph-builds-api` custom exporter (also part of
+#41) are marked `PROVISIONAL` and stay empty until that exporter is
+wired. See
+[`charts/ceph-tekton-stack/dashboards/README.md`](charts/ceph-tekton-stack/dashboards/README.md)
+for the inventory and local-preview steps.
+
+---
+
 ## Phase 2 (deferred)
 
 - Helm-based operator with a `CephCIPlatform` CRD (operator-sdk helm mode)
