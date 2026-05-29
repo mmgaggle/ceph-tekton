@@ -1,0 +1,809 @@
+# build-package — build distro packages (.deb / .rpm) from a ceph
+# source tree, inside the matching ceph-builder image.
+#
+# Phase-1 tracer for the package matrix (#16): produces a `.deb` for
+# ubuntu-noble-x86_64 from a ceph branch push. The full matrix expansion
+# (rocky10, ubuntu-jammy, fedora, aarch64, …) is #17 — that issue widens
+# `mode`, `distro`, and `arch` over the matrix without changing this
+# Task's surface.
+#
+# WHY ubuntu-noble-x86_64 FIRST:
+#   DEB packaging is mechanically more complex than RPM (debian/rules
+#   does a full ./configure + make + dh sequence; rpmbuild is one shot
+#   from a tarball). Getting noble-x86_64 working first proves the
+#   harder of the two paths; #17's rocky10 / jammy fans the matrix out
+#   from a known-good base. Issue #16 spells this rationale out.
+#
+# WHY WE DELEGATE TO build-package.sh IN THE BUILDER IMAGE:
+#   images/builders/build-package.sh (shipped in every ceph-builder
+#   image since #10) is the documented entrypoint contract: invoking
+#   the image with `<workdir> <build-cmd>` cds into the workdir and
+#   shell-execs the build-cmd. We pass the cmd as a STRING param so a
+#   caller can override the `-j` flag, add `--build=binary` etc.
+#   without changing the Task. The default is `dpkg-buildpackage
+#   -uc -us -b -j$(nproc)`:
+#     -uc        : do not sign the .changes file (no GPG key in pod)
+#     -us        : do not sign the source package (same reason)
+#     -b         : build binary packages only (no .dsc / .tar.gz —
+#                  Debian source-package generation needs `dpkg-source`
+#                  in a specific source-tree shape ceph doesn't ship)
+#     -j$(nproc) : parallelism. Matches build-from-source / make-check.
+#   The publish-repo Task (#20) is the consumer of the `.deb`s this
+#   Task produces; its `find /workspace/artifacts -name '*.deb'`
+#   discovery is what dictates our output convention (the `output/`
+#   subdir on the `source` workspace).
+#
+# WHY NOT `debian/rules binary`:
+#   `debian/rules binary` is what `dpkg-buildpackage -b` calls
+#   under the hood, but bypassing dpkg-buildpackage skips the
+#   pre-build hooks (debian/control parsing, build-deps check,
+#   .changes generation). The .changes file is what publish-repo
+#   /reprepro consumes in the upstream Debian flow; even though we
+#   discover `.deb`s by glob today, keeping `dpkg-buildpackage` as
+#   the entrypoint preserves the upstream contract.
+#
+# SCCACHE (#14 INTEGRATION):
+#   Issue #16 AC bullet 5: "sccache integration from #14 reused here".
+#   We mirror tasks/make-check's wiring verbatim — same sccache binary
+#   download, same STS-or-static-creds precedence, same
+#   `(branch, distro, arch)` key prefix. The build step exports
+#   CMAKE_C/CXX_COMPILER_LAUNCHER so the cmake invocation that
+#   `dpkg-buildpackage` runs inside `debian/rules` picks up sccache
+#   transparently (debian/rules calls `do_cmake.sh` for ceph; do_cmake.sh
+#   honours the launcher env vars).
+#
+# CHAINS (#27 INTEGRATION):
+#   The build artefacts here are FILES (`.deb`s), not OCI images. Chains
+#   0.26's file-subject grammar is `ARTIFACT_OUTPUTS = {"uri":"<path>",
+#   "digest":"sha256:<hex>","isBuildArtifact":"true"}`. We emit ONE
+#   ARTIFACT_OUTPUTS for the primary ceph_*.deb (the source-package-named
+#   .deb that names the build) plus a `DEB_PATHS` Result listing every
+#   `.deb` for downstream consumers. The multi-subject expansion (one
+#   ARTIFACT_OUTPUTS per file) is #17's job when the matrix lands — at
+#   that point the Pipeline-level attest Task aggregates per-Task
+#   ARTIFACT_OUTPUTS values into the matrix attestation. Doing it here
+#   would over-build for #16's single-cell tracer.
+#
+# FAIL-CLOSED (#16 AC bullet 4):
+#   `set -euo pipefail` in every step; the build step ALSO verifies
+#   that at least one `.deb` exists in the parent dir after
+#   dpkg-buildpackage returns. dpkg-buildpackage exits non-zero on real
+#   build failure, but a misconfigured `debian/rules` can emit warnings
+#   and exit zero without producing the expected files — the post-build
+#   check catches that mode.
+#
+# SCOPE NOTES:
+#   - No PaC trigger. Issue #18 owns `pipelines/branch-push.yaml`;
+#     that Pipeline wraps THIS Task. #16 calls it out: the pipeline
+#     is a downstream concern.
+#   - No S3 upload. Issue #19 owns staging-upload (build-package →
+#     publish-repo handoff). `.deb`s stay on the `source` workspace
+#     for the in-pipeline downstream consumer.
+#   - No `mode=rpm`. Same fail-loud dispatch as publish-repo's
+#     mode-gate — `mode=rpm` exits non-zero pointing at #17.
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: build-package
+spec:
+  description: |
+    Build distro packages (`.deb` for ubuntu-noble-x86_64 in #16's
+    tracer; the matrix expands in #17) from a ceph source tree inside
+    the matching ceph-builder image. Reuses tasks/make-check's
+    S3-backed sccache wiring so the second build of a given source is
+    fast. Output `.deb` files land on the `source` workspace under
+    `output/`, where the publish-repo Task (#20) and the S3-stage
+    Task (#19) pick them up.
+
+    Emits Chains-grammar Results (`ARTIFACT_OUTPUTS`, `DEB_PATHS`,
+    `DEB_DIGESTS`) so the Pipeline-level attest Task can subject the
+    produced files.
+  params:
+    - name: mode
+      type: string
+      default: "deb"
+      description: |
+        Package format to build. `deb` runs `dpkg-buildpackage`
+        (this PR, #16's tracer). `rpm` is reserved for #17's
+        matrix expansion and currently exits non-zero with a
+        "not yet implemented" pointer.
+    - name: git-url
+      type: string
+      default: https://github.com/ceph/ceph.git
+      description: |
+        Upstream ceph repo URL. Default tracks the canonical
+        github.com/ceph/ceph; #18's branch-push Pipeline threads
+        the PaC-resolved repo URL through here (matches the
+        make-check / build-from-source convention).
+    - name: git-ref
+      type: string
+      default: main
+      description: |
+        Git ref to build. Branch, tag, or commit SHA. #18's
+        branch-push Pipeline pins to the pushed branch SHA;
+        manual runs default to `main`.
+    - name: branch
+      type: string
+      default: main
+      description: |
+        Branch component of the sccache S3 key prefix. Same role
+        as in tasks/make-check — the cache is namespaced per
+        `(branch, distro, arch)` so a hit can't serve objects
+        compiled against a different toolchain. PaC threads the
+        pushed branch name.
+    - name: distro
+      type: string
+      default: ubuntu-noble
+      description: |
+        Distro slug. Threaded into the builder image tag AND the
+        sccache S3 key prefix. #16's tracer is ubuntu-noble-only;
+        #17 widens this to rocky10 / ubuntu-jammy / centos9 /
+        fedora-rawhide.
+    - name: arch
+      type: string
+      default: x86_64
+      description: |
+        Architecture slug. Threaded into the builder image tag and
+        the sccache key prefix. Mismatched-arch cache reuse would
+        silently produce wrong-arch object files; the prefix scope
+        prevents that.
+    - name: builder-image
+      type: string
+      default: localhost/ceph-builder:ubuntu-noble-x86_64
+      description: |
+        Full image reference for the ceph-builder. Defaults to the
+        kind-local tag produced by `tasks/build-builder-image` for
+        ubuntu-noble (matching #99's smoke output). Overlays /
+        Pipelines override this with the registry-pushed image
+        (`image-registry.openshift-image-registry.svc...` in Sepia,
+        `ghcr.io/mmgaggle/ceph-builder:ubuntu-noble-x86_64-<sha>` for
+        cross-cluster consumers).
+    - name: build-command
+      type: string
+      default: "dpkg-buildpackage -uc -us -b -j$(nproc)"
+      description: |
+        The literal build command shell-executed by the builder
+        image's `/usr/local/bin/build-package.sh` entrypoint. Default
+        is the canonical Debian binary build:
+          -uc        unsigned .changes (no GPG key in the pod)
+          -us        unsigned source package (same)
+          -b         binary-only (no .dsc/.tar.gz; matches the
+                     #20 publish-repo Task's `*.deb` discovery)
+          -j$(nproc) parallel
+        Callers can override to e.g. add `--build=binary` or
+        `--no-pre-clean` without touching the Task.
+    - name: sccache-bucket
+      type: string
+      default: ""
+      description: |
+        S3 bucket for the sccache backend. Empty disables sccache
+        entirely (smoke / dev-kind path) and dpkg-buildpackage runs
+        against a cold cache. Real pipelines thread the
+        `ceph-builder-cache` bucket from terraform's S3 module —
+        same source as tasks/make-check.
+    - name: sccache-endpoint
+      type: string
+      default: ""
+      description: |
+        Optional S3 endpoint URL (Sepia RGW or any S3-compatible
+        backend). Empty = AWS S3 default. Same semantics as in
+        tasks/make-check.
+    - name: sccache-region
+      type: string
+      default: us-east-1
+      description: |
+        Region threaded into `SCCACHE_REGION`. RGW ignores this
+        functionally but sccache (and the AWS SDK underneath it)
+        requires a non-empty value to satisfy the request signer.
+    - name: sccache-version
+      type: string
+      default: v0.8.2
+      description: |
+        Pinned sccache release. Same pin as tasks/make-check so
+        both Tasks evolve sccache together — bumping in one without
+        the other would split the cache namespace across versions.
+    - name: aws-cli-image
+      type: string
+      default: docker.io/amazon/aws-cli:2.17.0
+      description: |
+        Pinned image with the AWS CLI for the STS AssumeRoleWithWebIdentity
+        call. Same pin as tasks/make-check / tasks/generate-sbom.
+    - name: tools-image
+      type: string
+      default: docker.io/library/busybox:1.36
+      description: |
+        Pinned busybox for the dispatch + emit-results steps. Same
+        pin as build-builder-image / publish-repo for build
+        determinism.
+  results:
+    # ---- Chains 0.26 file-subject grammar -----------------------------
+    - name: ARTIFACT_OUTPUTS
+      type: string
+      description: |
+        Chains-grammar object Result. Shape:
+            {"uri":"<workspace-rel-path>","digest":"sha256:<hex>","isBuildArtifact":"true"}
+        With isBuildArtifact "true" Chains promotes this to a
+        subject in the slsa/v2alpha4 attestation.
+
+        This Task emits ARTIFACT_OUTPUTS for the PRIMARY `.deb`
+        only — the file whose name starts with `ceph_` (the
+        source-package-named binary; ceph's debian/control names
+        the source package `ceph`, so the head .deb is named
+        `ceph_<upstream-version>_<arch>.deb`). The full multi-
+        subject expansion (one per `.deb`) is #17's job when the
+        matrix lands and a Pipeline-level attest Task aggregates
+        per-cell ARTIFACT_OUTPUTS values.
+    - name: DEB_PATHS
+      type: string
+      description: |
+        Newline-separated list of WORKSPACE-RELATIVE paths to
+        every `.deb` this Task produced (relative to the `source`
+        workspace root). The publish-repo Task (#20) discovers
+        files by glob, not by reading this Result, but #19's
+        S3-stage and #17's multi-subject Chains expansion need a
+        canonical list — that's this Result. Empty Result means
+        zero `.deb` files were produced, which is also a fatal
+        condition the build step catches before this Result is
+        written.
+    - name: DEB_DIGESTS
+      type: string
+      description: |
+        Newline-separated `<workspace-rel-path>@sha256:<hex>` lines,
+        one per `.deb`. Same shape as build-builder-image's `IMAGES`
+        Result, repurposed for file artefacts. Chains 0.26 has no
+        native multi-file subject matcher today; this Result is the
+        honest "everything we produced + its hash" index for
+        downstream verifiers + #17's matrix-attest Task.
+    - name: source-sha
+      type: string
+      description: |
+        Full git SHA the build actually ran against. Resolved
+        post-clone — `git-ref=main` resolves to a moving target,
+        this Result captures what was built. Same shape as
+        tasks/make-check.
+    # ---- sccache stats (mirrors tasks/make-check) ---------------------
+    - name: sccache-hit-rate
+      type: string
+      description: |
+        sccache cache hit rate at end of build, formatted as a
+        percentage with two decimals (e.g. `87.42`). 0 when sccache
+        is disabled OR the run found no cacheable compile units.
+        Same shape and parsing as tasks/make-check.
+    - name: sccache-stats
+      type: string
+      description: |
+        Full `sccache --show-stats` output, verbatim. Empty when
+        sccache is disabled.
+  workspaces:
+    - name: source
+      description: |
+        Workspace that holds the cloned ceph tree, the in-tree build
+        output that `dpkg-buildpackage` writes to the parent dir,
+        and the collected `.deb` files. Layout after this Task:
+          $(workspaces.source.path)/ceph/         — git working tree
+          $(workspaces.source.path)/output/       — collected `.deb`s
+        The publish-repo Task (#20) mounts this workspace as its
+        `artifacts` workspace and `find`s `.deb` files under it —
+        the `output/` subdir keeps the `.deb`s out of the source
+        tree so a re-run sees a clean slate.
+
+        Binding shape: volumeClaimTemplate per PipelineRun. The
+        source tree alone is ~5GB; the build adds ~6GB of object
+        files; the `.deb` output is ~1GB. emptyDir is fine for
+        smoke on hefty workers; production runs need a sized PVC.
+      mountPath: /workspace/source
+    - name: sccache-bin
+      description: |
+        Workspace where the sccache binary is downloaded and then
+        consumed by the build step. emptyDir is the expected
+        binding — the binary is content-addressed by the
+        `sccache-version` param, no cross-run reuse needed. Same
+        binding shape as tasks/make-check.
+      mountPath: /workspace/sccache-bin
+    - name: s3-credentials
+      description: |
+        Optional. If mounted, expected to contain `AWS_ACCESS_KEY_ID`,
+        `AWS_SECRET_ACCESS_KEY`, and optionally `AWS_SESSION_TOKEN`
+        as files (one secret value per file). Same shape as
+        tasks/make-check / tasks/generate-sbom.
+
+        In Sepia the calling Pipeline leaves this workspace empty
+        and binds a projected SA token; the assume-role step then
+        runs `aws sts assume-role-with-web-identity` against the
+        `ceph-builder-cache` role to mint short-lived S3 creds.
+
+        In smoke / dev-kind both this workspace AND `sccache-bucket`
+        are empty, so the entire credential block short-circuits
+        and sccache is disabled.
+      optional: true
+  steps:
+    # ------------------------------------------------------------------
+    # Step 0: dispatch on `mode`. Mirrors tasks/publish-repo's mode
+    # gate. `deb` falls through; `rpm` aborts non-zero pointing at
+    # #17 (the matrix expansion); unrecognised values are also fatal.
+    # ------------------------------------------------------------------
+    - name: dispatch
+      image: $(params.tools-image)
+      env:
+        - name: MODE
+          value: $(params.mode)
+      script: |
+        #!/bin/sh
+        set -eu
+        case "${MODE}" in
+          deb)
+            echo "[dispatch] mode=deb -> dpkg-buildpackage path (#16's tracer)"
+            ;;
+          rpm)
+            echo "FATAL: mode=rpm is not yet implemented in this Task." >&2
+            echo "       The rpmbuild path is part of #17's matrix"      >&2
+            echo "       expansion; this PR (#16) implements only the"   >&2
+            echo "       ubuntu-noble-x86_64 DEB tracer. Pass mode=deb." >&2
+            exit 1
+            ;;
+          *)
+            echo "FATAL: unknown mode '${MODE}' - expected 'deb' or 'rpm'" >&2
+            exit 1
+            ;;
+        esac
+
+    # ------------------------------------------------------------------
+    # Step 1: clone — fetch ceph/ceph at the requested ref.
+    #
+    # Mirrors tasks/make-check + tasks/build-from-source's clone step.
+    # We use the SAME shallow + submodule-init pattern; debian/rules
+    # needs the full working tree but not the history, and the
+    # debian/changelog file (already committed in tree) is what
+    # dpkg-buildpackage reads for the package version.
+    # ------------------------------------------------------------------
+    - name: clone
+      image: docker.io/library/alpine/git:2.45.2
+      workingDir: $(workspaces.source.path)
+      env:
+        - name: GIT_URL
+          value: $(params.git-url)
+        - name: GIT_REF
+          value: $(params.git-ref)
+        - name: RESULT_SOURCE_SHA
+          value: $(results.source-sha.path)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        echo "[clone] git-url=${GIT_URL}"
+        echo "[clone] git-ref=${GIT_REF}"
+
+        if [ -d ceph/.git ]; then
+          echo "[clone] reusing existing ceph/ working tree"
+          cd ceph
+          git fetch --depth=1 origin "${GIT_REF}"
+          git checkout -q FETCH_HEAD
+        else
+          mkdir -p ceph
+          cd ceph
+          git init -q
+          git remote add origin "${GIT_URL}"
+          git fetch --depth=1 origin "${GIT_REF}"
+          git checkout -q FETCH_HEAD
+          # ceph's debian/rules drives a full cmake + make, which
+          # pulls in every submodule the upstream build expects.
+          # Same posture as tasks/build-from-source / tasks/make-check.
+          git submodule update --init --recursive --recommend-shallow
+        fi
+
+        RESOLVED_SHA="$(git rev-parse HEAD)"
+        echo "[clone] resolved ${GIT_REF} -> ${RESOLVED_SHA}"
+        printf '%s' "${RESOLVED_SHA}" > "${RESULT_SOURCE_SHA}"
+
+    # ------------------------------------------------------------------
+    # Step 2: install-sccache — download the pinned sccache binary
+    # into the `sccache-bin` workspace.
+    #
+    # Verbatim copy of tasks/make-check's install-sccache step. Gated
+    # on a non-empty `sccache-bucket` so the smoke / dev-kind path
+    # stays offline-friendly. Pinning + arch-mapping matches make-check
+    # so both Tasks evolve sccache together.
+    # ------------------------------------------------------------------
+    - name: install-sccache
+      image: docker.io/library/alpine:3.20
+      workingDir: $(workspaces.sccache-bin.path)
+      env:
+        - name: SCCACHE_VERSION
+          value: $(params.sccache-version)
+        - name: SCCACHE_BUCKET
+          value: $(params.sccache-bucket)
+        - name: ARCH
+          value: $(params.arch)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        if [ -z "${SCCACHE_BUCKET}" ]; then
+          echo "[install-sccache] sccache-bucket empty; skipping sccache install"
+          exit 0
+        fi
+
+        case "${ARCH}" in
+          x86_64)  SCCACHE_ARCH=x86_64 ;;
+          aarch64) SCCACHE_ARCH=aarch64 ;;
+          *)
+            echo "[install-sccache] FAIL: unsupported arch ${ARCH}" >&2
+            exit 1
+            ;;
+        esac
+
+        apk add --no-cache curl tar >/dev/null
+
+        TARBALL="sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl.tar.gz"
+        URL="https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/${TARBALL}"
+
+        echo "[install-sccache] downloading ${URL}"
+        curl -fsSL -o "${TARBALL}" "${URL}"
+        tar -xzf "${TARBALL}"
+        mv "sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl/sccache" sccache
+        chmod +x sccache
+        rm -rf "sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl" "${TARBALL}"
+
+        ./sccache --version
+
+    # ------------------------------------------------------------------
+    # Step 3: assume-role — exchange the projected SA token for
+    # short-lived S3 creds (Sepia path), or read static creds from the
+    # `s3-credentials` workspace (dev path), or short-circuit (smoke).
+    #
+    # Mirrors tasks/make-check's assume-role step verbatim. Output is
+    # the same `$(workspaces.sccache-bin.path)/sccache-creds.env` file
+    # the build step sources before invoking dpkg-buildpackage.
+    # ------------------------------------------------------------------
+    - name: assume-role
+      image: $(params.aws-cli-image)
+      workingDir: $(workspaces.sccache-bin.path)
+      env:
+        - name: SCCACHE_BUCKET
+          value: $(params.sccache-bucket)
+        - name: SCCACHE_ENDPOINT
+          value: $(params.sccache-endpoint)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        CREDS_ENV="$(workspaces.sccache-bin.path)/sccache-creds.env"
+        : > "${CREDS_ENV}"
+
+        if [ -z "${SCCACHE_BUCKET}" ]; then
+          echo "[assume-role] sccache-bucket empty; sccache disabled, no creds needed"
+          exit 0
+        fi
+
+        # 1. Static creds from the s3-credentials workspace (dev path).
+        CRED_DIR="$(workspaces.s3-credentials.path)"
+        if [ -d "${CRED_DIR}" ]; then
+          for k in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN; do
+            if [ -f "${CRED_DIR}/${k}" ]; then
+              VALUE="$(cat "${CRED_DIR}/${k}")"
+              printf 'export %s=%s\n' "${k}" "${VALUE}" >> "${CREDS_ENV}"
+              export "${k}=${VALUE}"
+            fi
+          done
+        fi
+
+        # 2. STS-OIDC fallback (Sepia production path) — same logic
+        #    as tasks/make-check.
+        SA_TOKEN_FILE="${AWS_WEB_IDENTITY_TOKEN_FILE:-/var/run/secrets/openshift/serviceaccount/token}"
+        if [ -z "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_ROLE_ARN:-}" ] && [ -f "${SA_TOKEN_FILE}" ]; then
+          echo "[assume-role] minting STS creds via AssumeRoleWithWebIdentity (role=${AWS_ROLE_ARN})"
+          ENDPOINT_ARG=""
+          [ -n "${SCCACHE_ENDPOINT}" ] && ENDPOINT_ARG="--endpoint-url ${SCCACHE_ENDPOINT}"
+          # shellcheck disable=SC2086
+          CREDS_JSON=$(aws sts assume-role-with-web-identity \
+            --role-arn "${AWS_ROLE_ARN}" \
+            --role-session-name "tekton-build-package" \
+            --web-identity-token "$(cat "${SA_TOKEN_FILE}")" \
+            ${ENDPOINT_ARG})
+          AKID=$(echo "${CREDS_JSON}"   | sed -n 's/.*"AccessKeyId": *"\([^"]*\)".*/\1/p')
+          SECRET=$(echo "${CREDS_JSON}" | sed -n 's/.*"SecretAccessKey": *"\([^"]*\)".*/\1/p')
+          TOKEN=$(echo "${CREDS_JSON}"  | sed -n 's/.*"SessionToken": *"\([^"]*\)".*/\1/p')
+          {
+            printf 'export AWS_ACCESS_KEY_ID=%s\n'     "${AKID}"
+            printf 'export AWS_SECRET_ACCESS_KEY=%s\n' "${SECRET}"
+            printf 'export AWS_SESSION_TOKEN=%s\n'     "${TOKEN}"
+          } > "${CREDS_ENV}"
+        fi
+
+        # If we got here with the env file still empty AND no creds
+        # available, that's a misconfiguration (bucket set, but no
+        # creds path worked). Fail loud rather than silently doing
+        # uncached builds — dpkg-buildpackage of ceph is ~2-3h cold,
+        # too expensive to mask a creds bug.
+        if [ ! -s "${CREDS_ENV}" ]; then
+          echo "[assume-role] FAIL: sccache-bucket=${SCCACHE_BUCKET} set but no creds available" >&2
+          echo "[assume-role]   - s3-credentials workspace: $([ -d "${CRED_DIR}" ] && echo mounted || echo absent)" >&2
+          echo "[assume-role]   - AWS_ROLE_ARN: ${AWS_ROLE_ARN:-unset}" >&2
+          echo "[assume-role]   - SA token: $([ -f "${SA_TOKEN_FILE}" ] && echo present || echo absent)" >&2
+          exit 1
+        fi
+
+        echo "[assume-role] credentials staged at ${CREDS_ENV}"
+
+    # ------------------------------------------------------------------
+    # Step 4: build-package — run dpkg-buildpackage inside the
+    # ceph-builder:ubuntu-noble-x86_64 image.
+    #
+    # The builder image's ENTRYPOINT (build-package.sh) routes on
+    # argv shape (see images/builders/build-package.sh):
+    #   `build-package.sh <workdir> <build-cmd>`
+    #     -> cd into <workdir>, then `bash -c "<build-cmd>"`
+    # We use the 2-arg form, passing the ceph source dir + the
+    # `dpkg-buildpackage …` string from the `build-command` param.
+    #
+    # sccache wiring: the same CMake-launcher mechanism tasks/make-check
+    # uses. ceph's debian/rules calls do_cmake.sh, which honours
+    # CMAKE_C/CXX_COMPILER_LAUNCHER from the env we export here. No
+    # ccache/sccache logic needs to leak into debian/rules.
+    #
+    # `dpkg-buildpackage -b` emits `.deb` files in the PARENT directory
+    # of the source tree (Debian convention) — i.e.
+    #   $(workspaces.source.path)/*.deb
+    # We then collect them into $(workspaces.source.path)/output/ so the
+    # workspace shape downstream Tasks see is predictable. The collection
+    # step ALSO fails if zero `.deb`s exist post-build, which is the
+    # "no silent success" guard from #16 AC bullet 4.
+    # ------------------------------------------------------------------
+    - name: build-package
+      image: $(params.builder-image)
+      workingDir: $(workspaces.source.path)
+      env:
+        - name: BUILD_COMMAND
+          value: $(params.build-command)
+        - name: SCCACHE_BUCKET
+          value: $(params.sccache-bucket)
+        - name: SCCACHE_ENDPOINT
+          value: $(params.sccache-endpoint)
+        - name: SCCACHE_REGION
+          value: $(params.sccache-region)
+        - name: BRANCH
+          value: $(params.branch)
+        - name: DISTRO
+          value: $(params.distro)
+        - name: ARCH
+          value: $(params.arch)
+        - name: SCCACHE_BIN_DIR
+          value: $(workspaces.sccache-bin.path)
+        - name: RESULT_HIT_RATE
+          value: $(results.sccache-hit-rate.path)
+        - name: RESULT_STATS
+          value: $(results.sccache-stats.path)
+      script: |
+        #!/bin/bash
+        set -euo pipefail
+
+        # ------------------------------------------------------------
+        # Surface the builder image's identity (baked at build time
+        # via the OCI label + /etc/ceph-builder-image.env). Same
+        # posture as tasks/make-check + tasks/build-from-source so a
+        # mis-routed builder image (e.g. ubuntu-jammy instead of
+        # ubuntu-noble) is obvious in the log tail.
+        # ------------------------------------------------------------
+        if [ -f /etc/ceph-builder-image.env ]; then
+          echo "[build-package] builder image identity:"
+          sed 's/^/[build-package]   /' /etc/ceph-builder-image.env
+        else
+          echo "[build-package] WARNING: /etc/ceph-builder-image.env missing - non-ceph-tekton builder?" >&2
+        fi
+
+        # ------------------------------------------------------------
+        # sccache wiring — same shape as tasks/make-check. Gated on
+        # a non-empty bucket so smoke / dev-kind runs offline.
+        # ------------------------------------------------------------
+        if [ -n "${SCCACHE_BUCKET}" ]; then
+          if [ ! -x "${SCCACHE_BIN_DIR}/sccache" ]; then
+            echo "[build-package] FAIL: sccache binary missing at ${SCCACHE_BIN_DIR}/sccache" >&2
+            exit 1
+          fi
+          if [ -f "${SCCACHE_BIN_DIR}/sccache-creds.env" ]; then
+            # shellcheck disable=SC1091
+            . "${SCCACHE_BIN_DIR}/sccache-creds.env"
+          fi
+          export SCCACHE_S3_KEY_PREFIX="${BRANCH}/${DISTRO}/${ARCH}/"
+          export SCCACHE_BUCKET
+          [ -n "${SCCACHE_ENDPOINT}" ] && export SCCACHE_ENDPOINT
+          export SCCACHE_REGION
+          export AWS_SDK_LOAD_CONFIG=1
+          export CMAKE_C_COMPILER_LAUNCHER="${SCCACHE_BIN_DIR}/sccache"
+          export CMAKE_CXX_COMPILER_LAUNCHER="${SCCACHE_BIN_DIR}/sccache"
+
+          echo "[build-package] sccache enabled"
+          echo "[build-package]   bucket=${SCCACHE_BUCKET}"
+          echo "[build-package]   endpoint=${SCCACHE_ENDPOINT:-<aws-default>}"
+          echo "[build-package]   prefix=${SCCACHE_S3_KEY_PREFIX}"
+
+          "${SCCACHE_BIN_DIR}/sccache" --start-server || true
+          "${SCCACHE_BIN_DIR}/sccache" --zero-stats || true
+        else
+          echo "[build-package] sccache-bucket empty; building against a cold cache"
+        fi
+
+        # ------------------------------------------------------------
+        # The builder image's ENTRYPOINT routes on argv shape. We
+        # invoke it from /bin/sh here rather than re-entering the
+        # entrypoint (Tekton already overrides ENTRYPOINT to its
+        # entrypointer; the entrypoint script lives at
+        # /usr/local/bin/build-package.sh).
+        #
+        # The 2-arg form (workdir + cmd) is what the entrypoint
+        # documents for package builds:
+        #   build-package.sh <workdir> "<cmd>"
+        # ------------------------------------------------------------
+        if [ ! -x /usr/local/bin/build-package.sh ]; then
+          echo "[build-package] FAIL: /usr/local/bin/build-package.sh missing - non-ceph-tekton builder?" >&2
+          exit 1
+        fi
+
+        if [ ! -d ceph ]; then
+          echo "[build-package] FAIL: no ceph/ source tree at $(pwd) - did clone run?" >&2
+          exit 1
+        fi
+
+        # debian/rules + dpkg-buildpackage existence checks: a
+        # ubuntu-noble builder image lacks the debian/* tooling iff
+        # something went sideways in image build. Fail loud here so
+        # the failure mode points at the image, not at "dpkg-buildpackage:
+        # command not found" deep in the log.
+        if ! command -v dpkg-buildpackage >/dev/null 2>&1; then
+          echo "[build-package] FAIL: dpkg-buildpackage not on PATH - wrong builder image? (expected ubuntu-noble)" >&2
+          exit 1
+        fi
+        if [ ! -f ceph/debian/rules ]; then
+          echo "[build-package] FAIL: ceph/debian/rules missing - source tree clone is broken or ceph branch lacks the debian/ subtree" >&2
+          exit 1
+        fi
+
+        echo "[build-package] invoking build-package.sh"
+        echo "[build-package]   workdir: $(pwd)/ceph"
+        echo "[build-package]   cmd:     ${BUILD_COMMAND}"
+
+        /usr/local/bin/build-package.sh "$(pwd)/ceph" "${BUILD_COMMAND}"
+
+        # ------------------------------------------------------------
+        # dpkg-buildpackage -b emits `.deb`s in the PARENT directory
+        # of the source tree (Debian convention). Verify here so a
+        # silent zero-debs outcome (caught by `set -e` is unreliable
+        # because dpkg-buildpackage CAN exit 0 with no debs if the
+        # source-package layout has nothing to build) fails loud.
+        # AC bullet 4: "Task fails clearly if dpkg-buildpackage fails
+        # (no silent success)".
+        # ------------------------------------------------------------
+        DEB_COUNT=$(find . -maxdepth 1 -type f -name '*.deb' | wc -l)
+        if [ "${DEB_COUNT}" -eq 0 ]; then
+          echo "[build-package] FAIL: dpkg-buildpackage produced zero .deb files" >&2
+          echo "[build-package]        listing $(pwd):" >&2
+          ls -la >&2 || true
+          exit 1
+        fi
+        echo "[build-package] dpkg-buildpackage produced ${DEB_COUNT} .deb file(s)"
+
+        # ------------------------------------------------------------
+        # sccache stats — emit to the Tekton Results, same parsing as
+        # tasks/make-check. Empty when sccache is disabled.
+        # ------------------------------------------------------------
+        if [ -n "${SCCACHE_BUCKET}" ]; then
+          STATS_OUT="$("${SCCACHE_BIN_DIR}/sccache" --show-stats || true)"
+          echo "[build-package] sccache stats:"
+          printf '%s\n' "${STATS_OUT}" | sed 's/^/[build-package]   /'
+          HITS=$(printf '%s\n' "${STATS_OUT}" | awk '/^Cache hits/{print $NF; exit}')
+          MISSES=$(printf '%s\n' "${STATS_OUT}" | awk '/^Cache misses/{print $NF; exit}')
+          HITS="${HITS:-0}"
+          MISSES="${MISSES:-0}"
+          TOTAL=$(( HITS + MISSES ))
+          if [ "${TOTAL}" -gt 0 ]; then
+            HIT_RATE=$(awk -v h="${HITS}" -v t="${TOTAL}" 'BEGIN { printf "%.2f", (h*100.0)/t }')
+          else
+            HIT_RATE="0.00"
+          fi
+          echo "[build-package] hit-rate=${HIT_RATE} (hits=${HITS} misses=${MISSES})"
+          printf '%s' "${HIT_RATE}" > "${RESULT_HIT_RATE}"
+          printf '%s' "${STATS_OUT}" > "${RESULT_STATS}"
+        else
+          printf '%s' "0.00" > "${RESULT_HIT_RATE}"
+          : > "${RESULT_STATS}"
+        fi
+
+    # ------------------------------------------------------------------
+    # Step 5: collect-debs — move the `.deb` files into
+    # `output/` and emit the Chains-grammar + downstream-consumer
+    # Results.
+    #
+    # The `output/` layout matches what tasks/publish-repo (#20)
+    # expects on its `artifacts` workspace: a flat directory of
+    # `.deb` files discoverable by `find … -name '*.deb'`. The
+    # publish-repo Task explicitly does NOT care about subdirectory
+    # structure, so flat-and-predictable is the right shape.
+    #
+    # Done as a separate step from build-package so the busybox
+    # tools-image handles the sha256 + workspace-rel-path arithmetic
+    # without dragging awk/sha256sum quirks across glibc/musl into
+    # the build step's bash. Same separation as build-builder-image's
+    # `emit-results` step.
+    # ------------------------------------------------------------------
+    - name: collect-debs
+      image: $(params.tools-image)
+      workingDir: $(workspaces.source.path)
+      env:
+        - name: RESULT_ARTIFACT_OUTPUTS
+          value: $(results.ARTIFACT_OUTPUTS.path)
+        - name: RESULT_DEB_PATHS
+          value: $(results.DEB_PATHS.path)
+        - name: RESULT_DEB_DIGESTS
+          value: $(results.DEB_DIGESTS.path)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        mkdir -p output
+        # Move every top-level .deb that dpkg-buildpackage left in
+        # the workspace root into output/. find … -exec mv is the
+        # portable shape; busybox find supports -maxdepth + -exec.
+        find . -maxdepth 1 -type f -name '*.deb' -exec mv {} output/ \;
+
+        # Sanity guard. The build step already fails if zero .debs
+        # exist, but a Task with multiple steps can have the workspace
+        # mutated between them; re-check here so a downstream Result
+        # consumer never sees a paradox (build "succeeded", DEB_PATHS
+        # empty).
+        DEB_COUNT=$(find output -maxdepth 1 -type f -name '*.deb' | wc -l)
+        if [ "${DEB_COUNT}" -eq 0 ]; then
+          echo "[collect-debs] FAIL: no .deb files in output/ after collection" >&2
+          ls -la . >&2 || true
+          exit 1
+        fi
+        echo "[collect-debs] collected ${DEB_COUNT} .deb file(s) into output/:"
+        ls -la output/
+
+        # DEB_PATHS — newline-separated, workspace-relative.
+        # find … -print emits one per line; we drop the leading
+        # `./` to match the relative-path convention every other
+        # Task in this repo uses.
+        find output -maxdepth 1 -type f -name '*.deb' \
+          | sed 's|^\./||' \
+          | sort \
+          > "${RESULT_DEB_PATHS}"
+
+        # DEB_DIGESTS — `<path>@sha256:<hex>` per line. busybox
+        # sha256sum emits `<hex>  <file>`; awk reshapes.
+        : > "${RESULT_DEB_DIGESTS}"
+        while IFS= read -r path; do
+          [ -z "${path}" ] && continue
+          HEX=$(sha256sum "${path}" | awk '{print $1}')
+          printf '%s@sha256:%s\n' "${path}" "${HEX}" \
+            >> "${RESULT_DEB_DIGESTS}"
+        done < "${RESULT_DEB_PATHS}"
+
+        # ARTIFACT_OUTPUTS — Chains-grammar object for the PRIMARY
+        # `.deb`. Pick the first `output/ceph_*.deb` lexicographically
+        # — that's the source-package-named binary (ceph's
+        # debian/control sets `Source: ceph`, so the head .deb name
+        # starts with `ceph_<upstream-version>_<arch>.deb`). If no
+        # `ceph_*.deb` is present (unlikely for a real ceph build,
+        # but the smoke harness in #17 might use a stub source tree),
+        # fall back to the first .deb in lexical order so the Result
+        # is never empty.
+        PRIMARY=$(find output -maxdepth 1 -type f -name 'ceph_*.deb' \
+                    | sort | head -n1)
+        if [ -z "${PRIMARY}" ]; then
+          PRIMARY=$(find output -maxdepth 1 -type f -name '*.deb' \
+                      | sort | head -n1)
+        fi
+        PRIMARY="${PRIMARY#./}"
+        PRIMARY_HEX=$(sha256sum "${PRIMARY}" | awk '{print $1}')
+        printf '{"uri":"%s","digest":"sha256:%s","isBuildArtifact":"true"}' \
+          "${PRIMARY}" "${PRIMARY_HEX}" \
+          > "${RESULT_ARTIFACT_OUTPUTS}"
+
+        echo "[collect-debs] DEB_PATHS:"
+        sed 's/^/[collect-debs]   /' "${RESULT_DEB_PATHS}"
+        echo "[collect-debs] DEB_DIGESTS:"
+        sed 's/^/[collect-debs]   /' "${RESULT_DEB_DIGESTS}"
+        echo "[collect-debs] ARTIFACT_OUTPUTS (primary):"
+        sed 's/^/[collect-debs]   /' "${RESULT_ARTIFACT_OUTPUTS}"
+        echo
