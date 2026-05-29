@@ -1,37 +1,81 @@
 # build-package — build distro packages (.deb / .rpm) from a ceph
 # source tree, inside the matching ceph-builder image.
 #
-# Phase-1 tracer for the package matrix (#16): produces a `.deb` for
-# ubuntu-noble-x86_64 from a ceph branch push. The full matrix expansion
-# (rocky10, ubuntu-jammy, fedora, aarch64, …) is #17 — that issue widens
-# `mode`, `distro`, and `arch` over the matrix without changing this
-# Task's surface.
+# Phase-1 tracer (#16) produced a `.deb` for ubuntu-noble-x86_64. This
+# Task (#17) widens that to the full (distro, arch) matrix without
+# changing the Task surface: the same `params` accept any cell from
+# the documented default matrix (centos10, rocky10, ubuntu-jammy,
+# ubuntu-noble × x86_64, aarch64), and the script branches on
+# package-family (DEB vs RPM) inside a single Task body.
 #
-# WHY ubuntu-noble-x86_64 FIRST:
-#   DEB packaging is mechanically more complex than RPM (debian/rules
-#   does a full ./configure + make + dh sequence; rpmbuild is one shot
-#   from a tarball). Getting noble-x86_64 working first proves the
-#   harder of the two paths; #17's rocky10 / jammy fans the matrix out
-#   from a known-good base. Issue #16 spells this rationale out.
+# WHY A SINGLE TASK (no per-distro Task files):
+#   The Tekton matrix construct fans a Pipeline-level matrix into N
+#   TaskRuns of the SAME Task definition, parameterised. Splitting the
+#   build into `build-package-deb` and `build-package-rpm` Tasks would
+#   either force the Pipeline to know which Task to use per cell (a
+#   second matrix dimension) or duplicate every non-build step (clone,
+#   sccache install, assume-role, stats). The script-level branch keeps
+#   the Pipeline-side matrix one-dimensional and the per-step plumbing
+#   shared.
+#
+# HOW THE BRANCH WORKS:
+#   The `dispatch` step resolves `mode` once at the top of the Task
+#   and writes the resolved value to a workspace-local file
+#   (`$(workspaces.source.path)/.build-package/mode`). Subsequent
+#   steps read that file rather than re-running the resolution
+#   case — there's no step-to-step env sharing in Tekton, but the
+#   workspace is the documented inter-step channel (same pattern
+#   tasks/make-check uses for the sccache creds env file).
+#
+# DISTRO -> FAMILY CLASSIFICATION:
+#   case on the distro slug:
+#     ubuntu-* | debian-*           -> deb-family (dpkg-buildpackage)
+#     centos*  | rocky*  | fedora*  -> rpm-family (rpmbuild)
+#     *                             -> fail (unknown distro)
+#   The classification table lives ONLY in the dispatch step so a new
+#   distro slug needs editing in one place. The matrix.yaml in
+#   #15's compute-matrix Task ships the same four distros that this
+#   case statement recognises today (centos10, rocky10, ubuntu-jammy,
+#   ubuntu-noble); fedora-rawhide and debian-bookworm fall out of the
+#   `fedora*` / `debian-*` wildcards without a code change.
 #
 # WHY WE DELEGATE TO build-package.sh IN THE BUILDER IMAGE:
 #   images/builders/build-package.sh (shipped in every ceph-builder
 #   image since #10) is the documented entrypoint contract: invoking
 #   the image with `<workdir> <build-cmd>` cds into the workdir and
-#   shell-execs the build-cmd. We pass the cmd as a STRING param so a
-#   caller can override the `-j` flag, add `--build=binary` etc.
-#   without changing the Task. The default is `dpkg-buildpackage
-#   -uc -us -b -j$(nproc)`:
-#     -uc        : do not sign the .changes file (no GPG key in pod)
-#     -us        : do not sign the source package (same reason)
-#     -b         : build binary packages only (no .dsc / .tar.gz —
-#                  Debian source-package generation needs `dpkg-source`
-#                  in a specific source-tree shape ceph doesn't ship)
-#     -j$(nproc) : parallelism. Matches build-from-source / make-check.
-#   The publish-repo Task (#20) is the consumer of the `.deb`s this
-#   Task produces; its `find /workspace/artifacts -name '*.deb'`
-#   discovery is what dictates our output convention (the `output/`
-#   subdir on the `source` workspace).
+#   shell-execs the build-cmd. The build-command param defaults to an
+#   empty string and the dispatch step derives the canonical
+#   per-family command:
+#
+#     DEB: `dpkg-buildpackage -uc -us -b -j$(nproc)`
+#       -uc        : do not sign the .changes file (no GPG key in pod)
+#       -us        : do not sign the source package (same reason)
+#       -b         : build binary packages only (no .dsc / .tar.gz —
+#                    Debian source-package generation needs
+#                    `dpkg-source` in a specific source-tree shape
+#                    ceph doesn't ship)
+#       -j$(nproc) : parallelism. Matches build-from-source / make-check.
+#
+#     RPM: `./make-srpm.sh && rpmbuild --define '_topdir <pwd>/rpmbuild' --rebuild ceph-*.src.rpm`
+#       make-srpm.sh : upstream-ceph entrypoint that generates
+#                      ceph-<ver>.src.rpm from ceph.spec.in + the
+#                      source tree. Lives in the ceph repo root.
+#       --rebuild    : rpmbuild's standard "binary from SRPM" mode.
+#                      Picks up sccache via the same CMake-launcher
+#                      env we set up for DEB; ceph.spec's %build
+#                      stanza runs `do_cmake.sh`.
+#       _topdir      : keep rpmbuild's scratch + output tree inside
+#                      the workspace, NOT in the build user's $HOME
+#                      (which is the default `~/rpmbuild`). Output
+#                      lands at $(pwd)/rpmbuild/RPMS/<arch>/*.rpm.
+#
+#   A caller can still override the resolved default by passing a
+#   non-empty build-command param; the dispatch step only synthesises
+#   one when the param is empty.
+#
+#   The publish-repo Task (#20) discovers files by glob from the
+#   `output/` subdir on the source workspace; both families collect
+#   their packages into that flat directory.
 #
 # WHY NOT `debian/rules binary`:
 #   `debian/rules binary` is what `dpkg-buildpackage -b` calls
@@ -41,6 +85,14 @@
 #   /reprepro consumes in the upstream Debian flow; even though we
 #   discover `.deb`s by glob today, keeping `dpkg-buildpackage` as
 #   the entrypoint preserves the upstream contract.
+#
+# WHY NOT `rpmbuild -bb ceph.spec` DIRECTLY:
+#   `ceph.spec` is GENERATED from `ceph.spec.in` by `make-srpm.sh`
+#   (the upstream entrypoint substitutes %version etc. from the
+#   tree). A bare `rpmbuild -bb ceph.spec` against a fresh checkout
+#   would fail with "ceph.spec: not found". `make-srpm.sh` does the
+#   right substitution AND produces the SRPM that the upstream
+#   release engineering flow consumes, so we honour that contract.
 #
 # SCCACHE (#14 INTEGRATION):
 #   Issue #16 AC bullet 5: "sccache integration from #14 reused here".
@@ -52,35 +104,40 @@
 #   transparently (debian/rules calls `do_cmake.sh` for ceph; do_cmake.sh
 #   honours the launcher env vars).
 #
-# CHAINS (#27 INTEGRATION):
-#   The build artefacts here are FILES (`.deb`s), not OCI images. Chains
-#   0.26's file-subject grammar is `ARTIFACT_OUTPUTS = {"uri":"<path>",
-#   "digest":"sha256:<hex>","isBuildArtifact":"true"}`. We emit ONE
-#   ARTIFACT_OUTPUTS for the primary ceph_*.deb (the source-package-named
-#   .deb that names the build) plus a `DEB_PATHS` Result listing every
-#   `.deb` for downstream consumers. The multi-subject expansion (one
-#   ARTIFACT_OUTPUTS per file) is #17's job when the matrix lands — at
-#   that point the Pipeline-level attest Task aggregates per-Task
-#   ARTIFACT_OUTPUTS values into the matrix attestation. Doing it here
-#   would over-build for #16's single-cell tracer.
+# CHAINS (#27 INTEGRATION) — MULTI-SUBJECT:
+#   The build artefacts here are FILES (`.deb` or `.rpm`), not OCI
+#   images. Chains 0.26's file-subject grammar accepts EITHER a single
+#   object OR a JSON array of objects under `ARTIFACT_OUTPUTS`:
+#       [{"uri":"<path>","digest":"sha256:<hex>","isBuildArtifact":"true"},
+#        ...]
+#   With `isBuildArtifact:"true"` on each element, Chains promotes
+#   every entry to a subject in the slsa/v2alpha4 attestation. This
+#   Task emits the ARRAY form — one entry per produced package —
+#   so a matrix cell's attestation covers every `.deb`/`.rpm` the
+#   cell shipped, not just a hand-picked "primary". (#16's tracer
+#   emitted the single-object shape for the primary `ceph_*.deb`;
+#   the matrix expansion fans that out as called for in #16's
+#   header note.) The Pipeline-level attest Task in #18 aggregates
+#   per-cell `ARTIFACT_OUTPUTS` arrays across matrix cells.
 #
-# FAIL-CLOSED (#16 AC bullet 4):
+# FAIL-CLOSED:
 #   `set -euo pipefail` in every step; the build step ALSO verifies
-#   that at least one `.deb` exists in the parent dir after
-#   dpkg-buildpackage returns. dpkg-buildpackage exits non-zero on real
-#   build failure, but a misconfigured `debian/rules` can emit warnings
-#   and exit zero without producing the expected files — the post-build
-#   check catches that mode.
+#   that at least one expected artefact exists post-build. Both
+#   dpkg-buildpackage AND rpmbuild can exit zero with no packages
+#   under misconfigured input trees — the post-build count check
+#   catches that mode for both families.
 #
 # SCOPE NOTES:
-#   - No PaC trigger. Issue #18 owns `pipelines/branch-push.yaml`;
-#     that Pipeline wraps THIS Task. #16 calls it out: the pipeline
-#     is a downstream concern.
+#   - No PaC trigger / Pipeline. Issue #18 / #22 own
+#     `pipelines/branch-push.yaml`; that Pipeline wraps THIS Task
+#     in a Tekton matrix. This PR (#17) makes the Task
+#     matrix-capable but DOES NOT add the wrapping Pipeline.
 #   - No S3 upload. Issue #19 owns staging-upload (build-package →
-#     publish-repo handoff). `.deb`s stay on the `source` workspace
+#     publish-repo handoff). Packages stay on the `source` workspace
 #     for the in-pipeline downstream consumer.
-#   - No `mode=rpm`. Same fail-loud dispatch as publish-repo's
-#     mode-gate — `mode=rpm` exits non-zero pointing at #17.
+#   - No per-cell e2e smoke. The honest smoke needs a real matrix
+#     Pipeline to drive matrix runs (the Pipeline issue, above),
+#     so the smoke lands with the Pipeline rather than the Task.
 ---
 apiVersion: tekton.dev/v1
 kind: Task
@@ -88,26 +145,29 @@ metadata:
   name: build-package
 spec:
   description: |
-    Build distro packages (`.deb` for ubuntu-noble-x86_64 in #16's
-    tracer; the matrix expands in #17) from a ceph source tree inside
-    the matching ceph-builder image. Reuses tasks/make-check's
-    S3-backed sccache wiring so the second build of a given source is
-    fast. Output `.deb` files land on the `source` workspace under
-    `output/`, where the publish-repo Task (#20) and the S3-stage
-    Task (#19) pick them up.
+    Build distro packages (`.deb` or `.rpm`) from a ceph source tree
+    inside the matching ceph-builder image, across the full (distro,
+    arch) matrix. Reuses tasks/make-check's S3-backed sccache wiring
+    so the second build of a given source is fast. Output package
+    files land on the `source` workspace under `output/`, where the
+    publish-repo Task (#20) and the S3-stage Task (#19) pick them up.
 
-    Emits Chains-grammar Results (`ARTIFACT_OUTPUTS`, `DEB_PATHS`,
-    `DEB_DIGESTS`) so the Pipeline-level attest Task can subject the
-    produced files.
+    Emits Chains-grammar Results — `ARTIFACT_OUTPUTS` is a JSON
+    ARRAY with one entry per produced package (multi-subject
+    expansion), plus per-family path/digest lists (`DEB_PATHS` /
+    `DEB_DIGESTS` for DEB cells, `RPM_PATHS` / `RPM_DIGESTS` for
+    RPM cells) for downstream consumers.
   params:
     - name: mode
       type: string
-      default: "deb"
+      default: "auto"
       description: |
-        Package format to build. `deb` runs `dpkg-buildpackage`
-        (this PR, #16's tracer). `rpm` is reserved for #17's
-        matrix expansion and currently exits non-zero with a
-        "not yet implemented" pointer.
+        Package format to build. One of `auto`, `deb`, `rpm`.
+        `auto` (the default) derives the format from the `distro`
+        param: `ubuntu-*` / `debian-*` -> `deb`;
+        `centos*` / `rocky*` / `fedora*` -> `rpm`. An explicit
+        `deb` or `rpm` overrides the distro-based derivation
+        (useful when calling with a non-canonical distro slug).
     - name: git-url
       type: string
       default: https://github.com/ceph/ceph.git
@@ -136,10 +196,18 @@ spec:
       type: string
       default: ubuntu-noble
       description: |
-        Distro slug. Threaded into the builder image tag AND the
-        sccache S3 key prefix. #16's tracer is ubuntu-noble-only;
-        #17 widens this to rocky10 / ubuntu-jammy / centos9 /
-        fedora-rawhide.
+        Distro slug. Threaded into:
+          1. the builder image tag (default `builder-image`
+             interpolates this);
+          2. the sccache S3 key prefix (cache scoped per
+             `(branch, distro, arch)`);
+          3. the dispatch step's family case statement that
+             chooses dpkg-buildpackage vs rpmbuild when
+             `mode=auto`.
+        Default preserves #16's tracer cell (ubuntu-noble) for
+        backwards-compatibility. Documented matrix cells are
+        centos10, rocky10, ubuntu-jammy, ubuntu-noble — see
+        tasks/compute-matrix.
     - name: arch
       type: string
       default: x86_64
@@ -152,27 +220,53 @@ spec:
       type: string
       default: localhost/ceph-builder:ubuntu-noble-x86_64
       description: |
-        Full image reference for the ceph-builder. Defaults to the
-        kind-local tag produced by `tasks/build-builder-image` for
-        ubuntu-noble (matching #99's smoke output). Overlays /
-        Pipelines override this with the registry-pushed image
-        (`image-registry.openshift-image-registry.svc...` in Sepia,
-        `ghcr.io/mmgaggle/ceph-builder:ubuntu-noble-x86_64-<sha>` for
-        cross-cluster consumers).
+        Full image reference for the ceph-builder. The static default
+        preserves #16's tracer cell (ubuntu-noble-x86_64) so a TaskRun
+        with no extra param overrides still works.
+
+        The wrapping Pipeline (#18 / #22) is responsible for deriving
+        the per-cell image tag at binding time — at the Pipeline-level
+        the matrix params ARE interpolable, so a binding of the form
+
+            params:
+              - name: builder-image
+                value: "$(params.registry)/ceph-builder:$(matrix.distro)-$(matrix.arch)-latest"
+
+        threads the right per-cell tag without this Task having to
+        compute it. (Tekton does NOT interpolate `$(params.X)` inside
+        a Task's own param `default:` — that's a Pipeline-level
+        feature only.)
+
+        Overlay examples:
+          Sepia:   image-registry.openshift-image-registry.svc.cluster.local:5000/ceph-builder:${distro}-${arch}-latest
+          GHCR:    ghcr.io/mmgaggle/ceph-builder:${distro}-${arch}-<sha>
+          dev:     localhost/ceph-builder:${distro}-${arch}
     - name: build-command
       type: string
-      default: "dpkg-buildpackage -uc -us -b -j$(nproc)"
+      default: ""
       description: |
-        The literal build command shell-executed by the builder
-        image's `/usr/local/bin/build-package.sh` entrypoint. Default
-        is the canonical Debian binary build:
-          -uc        unsigned .changes (no GPG key in the pod)
-          -us        unsigned source package (same)
-          -b         binary-only (no .dsc/.tar.gz; matches the
-                     #20 publish-repo Task's `*.deb` discovery)
-          -j$(nproc) parallel
-        Callers can override to e.g. add `--build=binary` or
-        `--no-pre-clean` without touching the Task.
+        Literal build command shell-executed by the builder image's
+        `/usr/local/bin/build-package.sh` entrypoint. Empty (the
+        default) makes the dispatch step synthesise the canonical
+        per-family command:
+
+          DEB: `dpkg-buildpackage -uc -us -b -j$(nproc)`
+            -uc        unsigned .changes (no GPG key in the pod)
+            -us        unsigned source package (same)
+            -b         binary-only (no .dsc/.tar.gz; matches the
+                       #20 publish-repo Task's `*.deb` discovery)
+            -j$(nproc) parallel
+
+          RPM: `./make-srpm.sh && rpmbuild --define '_topdir <pwd>/rpmbuild' --rebuild ceph-*.src.rpm`
+            make-srpm.sh   upstream-ceph entrypoint that generates
+                           `ceph-<ver>.src.rpm` from `ceph.spec.in`
+            --rebuild      rpmbuild's binary-from-SRPM mode
+            _topdir        keeps rpmbuild's scratch + output tree
+                           inside the workspace (default `~/rpmbuild`
+                           is in the build user's $HOME)
+
+        Callers can override to e.g. add `--build=binary` (DEB) or
+        `--without lttng` (RPM) without touching the Task.
     - name: sccache-bucket
       type: string
       default: ""
@@ -213,48 +307,58 @@ spec:
       type: string
       default: docker.io/library/busybox:1.36
       description: |
-        Pinned busybox for the dispatch + emit-results steps. Same
-        pin as build-builder-image / publish-repo for build
+        Pinned busybox for the dispatch + collect-packages steps.
+        Same pin as build-builder-image / publish-repo for build
         determinism.
   results:
     # ---- Chains 0.26 file-subject grammar -----------------------------
     - name: ARTIFACT_OUTPUTS
       type: string
       description: |
-        Chains-grammar object Result. Shape:
-            {"uri":"<workspace-rel-path>","digest":"sha256:<hex>","isBuildArtifact":"true"}
-        With isBuildArtifact "true" Chains promotes this to a
-        subject in the slsa/v2alpha4 attestation.
-
-        This Task emits ARTIFACT_OUTPUTS for the PRIMARY `.deb`
-        only — the file whose name starts with `ceph_` (the
-        source-package-named binary; ceph's debian/control names
-        the source package `ceph`, so the head .deb is named
-        `ceph_<upstream-version>_<arch>.deb`). The full multi-
-        subject expansion (one per `.deb`) is #17's job when the
-        matrix lands and a Pipeline-level attest Task aggregates
-        per-cell ARTIFACT_OUTPUTS values.
+        Chains-grammar Result. Shape: a JSON ARRAY with one entry
+        per produced package file —
+            [
+              {"uri":"output/<file1>","digest":"sha256:<hex>","isBuildArtifact":"true"},
+              {"uri":"output/<file2>","digest":"sha256:<hex>","isBuildArtifact":"true"},
+              ...
+            ]
+        With `isBuildArtifact:"true"` on each element Chains 0.26
+        promotes every entry to a subject in the slsa/v2alpha4
+        attestation. For DEB cells the entries are `.deb` files;
+        for RPM cells they're `.rpm` files. The array shape is the
+        multi-subject expansion called out as #17's job in #16's
+        header note — #18's Pipeline-level attest aggregates per-
+        cell `ARTIFACT_OUTPUTS` arrays across matrix cells.
     - name: DEB_PATHS
       type: string
       description: |
-        Newline-separated list of WORKSPACE-RELATIVE paths to
-        every `.deb` this Task produced (relative to the `source`
-        workspace root). The publish-repo Task (#20) discovers
+        Newline-separated list of WORKSPACE-RELATIVE paths to every
+        `.deb` this Task produced. Populated only on DEB cells
+        (`mode=deb` or `mode=auto` with a deb-family distro);
+        empty on RPM cells. The publish-repo Task (#20) discovers
         files by glob, not by reading this Result, but #19's
-        S3-stage and #17's multi-subject Chains expansion need a
-        canonical list — that's this Result. Empty Result means
-        zero `.deb` files were produced, which is also a fatal
-        condition the build step catches before this Result is
-        written.
+        S3-stage uses this for a canonical list. Empty on a DEB
+        cell means zero `.deb`s were produced, which is also a
+        fatal condition the build step catches first.
     - name: DEB_DIGESTS
       type: string
       description: |
+        Newline-separated `<workspace-rel-path>@sha256:<hex>`
+        lines, one per `.deb`. Populated only on DEB cells.
+    - name: RPM_PATHS
+      type: string
+      description: |
+        Newline-separated list of WORKSPACE-RELATIVE paths to every
+        `.rpm` this Task produced. Populated only on RPM cells
+        (`mode=rpm` or `mode=auto` with an rpm-family distro);
+        empty on DEB cells. Mirrors `DEB_PATHS` for the RPM family;
+        the RPM-mode publish-repo path (sibling issue, createrepo_c)
+        will consume this when it lands.
+    - name: RPM_DIGESTS
+      type: string
+      description: |
         Newline-separated `<workspace-rel-path>@sha256:<hex>` lines,
-        one per `.deb`. Same shape as build-builder-image's `IMAGES`
-        Result, repurposed for file artefacts. Chains 0.26 has no
-        native multi-file subject matcher today; this Result is the
-        honest "everything we produced + its hash" index for
-        downstream verifiers + #17's matrix-attest Task.
+        one per `.rpm`. Populated only on RPM cells.
     - name: source-sha
       type: string
       description: |
@@ -279,18 +383,26 @@ spec:
     - name: source
       description: |
         Workspace that holds the cloned ceph tree, the in-tree build
-        output that `dpkg-buildpackage` writes to the parent dir,
-        and the collected `.deb` files. Layout after this Task:
-          $(workspaces.source.path)/ceph/         — git working tree
-          $(workspaces.source.path)/output/       — collected `.deb`s
+        output (DEB writes to the parent dir; RPM writes under
+        `rpmbuild/`), and the collected package files. Layout after
+        this Task:
+          $(workspaces.source.path)/ceph/             - git working tree
+          $(workspaces.source.path)/ceph/rpmbuild/    - rpmbuild scratch
+                                                        + RPMS/<arch>
+                                                        (RPM cells only)
+          $(workspaces.source.path)/output/           - collected
+                                                        `.deb` or `.rpm`
+          $(workspaces.source.path)/.build-package/   - dispatch-step
+                                                        state (resolved
+                                                        mode + cmd)
         The publish-repo Task (#20) mounts this workspace as its
-        `artifacts` workspace and `find`s `.deb` files under it —
-        the `output/` subdir keeps the `.deb`s out of the source
-        tree so a re-run sees a clean slate.
+        `artifacts` workspace and `find`s package files under it —
+        the `output/` subdir keeps them out of the source tree so a
+        re-run sees a clean slate.
 
         Binding shape: volumeClaimTemplate per PipelineRun. The
         source tree alone is ~5GB; the build adds ~6GB of object
-        files; the `.deb` output is ~1GB. emptyDir is fine for
+        files; the package output is ~1GB. emptyDir is fine for
         smoke on hefty workers; production runs need a sized PVC.
       mountPath: /workspace/source
     - name: sccache-bin
@@ -319,34 +431,111 @@ spec:
       optional: true
   steps:
     # ------------------------------------------------------------------
-    # Step 0: dispatch on `mode`. Mirrors tasks/publish-repo's mode
-    # gate. `deb` falls through; `rpm` aborts non-zero pointing at
-    # #17 (the matrix expansion); unrecognised values are also fatal.
+    # Step 0: dispatch — resolve `mode` and `build-command` and write
+    # the resolved values to a workspace file the build + collect
+    # steps read back.
+    #
+    # `mode=auto` (the default) classifies the `distro` slug into a
+    # family:
+    #     ubuntu-* | debian-*           -> deb
+    #     centos*  | rocky*  | fedora*  -> rpm
+    #     *                             -> fail (unknown distro)
+    # `mode=deb` / `mode=rpm` skip the classifier and pin the family
+    # directly. Unknown explicit modes are fatal.
+    #
+    # `build-command=""` (the default) makes us synthesise the
+    # canonical per-family command (see Task header for the
+    # rationale on each flag). A non-empty `build-command` is
+    # passed through verbatim — callers can override per-cell
+    # without forking the Task.
+    #
+    # The resolved values are written to
+    # `$(workspaces.source.path)/.build-package/{mode,build-command}`
+    # for downstream steps to read. Tekton has no step-to-step env
+    # channel, but the source workspace is the documented
+    # inter-step bus (same pattern tasks/make-check uses for the
+    # sccache creds env file).
     # ------------------------------------------------------------------
     - name: dispatch
       image: $(params.tools-image)
+      workingDir: $(workspaces.source.path)
       env:
-        - name: MODE
+        - name: MODE_IN
           value: $(params.mode)
+        - name: DISTRO
+          value: $(params.distro)
+        - name: BUILD_COMMAND_IN
+          value: $(params.build-command)
       script: |
         #!/bin/sh
         set -eu
-        case "${MODE}" in
-          deb)
-            echo "[dispatch] mode=deb -> dpkg-buildpackage path (#16's tracer)"
+
+        # --- Step 1: classify distro -> family ----------------------
+        case "${DISTRO}" in
+          ubuntu-*|debian-*)
+            FAMILY=deb
             ;;
-          rpm)
-            echo "FATAL: mode=rpm is not yet implemented in this Task." >&2
-            echo "       The rpmbuild path is part of #17's matrix"      >&2
-            echo "       expansion; this PR (#16) implements only the"   >&2
-            echo "       ubuntu-noble-x86_64 DEB tracer. Pass mode=deb." >&2
-            exit 1
+          centos*|rocky*|fedora*)
+            FAMILY=rpm
             ;;
           *)
-            echo "FATAL: unknown mode '${MODE}' - expected 'deb' or 'rpm'" >&2
+            echo "FATAL: unknown distro '${DISTRO}' - expected ubuntu-*,"    >&2
+            echo "       debian-*, centos*, rocky*, or fedora*. Add a new"   >&2
+            echo "       family branch in tasks/build-package/task.yaml's"   >&2
+            echo "       dispatch step if widening the matrix."              >&2
             exit 1
             ;;
         esac
+        echo "[dispatch] distro=${DISTRO} -> family=${FAMILY}"
+
+        # --- Step 2: resolve mode (auto | deb | rpm) -----------------
+        case "${MODE_IN}" in
+          auto)
+            MODE="${FAMILY}"
+            echo "[dispatch] mode=auto -> resolved to ${MODE} from distro family"
+            ;;
+          deb|rpm)
+            MODE="${MODE_IN}"
+            if [ "${MODE}" != "${FAMILY}" ]; then
+              echo "[dispatch] WARNING: explicit mode=${MODE} disagrees with" >&2
+              echo "[dispatch]          distro=${DISTRO} (family=${FAMILY})." >&2
+              echo "[dispatch]          Trusting the explicit mode; verify"  >&2
+              echo "[dispatch]          the builder image actually carries"  >&2
+              echo "[dispatch]          the ${MODE} toolchain."              >&2
+            fi
+            echo "[dispatch] mode=${MODE} (explicit)"
+            ;;
+          *)
+            echo "FATAL: unknown mode '${MODE_IN}' - expected auto, deb, or rpm" >&2
+            exit 1
+            ;;
+        esac
+
+        # --- Step 3: synthesise build-command if not overridden ------
+        if [ -n "${BUILD_COMMAND_IN}" ]; then
+          BUILD_COMMAND="${BUILD_COMMAND_IN}"
+          echo "[dispatch] build-command (caller override): ${BUILD_COMMAND}"
+        else
+          case "${MODE}" in
+            deb)
+              BUILD_COMMAND='dpkg-buildpackage -uc -us -b -j$(nproc)'
+              ;;
+            rpm)
+              # _topdir keeps rpmbuild's BUILD/BUILDROOT/RPMS/SRPMS/SPECS
+              # trees inside the workspace rather than $HOME/rpmbuild.
+              # The `rpmbuild` dir is created relative to the workdir
+              # the entrypoint cd's into (ceph source root).
+              BUILD_COMMAND='./make-srpm.sh && rpmbuild --define "_topdir $(pwd)/rpmbuild" --rebuild ceph-*.src.rpm'
+              ;;
+          esac
+          echo "[dispatch] build-command (synthesised for mode=${MODE}): ${BUILD_COMMAND}"
+        fi
+
+        # --- Step 4: persist resolved values for downstream steps ----
+        mkdir -p .build-package
+        printf '%s' "${MODE}"          > .build-package/mode
+        printf '%s' "${BUILD_COMMAND}" > .build-package/build-command
+        echo "[dispatch] wrote resolved state to .build-package/"
 
     # ------------------------------------------------------------------
     # Step 1: clone — fetch ceph/ceph at the requested ref.
@@ -527,35 +716,45 @@ spec:
         echo "[assume-role] credentials staged at ${CREDS_ENV}"
 
     # ------------------------------------------------------------------
-    # Step 4: build-package — run dpkg-buildpackage inside the
-    # ceph-builder:ubuntu-noble-x86_64 image.
+    # Step 4: build-package — run the family-appropriate build inside
+    # the ceph-builder:${distro}-${arch} image.
     #
     # The builder image's ENTRYPOINT (build-package.sh) routes on
     # argv shape (see images/builders/build-package.sh):
     #   `build-package.sh <workdir> <build-cmd>`
     #     -> cd into <workdir>, then `bash -c "<build-cmd>"`
-    # We use the 2-arg form, passing the ceph source dir + the
-    # `dpkg-buildpackage …` string from the `build-command` param.
+    # We use the 2-arg form with the source dir and the resolved
+    # build-command read back from the dispatch step's workspace
+    # file (`$(workspaces.source.path)/.build-package/build-command`).
     #
     # sccache wiring: the same CMake-launcher mechanism tasks/make-check
-    # uses. ceph's debian/rules calls do_cmake.sh, which honours
-    # CMAKE_C/CXX_COMPILER_LAUNCHER from the env we export here. No
-    # ccache/sccache logic needs to leak into debian/rules.
+    # uses. Both ceph's debian/rules and ceph.spec's %build stanza call
+    # do_cmake.sh, which honours CMAKE_C/CXX_COMPILER_LAUNCHER from
+    # the env we export here. No ccache/sccache logic needs to leak
+    # into debian/rules or ceph.spec.
     #
-    # `dpkg-buildpackage -b` emits `.deb` files in the PARENT directory
-    # of the source tree (Debian convention) — i.e.
-    #   $(workspaces.source.path)/*.deb
-    # We then collect them into $(workspaces.source.path)/output/ so the
-    # workspace shape downstream Tasks see is predictable. The collection
-    # step ALSO fails if zero `.deb`s exist post-build, which is the
-    # "no silent success" guard from #16 AC bullet 4.
+    # Post-build artefact-presence check, per family:
+    #
+    #   DEB:  dpkg-buildpackage -b emits `.deb`s in the PARENT
+    #         directory of the source tree (Debian convention) — i.e.
+    #         $(workspaces.source.path)/*.deb
+    #   RPM:  rpmbuild --define '_topdir <pwd>/rpmbuild' --rebuild
+    #         emits binary RPMs at
+    #         $(workspaces.source.path)/ceph/rpmbuild/RPMS/<arch>/*.rpm
+    #         (`<pwd>` is the workdir the entrypoint cd'd into — the
+    #         ceph source root.) `<arch>` is rpmbuild's view of the
+    #         host arch (e.g. `x86_64` or `aarch64`); the source tree
+    #         can also contain `noarch` packages under
+    #         `rpmbuild/RPMS/noarch/`.
+    #
+    # The collect step covers the move into `output/`; this step
+    # only verifies a non-zero count post-build so the fail-loud
+    # guard sits as close to the failing command as possible.
     # ------------------------------------------------------------------
     - name: build-package
       image: $(params.builder-image)
       workingDir: $(workspaces.source.path)
       env:
-        - name: BUILD_COMMAND
-          value: $(params.build-command)
         - name: SCCACHE_BUCKET
           value: $(params.sccache-bucket)
         - name: SCCACHE_ENDPOINT
@@ -577,6 +776,20 @@ spec:
       script: |
         #!/bin/bash
         set -euo pipefail
+
+        # ------------------------------------------------------------
+        # Read the dispatch step's resolved mode + build-command.
+        # ------------------------------------------------------------
+        DISPATCH_DIR=".build-package"
+        if [ ! -f "${DISPATCH_DIR}/mode" ] || [ ! -f "${DISPATCH_DIR}/build-command" ]; then
+          echo "[build-package] FAIL: dispatch state missing under ${DISPATCH_DIR}/" >&2
+          echo "[build-package]        (did the dispatch step run on this workspace?)" >&2
+          exit 1
+        fi
+        MODE=$(cat "${DISPATCH_DIR}/mode")
+        BUILD_COMMAND=$(cat "${DISPATCH_DIR}/build-command")
+        echo "[build-package] resolved mode=${MODE}"
+        echo "[build-package] resolved cmd=${BUILD_COMMAND}"
 
         # ------------------------------------------------------------
         # Surface the builder image's identity (baked at build time
@@ -645,43 +858,88 @@ spec:
           exit 1
         fi
 
-        # debian/rules + dpkg-buildpackage existence checks: a
-        # ubuntu-noble builder image lacks the debian/* tooling iff
-        # something went sideways in image build. Fail loud here so
-        # the failure mode points at the image, not at "dpkg-buildpackage:
-        # command not found" deep in the log.
-        if ! command -v dpkg-buildpackage >/dev/null 2>&1; then
-          echo "[build-package] FAIL: dpkg-buildpackage not on PATH - wrong builder image? (expected ubuntu-noble)" >&2
-          exit 1
-        fi
-        if [ ! -f ceph/debian/rules ]; then
-          echo "[build-package] FAIL: ceph/debian/rules missing - source tree clone is broken or ceph branch lacks the debian/ subtree" >&2
-          exit 1
-        fi
+        # Per-family toolchain + source-tree checks. The point of
+        # the explicit checks (rather than letting the build command
+        # fail with "command not found") is to point at the image
+        # mis-routing as the failure mode, not at a cryptic deep-log
+        # error.
+        case "${MODE}" in
+          deb)
+            if ! command -v dpkg-buildpackage >/dev/null 2>&1; then
+              echo "[build-package] FAIL: dpkg-buildpackage not on PATH - wrong builder image? (mode=deb expects an ubuntu-* / debian-* builder)" >&2
+              exit 1
+            fi
+            if [ ! -f ceph/debian/rules ]; then
+              echo "[build-package] FAIL: ceph/debian/rules missing - source tree clone is broken or ceph branch lacks the debian/ subtree" >&2
+              exit 1
+            fi
+            ;;
+          rpm)
+            if ! command -v rpmbuild >/dev/null 2>&1; then
+              echo "[build-package] FAIL: rpmbuild not on PATH - wrong builder image? (mode=rpm expects a centos*/rocky*/fedora* builder)" >&2
+              exit 1
+            fi
+            if [ ! -f ceph/make-srpm.sh ]; then
+              echo "[build-package] FAIL: ceph/make-srpm.sh missing - source tree clone is broken or ceph branch lacks the upstream make-srpm.sh" >&2
+              exit 1
+            fi
+            if [ ! -f ceph/ceph.spec.in ]; then
+              echo "[build-package] FAIL: ceph/ceph.spec.in missing - make-srpm.sh needs it to generate ceph.spec" >&2
+              exit 1
+            fi
+            ;;
+          *)
+            echo "[build-package] FAIL: unexpected resolved mode '${MODE}' - dispatch step bug" >&2
+            exit 1
+            ;;
+        esac
 
         echo "[build-package] invoking build-package.sh"
         echo "[build-package]   workdir: $(pwd)/ceph"
+        echo "[build-package]   mode:    ${MODE}"
         echo "[build-package]   cmd:     ${BUILD_COMMAND}"
 
         /usr/local/bin/build-package.sh "$(pwd)/ceph" "${BUILD_COMMAND}"
 
         # ------------------------------------------------------------
-        # dpkg-buildpackage -b emits `.deb`s in the PARENT directory
-        # of the source tree (Debian convention). Verify here so a
-        # silent zero-debs outcome (caught by `set -e` is unreliable
-        # because dpkg-buildpackage CAN exit 0 with no debs if the
-        # source-package layout has nothing to build) fails loud.
-        # AC bullet 4: "Task fails clearly if dpkg-buildpackage fails
-        # (no silent success)".
+        # Artefact-presence guard, per family. Both dpkg-buildpackage
+        # and rpmbuild CAN exit zero with no packages produced under
+        # a misconfigured input tree (set -e alone is unreliable);
+        # the post-build count check is the "no silent success" guard.
+        #
+        #   DEB: dpkg-buildpackage -b drops `.deb`s in the PARENT of
+        #        the source tree, so $(workspaces.source.path)/*.deb
+        #        (we cd'd into the workspace root for this step).
+        #   RPM: the build-command we synthesise sets
+        #        --define '_topdir $(pwd)/rpmbuild' where $(pwd) is
+        #        the entrypoint's cd target (ceph/), so RPMs land at
+        #        ceph/rpmbuild/RPMS/<arch>/*.rpm and we look under
+        #        ceph/rpmbuild/RPMS (any subarch, including noarch).
         # ------------------------------------------------------------
-        DEB_COUNT=$(find . -maxdepth 1 -type f -name '*.deb' | wc -l)
-        if [ "${DEB_COUNT}" -eq 0 ]; then
-          echo "[build-package] FAIL: dpkg-buildpackage produced zero .deb files" >&2
-          echo "[build-package]        listing $(pwd):" >&2
-          ls -la >&2 || true
-          exit 1
-        fi
-        echo "[build-package] dpkg-buildpackage produced ${DEB_COUNT} .deb file(s)"
+        case "${MODE}" in
+          deb)
+            ARTIFACT_COUNT=$(find . -maxdepth 1 -type f -name '*.deb' | wc -l)
+            if [ "${ARTIFACT_COUNT}" -eq 0 ]; then
+              echo "[build-package] FAIL: dpkg-buildpackage produced zero .deb files" >&2
+              echo "[build-package]        listing $(pwd):" >&2
+              ls -la >&2 || true
+              exit 1
+            fi
+            echo "[build-package] dpkg-buildpackage produced ${ARTIFACT_COUNT} .deb file(s)"
+            ;;
+          rpm)
+            ARTIFACT_COUNT=$(find ceph/rpmbuild/RPMS -mindepth 2 -maxdepth 2 -type f -name '*.rpm' 2>/dev/null | wc -l)
+            if [ "${ARTIFACT_COUNT}" -eq 0 ]; then
+              echo "[build-package] FAIL: rpmbuild produced zero .rpm files" >&2
+              echo "[build-package]        expected layout: ceph/rpmbuild/RPMS/<arch>/*.rpm" >&2
+              echo "[build-package]        listing ceph/rpmbuild/ (if present):" >&2
+              ls -la ceph/rpmbuild/ >&2 2>/dev/null || true
+              ls -la ceph/rpmbuild/RPMS/ >&2 2>/dev/null || true
+              exit 1
+            fi
+            echo "[build-package] rpmbuild produced ${ARTIFACT_COUNT} .rpm file(s) under ceph/rpmbuild/RPMS/"
+            ;;
+        esac
 
         # ------------------------------------------------------------
         # sccache stats — emit to the Tekton Results, same parsing as
@@ -710,15 +968,27 @@ spec:
         fi
 
     # ------------------------------------------------------------------
-    # Step 5: collect-debs — move the `.deb` files into
-    # `output/` and emit the Chains-grammar + downstream-consumer
-    # Results.
+    # Step 5: collect-packages — move the package files into `output/`
+    # and emit the Chains-grammar + downstream-consumer Results.
     #
     # The `output/` layout matches what tasks/publish-repo (#20)
     # expects on its `artifacts` workspace: a flat directory of
-    # `.deb` files discoverable by `find … -name '*.deb'`. The
-    # publish-repo Task explicitly does NOT care about subdirectory
-    # structure, so flat-and-predictable is the right shape.
+    # package files discoverable by `find … -name '*.deb'` (or
+    # `*.rpm` for the RPM-mode createrepo_c path). The publish-repo
+    # Task explicitly does NOT care about subdirectory structure,
+    # so flat-and-predictable is the right shape for both families.
+    #
+    # Per-family source location:
+    #   DEB: `.deb`s in the workspace root (dpkg-buildpackage's
+    #        parent-dir output).
+    #   RPM: `.rpm`s under ceph/rpmbuild/RPMS/<arch>/ (and possibly
+    #        ceph/rpmbuild/RPMS/noarch/). We flatten into `output/`.
+    #
+    # Per-family results emitted:
+    #   DEB: DEB_PATHS, DEB_DIGESTS populated; RPM_* empty.
+    #   RPM: RPM_PATHS, RPM_DIGESTS populated; DEB_* empty.
+    # ARTIFACT_OUTPUTS is always a JSON array covering every
+    # collected package (multi-subject expansion).
     #
     # Done as a separate step from build-package so the busybox
     # tools-image handles the sha256 + workspace-rel-path arithmetic
@@ -726,7 +996,7 @@ spec:
     # the build step's bash. Same separation as build-builder-image's
     # `emit-results` step.
     # ------------------------------------------------------------------
-    - name: collect-debs
+    - name: collect-packages
       image: $(params.tools-image)
       workingDir: $(workspaces.source.path)
       env:
@@ -736,74 +1006,118 @@ spec:
           value: $(results.DEB_PATHS.path)
         - name: RESULT_DEB_DIGESTS
           value: $(results.DEB_DIGESTS.path)
+        - name: RESULT_RPM_PATHS
+          value: $(results.RPM_PATHS.path)
+        - name: RESULT_RPM_DIGESTS
+          value: $(results.RPM_DIGESTS.path)
       script: |
         #!/bin/sh
         set -eu
 
-        mkdir -p output
-        # Move every top-level .deb that dpkg-buildpackage left in
-        # the workspace root into output/. find … -exec mv is the
-        # portable shape; busybox find supports -maxdepth + -exec.
-        find . -maxdepth 1 -type f -name '*.deb' -exec mv {} output/ \;
-
-        # Sanity guard. The build step already fails if zero .debs
-        # exist, but a Task with multiple steps can have the workspace
-        # mutated between them; re-check here so a downstream Result
-        # consumer never sees a paradox (build "succeeded", DEB_PATHS
-        # empty).
-        DEB_COUNT=$(find output -maxdepth 1 -type f -name '*.deb' | wc -l)
-        if [ "${DEB_COUNT}" -eq 0 ]; then
-          echo "[collect-debs] FAIL: no .deb files in output/ after collection" >&2
-          ls -la . >&2 || true
+        # Read the dispatch step's resolved mode.
+        if [ ! -f .build-package/mode ]; then
+          echo "[collect-packages] FAIL: .build-package/mode missing - dispatch step didn't run?" >&2
           exit 1
         fi
-        echo "[collect-debs] collected ${DEB_COUNT} .deb file(s) into output/:"
+        MODE=$(cat .build-package/mode)
+        echo "[collect-packages] resolved mode=${MODE}"
+
+        mkdir -p output
+        # Start every per-family Result empty; the active branch
+        # populates its pair, the inactive branch leaves its pair
+        # as empty Results (Tekton supports empty string Results).
+        : > "${RESULT_DEB_PATHS}"
+        : > "${RESULT_DEB_DIGESTS}"
+        : > "${RESULT_RPM_PATHS}"
+        : > "${RESULT_RPM_DIGESTS}"
+
+        case "${MODE}" in
+          deb)
+            # find … -exec mv is the portable shape; busybox find
+            # supports -maxdepth + -exec.
+            find . -maxdepth 1 -type f -name '*.deb' -exec mv {} output/ \;
+            PACKAGE_GLOB='*.deb'
+            ACTIVE_PATHS="${RESULT_DEB_PATHS}"
+            ACTIVE_DIGESTS="${RESULT_DEB_DIGESTS}"
+            ;;
+          rpm)
+            # Flatten ceph/rpmbuild/RPMS/<arch>/*.rpm (and noarch/)
+            # into output/. `-exec mv {} output/ \;` re-homes each
+            # file at the top level of output/, dropping the
+            # per-arch subdir — publish-repo's createrepo_c path
+            # walks output/ flat, same convention as the DEB side.
+            if [ -d ceph/rpmbuild/RPMS ]; then
+              find ceph/rpmbuild/RPMS -mindepth 2 -maxdepth 2 -type f -name '*.rpm' \
+                -exec mv {} output/ \;
+            fi
+            PACKAGE_GLOB='*.rpm'
+            ACTIVE_PATHS="${RESULT_RPM_PATHS}"
+            ACTIVE_DIGESTS="${RESULT_RPM_DIGESTS}"
+            ;;
+          *)
+            echo "[collect-packages] FAIL: unexpected resolved mode '${MODE}' - dispatch step bug" >&2
+            exit 1
+            ;;
+        esac
+
+        # Sanity guard. The build step already fails if zero
+        # packages exist, but a Task with multiple steps can have
+        # the workspace mutated between them; re-check here so a
+        # downstream Result consumer never sees a paradox (build
+        # "succeeded", PATHS empty).
+        PKG_COUNT=$(find output -maxdepth 1 -type f -name "${PACKAGE_GLOB}" | wc -l)
+        if [ "${PKG_COUNT}" -eq 0 ]; then
+          echo "[collect-packages] FAIL: no ${PACKAGE_GLOB} files in output/ after collection" >&2
+          ls -la . >&2 || true
+          ls -la output/ >&2 2>/dev/null || true
+          exit 1
+        fi
+        echo "[collect-packages] collected ${PKG_COUNT} ${PACKAGE_GLOB} file(s) into output/:"
         ls -la output/
 
-        # DEB_PATHS — newline-separated, workspace-relative.
+        # Active-family PATHS — newline-separated, workspace-relative.
         # find … -print emits one per line; we drop the leading
         # `./` to match the relative-path convention every other
         # Task in this repo uses.
-        find output -maxdepth 1 -type f -name '*.deb' \
+        find output -maxdepth 1 -type f -name "${PACKAGE_GLOB}" \
           | sed 's|^\./||' \
           | sort \
-          > "${RESULT_DEB_PATHS}"
+          > "${ACTIVE_PATHS}"
 
-        # DEB_DIGESTS — `<path>@sha256:<hex>` per line. busybox
-        # sha256sum emits `<hex>  <file>`; awk reshapes.
-        : > "${RESULT_DEB_DIGESTS}"
+        # Active-family DIGESTS — `<path>@sha256:<hex>` per line.
+        # busybox sha256sum emits `<hex>  <file>`; awk reshapes.
         while IFS= read -r path; do
           [ -z "${path}" ] && continue
           HEX=$(sha256sum "${path}" | awk '{print $1}')
           printf '%s@sha256:%s\n' "${path}" "${HEX}" \
-            >> "${RESULT_DEB_DIGESTS}"
-        done < "${RESULT_DEB_PATHS}"
+            >> "${ACTIVE_DIGESTS}"
+        done < "${ACTIVE_PATHS}"
 
-        # ARTIFACT_OUTPUTS — Chains-grammar object for the PRIMARY
-        # `.deb`. Pick the first `output/ceph_*.deb` lexicographically
-        # — that's the source-package-named binary (ceph's
-        # debian/control sets `Source: ceph`, so the head .deb name
-        # starts with `ceph_<upstream-version>_<arch>.deb`). If no
-        # `ceph_*.deb` is present (unlikely for a real ceph build,
-        # but the smoke harness in #17 might use a stub source tree),
-        # fall back to the first .deb in lexical order so the Result
-        # is never empty.
-        PRIMARY=$(find output -maxdepth 1 -type f -name 'ceph_*.deb' \
-                    | sort | head -n1)
-        if [ -z "${PRIMARY}" ]; then
-          PRIMARY=$(find output -maxdepth 1 -type f -name '*.deb' \
-                      | sort | head -n1)
-        fi
-        PRIMARY="${PRIMARY#./}"
-        PRIMARY_HEX=$(sha256sum "${PRIMARY}" | awk '{print $1}')
-        printf '{"uri":"%s","digest":"sha256:%s","isBuildArtifact":"true"}' \
-          "${PRIMARY}" "${PRIMARY_HEX}" \
-          > "${RESULT_ARTIFACT_OUTPUTS}"
+        # ARTIFACT_OUTPUTS — Chains-grammar JSON ARRAY with one
+        # entry per produced package (multi-subject expansion).
+        # Shape: [{"uri":"output/<f>","digest":"sha256:<hex>","isBuildArtifact":"true"}, ...]
+        # We build the array by hand with awk-free shell because
+        # the busybox tools-image carries neither jq nor python.
+        FIRST=1
+        printf '[' > "${RESULT_ARTIFACT_OUTPUTS}"
+        while IFS= read -r path; do
+          [ -z "${path}" ] && continue
+          HEX=$(sha256sum "${path}" | awk '{print $1}')
+          if [ "${FIRST}" -eq 1 ]; then
+            FIRST=0
+          else
+            printf ',' >> "${RESULT_ARTIFACT_OUTPUTS}"
+          fi
+          printf '{"uri":"%s","digest":"sha256:%s","isBuildArtifact":"true"}' \
+            "${path}" "${HEX}" \
+            >> "${RESULT_ARTIFACT_OUTPUTS}"
+        done < "${ACTIVE_PATHS}"
+        printf ']' >> "${RESULT_ARTIFACT_OUTPUTS}"
 
-        echo "[collect-debs] DEB_PATHS:"
-        sed 's/^/[collect-debs]   /' "${RESULT_DEB_PATHS}"
-        echo "[collect-debs] DEB_DIGESTS:"
-        sed 's/^/[collect-debs]   /' "${RESULT_DEB_DIGESTS}"
-        echo "[collect-debs] ARTIFACT_OUTPUTS (primary):"
-        sed 's/^/[collect-debs]   /' "${RESULT_ARTIFACT_OUTPUTS}"
+        echo "[collect-packages] ${MODE}-family PATHS:"
+        sed 's/^/[collect-packages]   /' "${ACTIVE_PATHS}"
+        echo "[collect-packages] ${MODE}-family DIGESTS:"
+        sed 's/^/[collect-packages]   /' "${ACTIVE_DIGESTS}"
+        echo "[collect-packages] ARTIFACT_OUTPUTS (multi-subject JSON array):"
+        sed 's/^/[collect-packages]   /' "${RESULT_ARTIFACT_OUTPUTS}"
         echo
