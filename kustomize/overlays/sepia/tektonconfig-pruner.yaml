@@ -17,12 +17,19 @@
 # pac) AND the pruner CronJob the operator creates for us.
 #
 # We are therefore taking ownership of the `config` TektonConfig
-# starting with this manifest. Today it only carries the pruner
-# block (the focused scope of issue #60). Future PRs will move
-# the chains-config overrides and any other operator-driven
-# settings into this same object — see the comment in
-# kustomize/overlays/sepia/kustomization.yaml about where
-# follow-up patches land.
+# starting with this manifest. Three operator-driven blocks live
+# here today:
+#   - spec.pruner.*   — issue #60: TaskRun/PipelineRun count-based
+#                       retention.
+#   - spec.pipeline.* — issue #63: CloudEvents emission to the
+#                       in-cluster sink.
+#   - spec.chain.*    — issue #27: SLSA v1.0 attestations, Fulcio
+#                       keyless signing, public Rekor transparency.
+#                       See the chain block below for the per-key
+#                       rationale and the S3-sibling .intoto.jsonl
+#                       design the publish-repo Task implements
+#                       on top of the Statement Chains writes to
+#                       the PipelineRun annotation.
 #
 # SCHEMA SOURCE
 # -------------
@@ -164,3 +171,140 @@ spec:
     # unambiguous absolute form, so resolution can't be redirected
     # by tekton-pipelines's local search domain.
     default-cloud-events-sink: "http://cloudevents-sink.cloudevents-sink.svc.cluster.local"
+  # ----------------------------------------------------------------
+  # Tekton Chains config for Sepia (issue #27).
+  #
+  # On Sepia the OpenShift Pipelines operator owns Chains — it
+  # installs the controller, the `chains-config` ConfigMap, and the
+  # `signing-secrets` Secret in the `openshift-pipelines` namespace.
+  # `TektonConfig.spec.chain.*` is the operator pass-through: every
+  # entry below is reconciled verbatim into a key on the
+  # `chains-config` ConfigMap. Same shape as `spec.pipeline.*`
+  # above — the dev overlays don't run the operator, so they
+  # install the standalone `kustomize/base/tekton-chains/` base
+  # instead (see hack/dev-chains-setup.sh).
+  #
+  # Schema source: tektoncd/operator
+  #   pkg/apis/operator/v1alpha1/tektonchain_types.go (`ChainProperties`)
+  # which mirrors tektoncd/chains config/config.go field names. Every
+  # value below maps to a documented Chains ConfigMap key (the same
+  # ones the base patch in kustomize/base/tekton-chains/chains-config.patch.yaml
+  # lists for the dev install).
+  #
+  # WHAT THIS WIRES UP
+  # ------------------
+  # 1. **SLSA Provenance v1.0** in-toto Statements for every
+  #    PipelineRun and TaskRun, format `slsa/v2alpha4` (the only
+  #    Chains 0.26.x format whose predicateType is
+  #    `https://slsa.dev/provenance/v1`; see provenance.md
+  #    §"Inspecting the attestation").
+  # 2. **Fulcio keyless signing** via the cluster's SA-token OIDC
+  #    issuer. The PipelineRun executor SA's projected token is
+  #    exchanged at Fulcio for a short-lived X.509 cert bound to the
+  #    SA identity — no long-lived signing keys touch the cluster.
+  #    Identity binding: `system:serviceaccount:sepia-pipelines:ceph-pipeline-sa`
+  #    (see docs/architecture.md §"Signing identity").
+  # 3. **Public Rekor** transparency log entry per attestation. The
+  #    downstream verifier (the package-attestation sibling story,
+  #    #28) calls `cosign verify-blob-attestation` which gates on
+  #    the Rekor entry being present AND the Fulcio cert chaining
+  #    back to the Sigstore root.
+  # 4. **Per-package S3-sibling attestations** are NOT a Chains
+  #    backend in 0.26 — Chains exposes the signed Statement on the
+  #    PipelineRun's `chains.tekton.dev/payload-pipelinerun-*`
+  #    annotation, and the `publish-repo` Task (deferred, lands
+  #    alongside the build-package pipeline in #16-adjacent work)
+  #    reads that annotation and PUTs the in-toto Statement as
+  #    `s3://<bucket>/<branch>/<sha>/<distro>/<arch>/attestations/<pkg>.intoto.jsonl`
+  #    next to the .deb/.rpm artifact. That keeps Chains stateless
+  #    and avoids depending on a Chains S3 backend (Chains 0.26 ships
+  #    `gcs`-only for file storage; we explicitly do not use GCS —
+  #    see docs/provenance.md §"Per-build package SBOMs" for the
+  #    same convention applied to SBOMs). `artifacts.pipelinerun.enable-deep-inspection`
+  #    below is what makes the PipelineRun attestation roll up every
+  #    `IMAGES` / `SBOM_IMAGES` Result the child TaskRuns emit, so
+  #    one annotation carries every per-package subject the
+  #    publish-repo Task needs to split into per-`.intoto.jsonl`
+  #    files.
+  #
+  # WHY NO `oci` STORAGE BACKEND HERE
+  # ---------------------------------
+  # `artifacts.oci.storage=oci` is the right knob for **image**
+  # attestations (lands as a cosign referrer next to the image in
+  # quay.io / the in-cluster registry). The image-build pipeline
+  # that needs it (#26) is a separate slice; setting it here would
+  # silently misfire on PipelineRuns that don't emit `IMAGE_*`
+  # Results. Leave `artifacts.oci.*` defaulted (Chains will sign
+  # any `IMAGE_*` it sees, storing to the controller's default OCI
+  # behavior) and let #26 turn the explicit knob on when the image
+  # pipeline lands.
+  #
+  # ORDERING SAFETY
+  # ---------------
+  # Same shape as the cloudevents pass-through above. The operator
+  # reconciles this block on every change; the controller picks up
+  # the new ConfigMap values without a restart. If the `signing-secrets`
+  # Secret doesn't exist yet, Chains logs "no signing key found" once
+  # per attestation attempt — loud but harmless, and the secret is
+  # provisioned by a separate Sepia bootstrap step (operator-managed
+  # `TektonChain` CR; see PLAN.md §"Bootstrap & cluster install").
+  chain:
+    # ---- attestation format ----
+    # slsa/v2alpha4 emits the in-toto predicateType
+    # `https://slsa.dev/provenance/v1` (SLSA v1.0). See
+    # docs/provenance.md §"Inspecting the attestation" and
+    # tektoncd/chains v0.26 docs/slsa-provenance.md for the predicate
+    # shape. Same value as kustomize/base/tekton-chains/chains-config.patch.yaml
+    # so dev and Sepia produce attestations a single verifier accepts.
+    artifacts.taskrun.format: "slsa/v2alpha4"
+    artifacts.pipelinerun.format: "slsa/v2alpha4"
+    # ---- attestation storage ----
+    # `tekton` = attach the signed Statement to the run as a
+    # `chains.tekton.dev/payload-*` annotation. The publish-repo
+    # Task reads the annotation and writes the
+    # <package>.intoto.jsonl sibling object to S3 (see top-of-block
+    # comment for the S3 layout). `s3` is not a supported backend
+    # in Chains 0.26; `gcs` is, but we explicitly do not use GCS.
+    artifacts.taskrun.storage: "tekton"
+    artifacts.pipelinerun.storage: "tekton"
+    # Roll up every child TaskRun's type-hinted Results (IMAGES,
+    # SBOM_IMAGES, *_ARTIFACT_OUTPUTS, …) into the PipelineRun-level
+    # attestation. Without this, the per-package subjects emitted
+    # by build-package's child TaskRuns would not appear in the
+    # PipelineRun attestation the publish-repo Task is going to
+    # split into sibling .intoto.jsonl files. Required key for the
+    # #27 design. Upstream: tektoncd/chains config/config.go.
+    artifacts.pipelinerun.enable-deep-inspection: "true"
+    # ---- signing ----
+    # Fulcio keyless. The Chains controller exchanges the executor
+    # SA's projected token at Fulcio's public-good instance for a
+    # short-lived X.509 cert bound to the SA identity, then signs
+    # the in-toto Statement with the cert's private key. No
+    # long-lived signing key in the cluster. Verifier flow lives in
+    # docs/provenance.md §"Promoting to Fulcio keyless (Sepia)" and
+    # is exercised by issue #28.
+    signers.x509.fulcio.enabled: "true"
+    signers.x509.fulcio.address: "https://fulcio.sigstore.dev"
+    # `kubernetes` provider tells Chains to use the in-cluster SA
+    # token via the projected-volume convention. The alternative
+    # (`spiffe`) is for SPIRE-issued SVIDs; Sepia doesn't run SPIRE
+    # so `kubernetes` is the right choice.
+    signers.x509.fulcio.provider: "kubernetes"
+    # OIDC issuer = the Sepia OpenShift cluster's SA token issuer
+    # URL — Fulcio fetches the issuer's discovery doc to verify the
+    # SA token. The actual URL is a per-cluster value set during
+    # Sepia bootstrap (kube-apiserver `--service-account-issuer`
+    # flag); leaving it unset here lets Fulcio fall back to the
+    # token's `iss` claim, which is what we want. If a future
+    # Sepia overlay needs to pin the issuer (e.g. for an air-gapped
+    # Fulcio), add `signers.x509.fulcio.issuer: "<url>"` here.
+    # ---- transparency ----
+    # Sign-and-log every attestation to the public-good Rekor. The
+    # #28 verification side (`cosign verify-blob-attestation`)
+    # depends on the Rekor entry being present, so leaving this
+    # enabled now means #28 can land independently without a
+    # second Chains-config change. Same Rekor URL as dev — one
+    # public log holds entries from both environments and the
+    # verifier doesn't need to know which cluster produced an entry.
+    transparency.enabled: "true"
+    transparency.url: "https://rekor.sigstore.dev"
