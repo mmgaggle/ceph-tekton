@@ -1,0 +1,106 @@
+# ServiceMonitor — point OpenShift's Prometheus at Tekton's
+# PipelineRun + TaskRun metrics.
+#
+# Partially addresses mmgaggle/ceph-tekton#41 (the "ServiceMonitor for
+# Tekton pipelines controller" acceptance bullet). The other bullets in
+# that issue (kube-prometheus-stack helm install, ceph-builds-api
+# custom metrics at /metrics, docs/observability.md, retention knobs)
+# are deliberately deferred and tracked separately — see the issue body
+# for status and the PR description for the punt list.
+#
+# WHY SEPIA ONLY
+# --------------
+# This manifest lives in the sepia overlay (and not dev-local or
+# dev-kind) for the same reason tektonconfig-pruner.yaml does:
+# ServiceMonitor is a CR owned by the Prometheus Operator, which
+# OpenShift ships as part of its built-in monitoring stack. k3s
+# (dev-local) and kind (dev-kind) do NOT ship the Prometheus
+# Operator out of the box, so applying this CR there would either
+# 404 on an unknown kind or land as an inert blob no one scrapes.
+# When the dev overlays grow an in-cluster Prometheus chart (the
+# phase-1 posture documented in docs/architecture.md §"Observability"),
+# this manifest can move to the base — at that point both dev and
+# Sepia will have a Prometheus Operator to honour it.
+#
+# WHAT TEKTON EXPORTS
+# -------------------
+# The Tekton Pipelines controller exports Prometheus metrics on a
+# Service named `tekton-pipelines-controller`, port name `http-metrics`
+# (TCP 9090). The OpenShift Pipelines operator preserves the upstream
+# Service name + port name in the `openshift-pipelines` install
+# namespace. Sample metrics surfaced once this is wired:
+#
+#   tekton_pipelines_controller_pipelinerun_count
+#   tekton_pipelines_controller_pipelinerun_duration_seconds
+#   tekton_pipelines_controller_running_pipelineruns_count
+#   tekton_pipelines_controller_taskrun_count
+#   tekton_pipelines_controller_taskrun_duration_seconds
+#   tekton_pipelines_controller_running_taskruns_count
+#
+# Those are the names emitted by Tekton's `knative.dev/pkg/metrics`
+# wrapper in the pinned v1.6.0 line (and by OpenShift Pipelines'
+# packaged controller). The matching metric inventory + label
+# semantics will be documented in docs/observability.md as part of
+# the follow-up that closes the rest of #41.
+#
+# Tekton also ships a separate `tekton-pipelines-webhook` Service with
+# its own `http-metrics` port. Webhook metrics are operationally less
+# useful (admission stats, not PipelineRun lifecycle), and #41 calls
+# out PipelineRun + TaskRun specifically — scoping this CR to the
+# controller keeps the cardinality bounded and the dashboards
+# (issue #42) honest about what they're querying.
+#
+# WHICH PROMETHEUS PICKS THIS UP
+# ------------------------------
+# OpenShift's *platform* Prometheus (in `openshift-monitoring`)
+# auto-discovers ServiceMonitors in `openshift-*` namespaces,
+# including `openshift-pipelines`. No user-workload-monitoring
+# (UWM) toggle is required for this specific posture. If a future
+# decision moves the controller to a non-`openshift-*` namespace
+# (unlikely on a vanilla OpenShift Pipelines install), UWM must be
+# enabled and this ServiceMonitor's namespace adjusted accordingly.
+#
+# Prometheus exposes the resulting target with:
+#   job="tekton-pipelines-controller"
+#   namespace="openshift-pipelines"
+#   service="tekton-pipelines-controller"
+# Issue #42's Grafana dashboard should query against
+# {job="tekton-pipelines-controller", namespace="openshift-pipelines"}.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: tekton-pipelines-controller
+  namespace: openshift-pipelines
+  labels:
+    # Match the Service's identity labels so a `kubectl get
+    # servicemonitor -l app.kubernetes.io/part-of=tekton-pipelines`
+    # surfaces this object alongside everything else the operator
+    # installs for Tekton.
+    app.kubernetes.io/name: tekton-pipelines-controller
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/part-of: tekton-pipelines
+spec:
+  # selector pins us to the controller Service the OpenShift
+  # Pipelines operator creates. `app.kubernetes.io/name: controller`
+  # + `app.kubernetes.io/part-of: tekton-pipelines` together uniquely
+  # identify it (the webhook Service carries name=webhook).
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: controller
+      app.kubernetes.io/part-of: tekton-pipelines
+  namespaceSelector:
+    matchNames:
+      - openshift-pipelines
+  endpoints:
+    # `http-metrics` is the upstream Tekton port name on the
+    # tekton-pipelines-controller Service (TCP 9090). Naming the
+    # port (not the number) keeps this resilient to upstream port
+    # renumbers.
+    - port: http-metrics
+      # 30s lines up with the kube-prometheus-stack default and is
+      # well under any Tekton metric's emit cadence — PipelineRun
+      # counters update on reconcile, gauges on each tick.
+      interval: 30s
+      # honorLabels: false (the kube-prom default) lets Prometheus
+      # attach its `namespace`/`pod`/`service` labels to the scrape
+      # without the metric source clobbering them.
