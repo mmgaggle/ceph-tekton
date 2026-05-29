@@ -1,7 +1,7 @@
 # compute-matrix-smoke-test — `compute-matrix-smoke-seed` Task.
 #
 # Stages a deterministic synthetic matrix.yaml in the shared source
-# workspace so `compute-matrix` has something to read. Three cells with
+# workspace so `compute-matrix` has something to read. Four cells with
 # a mix of gating=true and gating=false, so the assert step has signal
 # on both code paths.
 #
@@ -16,7 +16,7 @@ metadata:
 spec:
   description: |
     Stage a deterministic synthetic matrix.yaml in the shared source
-    workspace so `compute-matrix` has something to read. Three cells
+    workspace so `compute-matrix` has something to read. Four cells
     with a mix of gating=true and gating=false, so the assert step
     has signal on both code paths.
   params:
@@ -47,10 +47,13 @@ spec:
         #!/bin/sh
         set -eu
 
-        # Three cells: two gating, one non-gating. The non-gating cell
+        # Four cells: three gating, one non-gating. The non-gating cell
         # exercises the `gating: false` → "false" string-coercion path.
         # Kept tiny on purpose — the smoke is about the Task's parse +
         # emit path, not about exercising the real production matrix.
+        # Cells are sorted alphabetically by distro so sibling PRs that
+        # extend coverage (#99 ubuntu-noble already in, #100 ubuntu-jammy,
+        # #101 rocky10) drop into the obvious slot.
         cat > "${MATRIX_FILE}" <<'EOF'
         # Synthetic matrix.yaml for compute-matrix-smoke-test.
         # Real source trees ship this at the repo root; see
@@ -59,12 +62,15 @@ spec:
           - distro: centos10
             arch: x86_64
             gating: true
-          - distro: ubuntu-noble
-            arch: aarch64
-            gating: true
           - distro: fedora-rawhide
             arch: x86_64
             gating: false
+          - distro: ubuntu-jammy
+            arch: x86_64
+            gating: true
+          - distro: ubuntu-noble
+            arch: aarch64
+            gating: true
         EOF
 
         echo "[seed] staged source workspace:"

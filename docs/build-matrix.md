@@ -199,6 +199,8 @@ emits a documented default matrix and logs a warning to stderr:
   {"distro": "centos10",     "arch": "aarch64", "gating": "true"},
   {"distro": "rocky10",      "arch": "x86_64",  "gating": "true"},
   {"distro": "rocky10",      "arch": "aarch64", "gating": "true"},
+  {"distro": "ubuntu-jammy", "arch": "x86_64",  "gating": "true"},
+  {"distro": "ubuntu-jammy", "arch": "aarch64", "gating": "true"},
   {"distro": "ubuntu-noble", "arch": "x86_64",  "gating": "true"},
   {"distro": "ubuntu-noble", "arch": "aarch64", "gating": "true"}
 ]
@@ -215,9 +217,11 @@ someone hand-backports a YAML file.
 Instead, the Task picks "the modern long-term-support cell set" as a
 graceful default: centos10 + rocky10 cover the actively-supported
 RPM-family targets (Stream's rolling tip and the tagged-RHEL rebuild
-that Sepia release builds anchor to), and ubuntu-noble covers the
-actively-supported DEB target. All on both arches, all gating. That
-gets a sensible build out the door without requiring a backport.
+that Sepia release builds anchor to), and ubuntu-jammy + ubuntu-noble
+cover the actively-supported DEB targets (Ubuntu 22.04 LTS is still in
+standard support; 24.04 LTS is the current release). All on both
+arches, all gating. That gets a sensible build out the door without
+requiring a backport.
 
 When a release branch backports an explicit `matrix.yaml`, it
 overrides the default — same code path either way.

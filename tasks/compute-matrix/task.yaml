@@ -33,10 +33,10 @@
 #
 # FALLBACK SEMANTICS: if `matrix.yaml` is absent at the source ref
 # (e.g. an old release branch that pre-dates this work), the Task emits
-# a documented default matrix (centos10 + rocky10 + ubuntu-noble × x86_64
-# + aarch64, all gating=true) and logs a warning to stderr. This makes
-# the Task graceful for branches that haven't been backported. See
-# docs/build-matrix.md.
+# a documented default matrix (centos10 + rocky10 + ubuntu-jammy +
+# ubuntu-noble × x86_64 + aarch64, all gating=true) and logs a warning
+# to stderr. This makes the Task graceful for branches that haven't been
+# backported. See docs/build-matrix.md.
 #
 # CONTRACT — the JSON array shape (locked):
 #   [
@@ -61,7 +61,7 @@ spec:
     `gating-count` Results for dashboards / sanity checks.
 
     If `matrix.yaml` is absent at the source ref, emit the documented
-    default matrix (centos10 + rocky10 + ubuntu-noble × x86_64 +
+    default matrix (centos10 + rocky10 + ubuntu-jammy + ubuntu-noble × x86_64 +
     aarch64, all gating=true) and log a warning. This is the graceful
     fallback for old release branches that pre-date this work.
   params:
@@ -151,7 +151,7 @@ spec:
         # the table in docs/build-matrix.md ("Default-matrix fallback").
         #
         # We use printf to avoid heredoc quoting weirdness with yq.
-        DEFAULT_MATRIX_JSON='[{"distro":"centos10","arch":"x86_64","gating":"true"},{"distro":"centos10","arch":"aarch64","gating":"true"},{"distro":"rocky10","arch":"x86_64","gating":"true"},{"distro":"rocky10","arch":"aarch64","gating":"true"},{"distro":"ubuntu-noble","arch":"x86_64","gating":"true"},{"distro":"ubuntu-noble","arch":"aarch64","gating":"true"}]'
+        DEFAULT_MATRIX_JSON='[{"distro":"centos10","arch":"x86_64","gating":"true"},{"distro":"centos10","arch":"aarch64","gating":"true"},{"distro":"rocky10","arch":"x86_64","gating":"true"},{"distro":"rocky10","arch":"aarch64","gating":"true"},{"distro":"ubuntu-jammy","arch":"x86_64","gating":"true"},{"distro":"ubuntu-jammy","arch":"aarch64","gating":"true"},{"distro":"ubuntu-noble","arch":"x86_64","gating":"true"},{"distro":"ubuntu-noble","arch":"aarch64","gating":"true"}]'
 
         MATRIX_PATH="${SOURCE_DIR}/${MATRIX_FILE}"
 
@@ -161,7 +161,7 @@ spec:
 
         if [ ! -f "${MATRIX_PATH}" ]; then
           echo "[compute-matrix] WARNING: ${MATRIX_PATH} not present at source-ref=${SOURCE_REF:-<unset>}" >&2
-          echo "[compute-matrix] WARNING: emitting documented default matrix (centos10 + rocky10 + ubuntu-noble x amd64/arm64, gating=true)" >&2
+          echo "[compute-matrix] WARNING: emitting documented default matrix (centos10 + rocky10 + ubuntu-jammy + ubuntu-noble x amd64/arm64, gating=true)" >&2
           echo "[compute-matrix] WARNING: see docs/build-matrix.md § 'Default-matrix fallback' for rationale" >&2
           MATRIX_JSON="${DEFAULT_MATRIX_JSON}"
         else

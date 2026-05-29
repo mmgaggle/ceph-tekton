@@ -44,8 +44,8 @@
 #   consulted in FULL_BUILD mode; the synthetic path doesn't read it).
 #   Example:
 #     DISTROS="centos10 ubuntu-noble" bash hack/e2e/assert-build-builder-image.sh
-#   Default: `centos10` — preserves the pre-#98 behaviour for the
-#   default CI run. The other entries land via #99-#101.
+#   Default: `centos10 ubuntu-jammy` — kept alphabetical so #99/#101
+#   land as trivial single-line additions.
 #
 # IN-CLUSTER REGISTRY:
 # The smoke deploys a single-Pod `registry:2` Service in the same
@@ -72,8 +72,9 @@ FULL_BUILD="${E2E_BUILDER_IMAGE_FULL_BUILD:-false}"
 # DISTROS: accept either a bash array (if the caller `source`d this
 # script — unusual) or, more typically, a whitespace-separated string
 # env var. `read -r -a` normalizes both into the DISTRO_LIST array.
-# Default preserves pre-#98 behaviour (centos10 only).
-read -r -a DISTRO_LIST <<<"${DISTROS:-centos10 rocky10 ubuntu-noble}"
+# Default is the alphabetised set of distros that ship a Dockerfile
+# in `images/builders/` and have landed their per-distro smoke wiring.
+read -r -a DISTRO_LIST <<<"${DISTROS:-centos10 rocky10 ubuntu-jammy ubuntu-noble}"
 if [[ "${#DISTRO_LIST[@]}" -eq 0 ]]; then
   log::fail "DISTROS resolved to an empty list — refusing to run"
   exit 2

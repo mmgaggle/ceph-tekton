@@ -5,7 +5,7 @@
 #
 #   - A `compute-matrix-smoke-seed` Task writes a deterministic synthetic
 #     matrix.yaml into the shared `source` workspace. The matrix covers
-#     three cells with a mix of gating=true / gating=false, so the
+#     four cells with a mix of gating=true / gating=false, so the
 #     downstream assert has signal on both code paths. Hand-rolled bytes
 #     follow the same pattern as `vuln-scan-smoke-seed` — no upstream
 #     git-clone Task is needed (real pipelines wire one upstream; that's
@@ -20,8 +20,11 @@
 #       * Every entry has distro / arch / gating keys.
 #       * `cell-count` is a positive integer and equals len(matrix).
 #       * `gating-count <= cell-count`.
-#       * For the synthetic seed specifically, cell-count == 3 and
-#         gating-count == 2 (two true + one false).
+#       * For the synthetic seed specifically, cell-count == 4 and
+#         gating-count == 3 (three true + one false).
+#       * Every distro in the seed (centos10, fedora-rawhide,
+#         ubuntu-jammy, ubuntu-noble) appears at least once in the
+#         matrix Result.
 #
 # Pairs with:
 #   - pipelines/tasks/compute-matrix-smoke-seed.yaml
@@ -46,7 +49,7 @@ spec:
   description: |
     Three-Task pipeline:
       1. `seed`           — stage a deterministic synthetic matrix.yaml
-                            in the shared source workspace (3 cells, 2
+                            in the shared source workspace (4 cells, 3
                             gating, 1 non-gating).
       2. `compute-matrix` — parse it and emit the matrix /
                             cell-count / gating-count Results.
