@@ -24,11 +24,13 @@ kind: Kustomization
 #
 # Resource ordering: Tekton goes first so the tekton-pipelines
 # namespace + CRDs apply before anything that references the
-# tekton.dev API group (the build-grype-db Role names pipelineruns /
-# pipelines in its verbs list — a Role pointing at a not-yet-installed
-# CRD is permitted by the apiserver but is a confusing signal). zgw-posix
-# is dev-only and applies after Tekton settles in.
+# tekton.dev API group (the build-grype-db and build-builder-image
+# Roles name pipelineruns / pipelines in their verbs lists — a Role
+# pointing at a not-yet-installed CRD is permitted by the apiserver
+# but is a confusing signal). zgw-posix is dev-only and applies
+# after Tekton settles in.
 resources:
   - ../../base/tekton-pipelines
   - ../../base/zgw-posix
   - ../../base/build-grype-db
+  - ../../base/build-builder-image

@@ -1,0 +1,42 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# build-builder-image — RBAC for the nightly-rebuild cron submitter.
+#
+# Scope of THIS base (issue #12): the in-cluster identity the
+# `build-builder-image-matrix-nightly` CronJob
+# (pipelines/build-builder-image-matrix-nightly.yaml) runs under.
+# That CronJob's pod does one thing — `kubectl create -f -` of a
+# PipelineRun manifest in its own namespace. It does NOT need the
+# rights to mount workspaces, push to the registry, or sign
+# attestations; those rights live on the SEPARATE ServiceAccount the
+# PipelineRun itself executes under (configured in the broader Sepia
+# overlay alongside the registry pusher SA + Chains signing key).
+#
+# Same single-purpose split as `kustomize/base/build-grype-db/`. The
+# whole base is intentionally a four-file copy of that one with the
+# names + comments updated — keeping the shape identical means
+# operators reading either base see the same three objects (SA, Role,
+# RoleBinding) lined up by name in `kubectl get`.
+#
+# WHY a separate namespace (`build-builder-image`) rather than
+# colocating in `tekton-pipelines` or in the registry's namespace:
+#   - Per-job RBAC + NetworkPolicy + ResourceQuota stay scoped to the
+#     producer pipeline and don't leak into the Tekton control-plane
+#     namespace.
+#   - The nightly-cron PipelineRun spawns large buildah pods (per-
+#     distro, ~2GB workspace each). A namespace-level ResourceQuota
+#     here is the natural circuit-breaker if a runaway run is queued.
+#   - Same convention build-grype-db follows.
+#
+# WHY kustomize at the base level (rather than helm or terraform):
+# four small YAMLs with no parametrization — kustomize is the right
+# tool. Helm would add a values.yaml + template dance for zero net
+# flexibility.
+namespace: build-builder-image
+
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - role.yaml
+  - rolebinding.yaml

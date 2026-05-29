@@ -18,10 +18,10 @@ consumers, and the reproducibility caveats. The full matrix expansion
 (centos9, ubuntu-jammy, ubuntu-noble, fedora-rawhide × x86_64,
 aarch64) lands in
 [#11](https://github.com/mmgaggle/ceph-tekton/issues/11); the
-nightly + install-deps.sh-change triggers in
-[#12](https://github.com/mmgaggle/ceph-tekton/issues/12). This file
-documents what's shipped TODAY — the centos10-x86_64 starter — and
-notes where #11/#12 will extend it.
+nightly + install-deps.sh-change triggers
+([#12](https://github.com/mmgaggle/ceph-tekton/issues/12)) shipped
+alongside that matrix work — see the "Automated triggers" section
+below for the schedule + PaC details.
 
 If you want the higher-level Chains / SLSA story (signing,
 attestations, Rekor), read [`provenance.md`](provenance.md) first.
@@ -115,11 +115,22 @@ tkn pipeline start build-builder-image \
   ...
 ```
 
-When #12 ships, the install-deps.sh-change PaC trigger from
-`ceph/ceph` will set this to the PR's HEAD; the nightly CronJob will
-refresh it to current `main`. Today (issue #10), it defaults to the
-SHA baked into the Containerfile (current `ceph/ceph` main HEAD at
-file-creation time).
+Two automated drivers also set this param (issue #12):
+
+- The install-deps.sh-change PaC trigger
+  (`.tekton/builder-image-on-install-deps.yaml`) sets `ceph-sha`
+  to the triggering ceph commit (the SHA whose `install-deps.sh`
+  is under test). Per-event tag suffix:
+  `<distro>-x86_64-installdeps-<ceph-sha>` plus an
+  `<distro>-x86_64-installdeps-latest` moving pointer.
+- The nightly CronJob
+  (`pipelines/build-builder-image-matrix-nightly.yaml`) does NOT
+  override `ceph-sha`; it picks up the Containerfile-baked
+  default. The purpose of the nightly is to refresh against
+  base-image security updates, not to follow ceph's HEAD.
+
+Ad-hoc invocations default to the SHA baked into the Containerfile
+(the `ceph/ceph` main HEAD at file-creation time).
 
 ## Overriding the Containerfile path
 
@@ -127,6 +138,69 @@ The Pipeline's `dockerfile-path` param accepts any path under the
 `source` workspace. The matrix expansion (#11) threads
 `images/builders/Dockerfile.<distro>` per cell — until then, the
 default `images/builders/Dockerfile.centos10` is what runs.
+
+## Automated triggers (issue #12)
+
+Two automated drivers rebuild the (distro, x86_64) matrix without
+operator intervention:
+
+### Nightly schedule — `pipelines/build-builder-image-matrix-nightly.yaml`
+
+A `batch/v1.CronJob` (`build-builder-image-matrix-nightly`) fires
+**daily at 02:47 UTC**. Its pod runs `kubectl create -f -` on a
+PipelineRun manifest that wraps the existing `build-builder-image`
+Task with a minimal inline `git-clone` step and the same
+`matrix.include` fan-out as
+`pipelines/build-builder-image-matrix.yaml`. Same shape as the
+build-grype-db cron (#61) — the rationale for "k8s CronJob, not
+PaC `on-cron`" is documented in both files' headline comments.
+
+PipelineRuns carry the label
+`ceph-tekton.mmgaggle.io/trigger: nightly` so the in-cluster registry
+tag pruner (follow-up; see the headline comment on the cron YAML)
+can apply the "keep last 14 nightlies per (distro, arch)" half of
+issue #12's retention AC.
+
+RBAC for the cron submitter lives in
+`kustomize/base/build-builder-image/` (namespace, SA, Role,
+RoleBinding) — same single-purpose "create PipelineRuns, read
+PipelineRuns, read Pipelines" shape as the build-grype-db cron
+submitter.
+
+### install-deps.sh change — `.tekton/builder-image-on-install-deps.yaml`
+
+A Pipelines-as-Code template that PaC matches against PRs and
+pushes whose changed-files list includes `install-deps.sh`. The CEL
+filter walks `files.added`, `files.modified`, and `files.renamed`
+(not `files.removed` — a removed script means there's no current
+content to bake). The matched PipelineRun rebuilds the matrix with
+`CEPH_SHA={{ revision }}` so the resulting tag suffix
+(`<distro>-x86_64-installdeps-<ceph-sha>`) names exactly which ceph
+commit's install-deps drove the build.
+
+PaC matches the canonical template against THIS repo's `.tekton/`
+natively; for the template to fire on ceph/ceph (or mmgaggle/ceph)
+events, the event repo needs a small remote-resolution STUB that
+points at this file (see `docs/pipelines-as-code.md` § "Option B —
+remote-resolve from this repo" for the stub recipe). Landing that
+stub on mmgaggle/ceph is a HITL follow-up — not part of #12's
+scope.
+
+PipelineRuns carry the label
+`ceph-tekton.mmgaggle.io/trigger: install-deps` so the registry tag
+pruner can apply the "keep last 5 install-deps-driven builds per
+(distro, arch)" half of issue #12's retention AC independently
+from the nightly half.
+
+### Out of scope for #12
+
+- **Registry tag pruner.** The issue body offers two paths ("CronJob
+  that prunes old tags, OR registry-native policy"). Both labels
+  above let either path key off the trigger. The pruner itself is a
+  follow-up CronJob.
+- **Slack/email failure notification.** Channel TBD per the issue
+  body. Wires in as a single `finally:` Task once the team picks a
+  transport + channel.
 
 ## Reproducibility caveats
 

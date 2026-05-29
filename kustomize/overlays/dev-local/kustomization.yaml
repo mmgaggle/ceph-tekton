@@ -11,10 +11,11 @@ kind: Kustomization
 # Tekton's webhook reconciler taxes the kind cluster cold-start
 # noticeably and we'd rather not have zgw-posix's PVC + Pod schedule
 # fighting for kubelet attention during that window. build-grype-db
-# RBAC references the tekton.dev API group (Role grants verbs on
-# pipelineruns/pipelines), so its base must apply AFTER tekton-pipelines
-# has registered those CRDs.
+# and build-builder-image RBAC each reference the tekton.dev API
+# group (Role grants verbs on pipelineruns/pipelines), so their
+# bases must apply AFTER tekton-pipelines has registered those CRDs.
 resources:
   - ../../base/tekton-pipelines
   - ../../base/zgw-posix
   - ../../base/build-grype-db
+  - ../../base/build-builder-image

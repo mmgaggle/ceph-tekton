@@ -1,0 +1,288 @@
+# Pipelines-as-Code PipelineRun template — rebuild the matrix of
+# ceph-builder images whenever upstream ceph/ceph's
+# `install-deps.sh` changes.
+#
+# Per issue #12, second trigger half: "On `install-deps.sh` change —
+# PaC trigger from ceph/ceph that rebuilds when the dep script
+# changes."
+#
+# WHY PaC HERE (vs another CronJob): this trigger IS event-driven
+# from a git push — the rebuild has to fire when (and only when)
+# the specific file `install-deps.sh` changes. PaC is the right
+# tool: it matches inbound GitHub webhooks against per-template
+# annotations and instantiates a PipelineRun only when the event
+# matches. The nightly schedule half of issue #12 uses a CronJob
+# (see `pipelines/build-builder-image-matrix-nightly.yaml`) because
+# that trigger is time-based and does not originate from a git push.
+#
+# WHERE THIS FILE LIVES — `.tekton/` at the ceph-tekton repo root —
+# AND HOW PaC PICKS IT UP:
+#
+#   PaC discovers `.tekton/*.yaml` natively for the repo PaC is
+#   matching the event against. The intent is for THIS template to
+#   match ceph/ceph (or the mmgaggle/ceph integration fork) events,
+#   not ceph-tekton events. The phase-1 model documented in
+#   docs/pipelines-as-code.md is "PaC files live in
+#   ceph-tekton/pipelines/, remote-resolved by PaC. Lets us iterate
+#   without ceph/ceph review cycles."
+#
+#   Concretely: a tiny STUB file
+#       https://github.com/mmgaggle/ceph/.tekton/builder-image-on-install-deps.yaml
+#   carries only the annotations + a
+#       pipelinesascode.tekton.dev/pipeline:
+#         "https://raw.githubusercontent.com/mmgaggle/ceph-tekton/main/.tekton/builder-image-on-install-deps.yaml"
+#   remote-resolution pointer at THIS file. PaC matches the
+#   annotations on the stub, fetches the spec from the URL, and runs
+#   it in the `ceph-builds-ci` namespace (per the `Repository` CR in
+#   `kustomize/base/pac-repositories/ceph-mmgaggle.yaml`). Landing
+#   the stub on mmgaggle/ceph is a HITL one-PR follow-up — same
+#   shape as the noop stub described in docs/pipelines-as-code.md
+#   "Option B — remote-resolve from this repo".
+#
+#   This template ALSO sits in this repo's own .tekton/ where PaC
+#   matches it on ceph-tekton PRs. The CEL filter below restricts
+#   firing to changes that include a literal `install-deps.sh` —
+#   ceph-tekton does not ship an `install-deps.sh`, so the filter
+#   excludes every real ceph-tekton PR. (If a ceph-tekton PR ever
+#   adds a file named install-deps.sh, it will spuriously rebuild
+#   the builder images. That is acceptable noise — the fix is to
+#   tighten the CEL when it happens.)
+#
+# WHY `on-cel-expression` INSTEAD OF `on-path-change`:
+#   PaC ships two ways to filter by changed file. `on-path-change`
+#   is a thinner shorthand added in newer PaC releases that takes a
+#   glob list. `on-cel-expression` is the underlying primitive PaC
+#   has had since v0.16 and is the one this repo's pinned PaC
+#   v0.27.0 (see kustomize/base/pipelines-as-code/kustomization.yaml)
+#   definitely supports. The CEL form also keeps the matching
+#   semantics legible — anyone reading the annotation sees exactly
+#   which lists (`files.added`, `files.modified`, `files.renamed`)
+#   the match walks.
+#
+# WHY THE MATCH CHECKS ALL THREE OF added/modified/renamed (NOT
+# `removed`):
+#   A `removed` install-deps.sh in a PR means the script is going
+#   away — there is no current content to bake into a builder
+#   image, so rebuilding against the removed-script PR is
+#   nonsensical. Add / modify / rename are the three transitions
+#   that change WHAT install-deps.sh contains at HEAD; those are
+#   the ones the rebuild should fire on. The `endsWith` form (vs
+#   exact equality) catches the file at whatever path the upstream
+#   repo carries it ("install-deps.sh" at root in current ceph/ceph;
+#   could move to a `scripts/` subdirectory in a future
+#   reorganisation without breaking this trigger).
+#
+# RETENTION LABEL — see the headline comment on
+# `pipelines/build-builder-image-matrix-nightly.yaml` for the
+# follow-up tag-pruner Job that filters PipelineRuns by these
+# labels. This template stamps
+#   ceph-tekton.mmgaggle.io/trigger: install-deps
+# so the pruner can apply the "keep last 5 install-deps-driven
+# builds per (distro, arch)" half of issue #12's retention AC
+# independently from the "keep last 14 nightlies" half (which the
+# nightly CronJob stamps with `trigger: nightly`).
+#
+# YAML shape: no leading `---` directives-end marker. Same as
+# `.tekton/noop-pull-request.yaml` — PaC's multi-doc reader logs
+# "Object 'Kind' is missing" on the empty leading doc otherwise.
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: builder-image-on-install-deps-
+  labels:
+    app.kubernetes.io/name: build-builder-image
+    app.kubernetes.io/component: pac-triggered-run
+    app.kubernetes.io/part-of: ceph-tekton
+    ceph-tekton.mmgaggle.io/trigger: install-deps
+  annotations:
+    # `pull_request` AND `push` — we want the rebuild when the
+    # change merges to a branch AND we want a preview run on the
+    # PR that proposes the change (so the PR can see whether
+    # builder images even build against the new script before
+    # the merge button is pressed).
+    pipelinesascode.tekton.dev/on-event: "[pull_request, push]"
+    # All target branches. In the upstream ceph/ceph mirror,
+    # install-deps.sh changes most commonly land on `main` and
+    # `release-*` branches; the `**` glob covers both without
+    # this template having to enumerate the release-branch list
+    # every time a new ceph release branch opens.
+    pipelinesascode.tekton.dev/on-target-branch: "[**]"
+    # The actual file-path gate. PaC binds the GitHub-API
+    # changed-files lists into the CEL evaluator as
+    # `files.added`, `files.modified`, `files.removed`,
+    # `files.renamed`, `files.all`. We match on add / modify /
+    # rename (see the comment block above for why not removed).
+    #
+    # `.exists(p, p.endsWith("install-deps.sh"))` returns true
+    # iff ANY entry in the named list ends with "install-deps.sh".
+    # The endsWith form catches both the current path
+    # ("install-deps.sh" at repo root) and a future move to a
+    # `scripts/` subdirectory.
+    pipelinesascode.tekton.dev/on-cel-expression: |
+      files.added.exists(p, p.endsWith("install-deps.sh"))
+      || files.modified.exists(p, p.endsWith("install-deps.sh"))
+      || files.renamed.exists(p, p.endsWith("install-deps.sh"))
+    # PaC garbage-collects completed PipelineRuns above this count
+    # per (repo, template). 5 covers issue #12's retention AC for
+    # the install-deps trigger ("keep last 5 install-deps-driven
+    # builds per (distro, arch)") at the PipelineRun-object level.
+    # The accompanying registry tag pruner (see the headline
+    # comment on build-builder-image-matrix-nightly.yaml) is what
+    # enforces the same retention at the registry-tag level.
+    pipelinesascode.tekton.dev/max-keep-runs: "5"
+spec:
+  # PaC substitutes these dynamic variables from the GitHub event
+  # payload at PipelineRun-instantiation time. See
+  # https://pipelinesascode.com/docs/guide/authoringprs/#dynamic-variables
+  params:
+    - name: repo_url
+      value: "{{ repo_url }}"
+    - name: revision
+      value: "{{ revision }}"
+    # Threaded through to the builder image as CEPH_SHA so the
+    # baked install-deps output corresponds to the exact ceph
+    # commit that triggered the rebuild. Operators reading the
+    # OCI labels on a triggered image see this SHA.
+    - name: ceph-sha
+      value: "{{ revision }}"
+    # Fixed output-image base. The PaC stub on the event repo
+    # (ceph/ceph or mmgaggle/ceph) cannot mint a unique destination
+    # registry per event — Tekton variable substitution has no
+    # string-manipulation operators (`$(params.x | replace)` is not
+    # a thing). The per-event uniqueness lives in the TAG, which IS
+    # parameter-substitutable, not in the registry base.
+    - name: output-image-base
+      value: image-registry.openshift-image-registry.svc:5000/ceph-tekton/ceph-builder
+  pipelineSpec:
+    # Same shape as
+    # `pipelines/build-builder-image-matrix-nightly.yaml`'s inline
+    # pipelineSpec: clone the source the cron / event names, then
+    # fan out the build-builder-image Task across the 4 distros.
+    # Kept in sync with that file by code review; the `include:`
+    # list and per-cell params here must match the cron's.
+    #
+    # WHY inline pipelineSpec rather than `pipelineRef:
+    # build-builder-image-matrix`: the matrix Pipeline expects its
+    # source workspace pre-populated. PaC's git-clone resolver
+    # populates the workspace for the EVENT repo (ceph/ceph in this
+    # case) — but the Containerfiles for `build-builder-image` live
+    # in CEPH-TEKTON, not ceph/ceph. We need TWO sources: ceph for
+    # the install-deps.sh, ceph-tekton for the Containerfile. The
+    # inline pipelineSpec lets us clone ceph-tekton directly into
+    # the `source` workspace (overriding PaC's default ceph-source
+    # clone) and thread {{ revision }} (the ceph commit) as the
+    # `ceph-sha` build arg the Containerfiles' install-deps step
+    # reads.
+    params:
+      - name: repo_url
+        type: string
+      - name: revision
+        type: string
+      - name: ceph-sha
+        type: string
+      - name: output-image-base
+        type: string
+    workspaces:
+      - name: source
+      - name: registry-credentials
+        optional: true
+    tasks:
+      # ----------------------------------------------------------
+      # clone-ceph-tekton — fetch THIS repo (the recipe) into the
+      # `source` workspace so build-builder-image can read the
+      # Containerfiles + build-package.sh out of `images/builders/`.
+      # The triggering ceph commit is threaded into the build via
+      # the ceph-sha param, NOT by cloning ceph/ceph into the
+      # workspace — the Containerfile's install-deps step pulls
+      # the script at CEPH_SHA via curl, not via a workspace
+      # checkout.
+      # ----------------------------------------------------------
+      - name: clone-ceph-tekton
+        workspaces:
+          - name: output
+            workspace: source
+        taskSpec:
+          workspaces:
+            - name: output
+              description: ceph-tekton repo lands here.
+          steps:
+            - name: clone
+              image: docker.io/alpine/git:2.45.2
+              workingDir: $(workspaces.output.path)
+              script: |
+                #!/bin/sh
+                set -eu
+                git clone --depth 1 \
+                  --branch main \
+                  https://github.com/mmgaggle/ceph-tekton.git \
+                  .
+                echo "cloned ceph-tekton @ $(git rev-parse HEAD)"
+      # ----------------------------------------------------------
+      # build-x86_64 — same matrix.include shape as the nightly
+      # CronJob's pipelineSpec. The per-cell ceph-sha is the
+      # triggering commit (i.e. the install-deps.sh content under
+      # test), threaded into BUILDER_IMAGE_VERSION + CEPH_SHA so
+      # the resulting image's OCI labels record exactly which ceph
+      # commit's install-deps the image baked.
+      # ----------------------------------------------------------
+      - name: build-x86_64
+        runAfter: [clone-ceph-tekton]
+        taskRef:
+          name: build-builder-image
+        matrix:
+          include:
+            - name: centos9
+              params:
+                - name: distro
+                  value: centos9
+            - name: centos10
+              params:
+                - name: distro
+                  value: centos10
+            - name: ubuntu-jammy
+              params:
+                - name: distro
+                  value: ubuntu-jammy
+            - name: ubuntu-noble
+              params:
+                - name: distro
+                  value: ubuntu-noble
+        params:
+          - name: dockerfile-path
+            value: images/builders/Dockerfile.$(matrix.distro)
+          - name: build-context
+            value: images/builders
+          - name: output-image
+            # Distinct tag suffix from the nightly so an operator
+            # reading `kubectl get pipelinerun` AND the registry
+            # tag list can tell at a glance which trigger built
+            # which tag. The `installdeps-<sha>` suffix names the
+            # CEPH SHA whose install-deps content drove the build.
+            value: $(params.output-image-base):$(matrix.distro)-x86_64-installdeps-$(params.ceph-sha)
+          - name: extra-tags
+            value:
+              - $(params.output-image-base):$(matrix.distro)-x86_64-installdeps-latest
+          - name: build-args
+            value:
+              - "CEPH_SHA=$(params.ceph-sha)"
+              - "BUILDER_IMAGE_VERSION=0.1.0-$(matrix.distro)-installdeps-$(params.ceph-sha)"
+              - "INSTALL_DEPS_FOR_MAKE_CHECK=true"
+        workspaces:
+          - name: source
+            workspace: source
+          - name: registry-credentials
+            workspace: registry-credentials
+  workspaces:
+    - name: source
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 2Gi
+    - name: registry-credentials
+      # PaC PipelineRuns running in `ceph-builds-ci` push to the
+      # in-cluster registry via the namespace's image-pusher SA
+      # token, not a docker-auth Secret — leave this an emptyDir
+      # so build-builder-image's optional-workspace branch fires.
+      emptyDir: {}

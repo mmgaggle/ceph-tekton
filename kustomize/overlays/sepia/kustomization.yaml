@@ -21,17 +21,23 @@ kind: Kustomization
 #     EXECUTOR SA (cosign-signing-key + S3 STS via projected SA token)
 #     is a separate Sepia-only object that lives in its own follow-up;
 #     see kustomize/base/build-grype-db/serviceaccount.yaml's comment.
+#   - build-builder-image RBAC follows the same convention as
+#     build-grype-db: cron-submitter SA + Role + RoleBinding for the
+#     nightly CronJob (issue #12). The PipelineRun executor SA
+#     (in-cluster registry pusher token + Chains signing key) is a
+#     separate Sepia-only follow-up.
 #   - chains-config overrides (fulcio/keyless, OCI artifact storage,
 #     OIDC issuer URL) ALSO land here in a follow-up — same overlay,
 #     separate PR — per kustomize/base/tekton-chains/chains-config.patch.yaml.
 #
 # Resource ordering: Tekton first so its CRDs land before the
-# build-grype-db Role names them. The TektonConfig CR
-# (tektonconfig-pruner.yaml, issue #60 + #63) is reconciled by the
-# OpenShift Pipelines operator — it's only meaningful on Sepia
-# (the operator is not installed in the dev-{local,kind}
-# overlays, which run raw Tekton Pipelines from release.yaml), so
-# it lives in this overlay rather than the shared base.
+# build-grype-db and build-builder-image Roles name them. The
+# TektonConfig CR (tektonconfig-pruner.yaml, issue #60 + #63) is
+# reconciled by the OpenShift Pipelines operator — it's only
+# meaningful on Sepia (the operator is not installed in the
+# dev-{local,kind} overlays, which run raw Tekton Pipelines from
+# release.yaml), so it lives in this overlay rather than the
+# shared base.
 #
 # cloudevents-sink (issue #63) MUST be in the resource list BEFORE
 # tektonconfig-pruner.yaml. The TektonConfig flips
@@ -45,6 +51,7 @@ kind: Kustomization
 # time the operator reconciles the feature-flags ConfigMap.
 resources:
   - ../../base/tekton-pipelines
+  - ../../base/build-builder-image
   - ../../base/build-grype-db
   - ../../base/cloudevents-sink
   - tektonconfig-pruner.yaml
