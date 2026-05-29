@@ -417,7 +417,7 @@ EOF
 
 ## Smoke-test with the noop pipeline
 
-`pipelines/noop-pull-request.yaml` in this repo is the PipelineRun
+`.tekton/noop-pull-request.yaml` in this repo is the PipelineRun
 template PaC will instantiate on every `pull_request` event against
 your test fork. It runs a single Task that echoes the event payload —
 just enough to prove the round trip works.
@@ -432,7 +432,7 @@ commit the file there:
 ```sh
 # in your test fork's checkout
 mkdir -p .tekton
-cp /path/to/ceph-tekton/pipelines/noop-pull-request.yaml .tekton/
+cp /path/to/ceph-tekton/.tekton/noop-pull-request.yaml .tekton/
 git add .tekton/noop-pull-request.yaml
 git commit -m "ci: add noop PaC pipeline"
 git push
@@ -453,15 +453,16 @@ metadata:
   annotations:
     pipelinesascode.tekton.dev/on-event: "[pull_request]"
     pipelinesascode.tekton.dev/on-target-branch: "[**]"
-    pipelinesascode.tekton.dev/pipeline: "https://raw.githubusercontent.com/mmgaggle/ceph-tekton/main/pipelines/noop-pull-request.yaml"
+    pipelinesascode.tekton.dev/pipeline: "https://raw.githubusercontent.com/mmgaggle/ceph-tekton/main/.tekton/noop-pull-request.yaml"
 spec:
   pipelineRef:
     name: noop-pull-request
 ```
 
 Option B matches the phase-1 PLAN.md decision ("PaC files live in
-`ceph-tekton/pipelines/`, remote-resolved by PaC. Lets us iterate
-without ceph/ceph review cycles").
+`ceph-tekton/`, remote-resolved by PaC. Lets us iterate without
+ceph/ceph review cycles") — the canonical location is the repo-root
+`.tekton/` directory PaC natively discovers.
 
 ### Trigger it
 

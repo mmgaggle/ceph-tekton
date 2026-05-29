@@ -220,8 +220,9 @@ Three-bullet summary:
   real `ceph/ceph` app, which is tracked in issue #9) — the doc covers
   how to create one in 5 minutes and wire its secrets into PaC.
 - Smoke test: push a branch to your fork with
-  `pipelines/noop-pull-request.yaml` referenced from `.tekton/`, open a
-  PR, watch the PaC controller spawn a `noop-pull-request` PipelineRun.
+  `.tekton/noop-pull-request.yaml` (copied or remote-resolved from this
+  repo's `.tekton/`), open a PR, watch the PaC controller spawn a
+  `noop-pull-request` PipelineRun.
 
 Debug: `kubectl -n pipelines-as-code logs deploy/pipelines-as-code-controller`
 plus the smee.io request log in your browser.
@@ -429,7 +430,7 @@ For the full PaC-driven loop (a personal fork of `ceph/ceph` whose
 | Pipeline | What it exercises | Doc |
 |---|---|---|
 | `pipelines/pipelines/hello-world.yaml` | Tekton Pipelines baseline | this doc |
-| `pipelines/noop-pull-request.yaml` | Pipelines-as-Code resolution + run | [`pipelines-as-code.md`](pipelines-as-code.md) |
+| `.tekton/noop-pull-request.yaml` | Pipelines-as-Code resolution + run | [`pipelines-as-code.md`](pipelines-as-code.md) |
 | `pipelines/pipelines/chains-smoke-test.yaml` | Chains signing + Rekor + SBOM byproduct | [`provenance.md`](provenance.md) |
 | `pipelines/pipelines/vault-smoke-test.yaml` | Vault transit signing via k8s auth | [`vault.md`](vault.md) |
 | `pipelines/pipelines/kyverno-smoke-test.yaml` | Signed-image admit, unsigned-image reject | [`deploy-verification.md`](deploy-verification.md) |

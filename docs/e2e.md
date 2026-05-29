@@ -13,7 +13,9 @@ the harness is under [`hack/e2e/`](../hack/e2e/).
 Per push to `main` or per PR (open / synchronize / reopened):
 
 1. Bring up a single-node kind cluster from `hack/e2e/kind-config.yaml`.
-2. `kubectl apply -k kustomize/overlays/dev-local/` — Tekton Pipelines.
+2. `kubectl apply -k kustomize/overlays/dev-local/` — Tekton Pipelines
+   + the zgw-posix in-cluster S3 endpoint (the dev-local overlay
+   includes both).
 3. `hack/dev-chains-setup.sh` — Tekton Chains + cosign keypair into
    `tekton-chains/signing-secrets`.
 4. `hack/dev-vault-up.sh` — Vault helm install + transit engine +
@@ -21,6 +23,11 @@ Per push to `main` or per PR (open / synchronize / reopened):
 5. `hack/dev-kyverno-up.sh` — Kyverno helm install + the
    `verify-ceph-image-signatures-dev` ClusterPolicy.
 6. `bash hack/e2e/run-all.sh` — every assertion, in order, fail-fast.
+   The current ordered list (see `ASSERTIONS=(…)` in `run-all.sh`):
+   `hello-world`, `chains-smoke`, `vault-smoke`, `kyverno-smoke`,
+   `reproducibility-smoke`, `generate-sbom-smoke`,
+   `compute-matrix-smoke`, `zgw-posix-up`, `vuln-scan-smoke`,
+   `build-builder-image`.
 
 A green run takes **15–20 minutes** on `ubuntu-latest`. The biggest
 single cost is the helm wait on Vault's pod (~2 min cold) and the
@@ -44,6 +51,7 @@ the harness locally with the new version first.
 | cosign       | `v2.4.1`   | 2.x is required for the verification flags we use.        |
 | rekor-cli    | `v1.3.6`   | Matches the current public-good Rekor service line.       |
 | syft         | `v1.18.0`  | Matches the syft image the smoke pipelines pin.           |
+| grype        | `v0.112.0` | Matches the grype image `tasks/vuln-scan` pins; host-side grype seeds the vuln-scan smoke DB. |
 | Tekton Pipelines | `v1.6.0` | Pinned in `kustomize/base/tekton-pipelines/kustomization.yaml`. |
 | Tekton Chains    | `v0.26.0` | Pinned in `kustomize/base/tekton-chains/kustomization.yaml`.    |
 | Vault chart      | `0.28.1`  | Pinned in `hack/dev-vault-up.sh`.                         |
@@ -217,6 +225,38 @@ for `Pending` events on the PVC); syft format-detection broke (the
 SBOM bytes won't round-trip — capture the file and run `syft scan`
 manually).
 
+### `assert-compute-matrix-smoke.sh`
+
+- `pipelines/pipelines/compute-matrix-smoke-test.yaml` PipelineRun
+  reaches Succeeded — the in-cluster `assert-results` Task does the
+  real shape-checking; if it fails, the PipelineRun fails.
+- Defensive host-side double-check: re-pull the `matrix` /
+  `cell-count` / `gating-count` Results off the `compute-matrix`
+  TaskRun via `kubectl` and re-validate the JSON shape with `jq`.
+
+Likely causes of failure: the seed Task wrote a `matrix.yaml` shape
+`compute-matrix` doesn't parse; a Results value got truncated between
+TaskRun completion and the consumer Task (rare — `jq` re-validation
+exists to catch this).
+
+### `assert-zgw-posix-up.sh`
+
+- The `zgw-posix` Deployment in the `zgw-posix` namespace reports
+  `Available=True`.
+- Port-forwarded `aws s3api list-buckets` returns cleanly (auth +
+  HTTP round trip succeeds; an empty bucket array is fine).
+- Full create-bucket → PUT object → GET (byte-identical) →
+  delete-object → delete-bucket sequence succeeds.
+
+Wired ahead of `assert-vuln-scan-smoke` so a regression in the
+zgw-posix base fails fast, before the multi-minute grype-DB stages
+of vuln-scan have anywhere to land.
+
+Likely causes of failure: `make dev-up` didn't apply the dev-local
+overlay (no `zgw-posix` namespace); the zgw-posix Pod is crash-looping
+on a backend driver bug (check `kubectl -n zgw-posix logs`); port
+8000 port-forward race on a busy laptop.
+
 ### `assert-vuln-scan-smoke.sh`
 
 - `pipelines/pipelines/vuln-scan-smoke-test.yaml` PipelineRun reaches Succeeded.
@@ -254,6 +294,33 @@ Likely causes of failure: the test-db Pod's `kubectl cp` timing out
 signature shape changed (re-pin `cosign verify-blob` step image);
 grype DB schema bumped (`SCHEMA=7 ./assert-vuln-scan-smoke.sh` to
 test the schema-version-scoped path).
+
+### `assert-build-builder-image.sh`
+
+Runs `pipelines/build-builder-image-matrix.yaml` (sourced from
+`images/builders/pipeline.yaml`) end-to-end against a tiny
+synthetic Containerfile and asserts:
+
+- The PipelineRun reaches Succeeded.
+- `IMAGE_URL` Result equals the output-image we passed in.
+- `IMAGE_DIGEST` Result is a `sha256:<64-hex>` digest.
+- `IMAGES` Result has shape `<url>@sha256:<hex>` (single line).
+- `ARTIFACT_OUTPUTS` is a JSON object with `uri` / `digest` /
+  `isBuildArtifact: "true"` — the Chains promote-to-subject form the
+  Task documents.
+- The pushed image is fetchable from the smoke's in-cluster
+  `registry:2` Service.
+
+The synthetic Containerfile (`FROM busybox` + `COPY`) exercises every
+code path of the Task without paying the real `install-deps.sh` cost.
+To run against the real `images/builders/Dockerfile.centos10` (e.g.
+before tagging a release), set `E2E_BUILDER_IMAGE_FULL_BUILD=true` —
+it swaps the Containerfile and bumps the PipelineRun timeout to 30 min.
+
+Likely causes of failure: in-cluster `registry:2` Pod not Ready;
+buildah-rootless permission regression on the kind node; Chains
+grammar Results misshapen (the Task emits them — failures here
+usually mean a Task change broke the documented shape).
 
 ## Failure artefact bundle
 

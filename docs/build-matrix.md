@@ -184,7 +184,7 @@ PipelineRun completes when every cell completes (or, for non-gating
 cells, completes regardless of outcome).
 
 Requires Tekton Pipelines ≥ v0.50 for Result-driven matrix fan-out.
-ceph-tekton ships v1.6.0 (see `charts/tekton-pipelines/`).
+ceph-tekton ships v1.6.0 (see `kustomize/base/tekton-pipelines/`).
 
 ---
 
