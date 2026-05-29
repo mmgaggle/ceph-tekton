@@ -1,0 +1,69 @@
+# Role granting the `build-builder-image-cron` SA the rights it
+# needs to submit a PipelineRun and nothing else.
+#
+# Verb inventory (deliberately minimal — same shape as
+# `kustomize/base/build-grype-db/role.yaml`):
+#
+#   tekton.dev/pipelineruns:
+#     create  — the actual submit
+#     get     — let the operator `kubectl describe pipelinerun ...`
+#               under this SA when debugging the cron pod, and let
+#               any future `kubectl wait` / `kubectl create --output`
+#               path read the just-created object's status
+#     list    — list pipelineruns in the namespace (debugging, and
+#               lets `tkn pipelinerun list -n build-builder-image`
+#               work under this identity for triage)
+#     watch   — same triage path as list; cheap to include since
+#               it's namespaced and read-only
+#
+#   tekton.dev/pipelines:
+#     get     — the PipelineRun the cron submits carries a
+#               pipelineSpec inline rather than a `pipelineRef`, so
+#               the submitter does not strictly need this verb
+#               today. We grant it anyway to match
+#               build-grype-db-cron's posture: a future refactor
+#               that promotes the inline pipelineSpec to a standing
+#               Pipeline (e.g. `build-builder-image-matrix-scheduled`)
+#               and switches the CronJob to `pipelineRef:` avoids a
+#               RBAC tweak then. Read-only, same namespace, harmless.
+#
+# What we do NOT grant + why:
+#
+#   secrets:*       — the SUBMITTER doesn't touch secrets. The
+#                     PipelineRun's own SA mounts the registry-push
+#                     credentials + Chains signing key via Tekton's
+#                     workspace machinery; the cron pod doesn't see
+#                     them.
+#   pvc:create      — workspace PVCs are created by Tekton's
+#                     reconciler under its own SA when it expands
+#                     `volumeClaimTemplate`. The submitter never
+#                     directly creates a PVC.
+#   pipelineruns:delete/patch  — the submitter is fire-and-forget;
+#                     it does not need to mutate already-created
+#                     PipelineRuns. Garbage collection of old
+#                     PipelineRuns is handled by Tekton's own
+#                     pruner config (issue #60), not by this SA.
+#                     Tag-pruning on the in-cluster registry is the
+#                     separate follow-up CronJob noted in
+#                     `pipelines/build-builder-image-matrix-nightly.yaml`.
+#
+# Scope: this is a `Role`, not a `ClusterRole`. The CronJob, the
+# cron pod, and the PipelineRun it spawns all live in the
+# `build-builder-image` namespace, so namespaced RBAC is the right
+# shape.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: build-builder-image-cron
+  namespace: build-builder-image
+  labels:
+    app.kubernetes.io/name: build-builder-image
+    app.kubernetes.io/component: cron-submitter
+    app.kubernetes.io/part-of: ceph-tekton
+rules:
+  - apiGroups: ["tekton.dev"]
+    resources: ["pipelineruns"]
+    verbs: ["create", "get", "list", "watch"]
+  - apiGroups: ["tekton.dev"]
+    resources: ["pipelines"]
+    verbs: ["get"]

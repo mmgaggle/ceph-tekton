@@ -1,0 +1,22 @@
+# Namespace for the build-builder-image-matrix-nightly producer
+# Pipeline + its cron submitter. The Pipeline reference
+# (`build-builder-image-matrix`), the CronJob
+# (`build-builder-image-matrix-nightly`), and the PipelineRuns the
+# cron spawns all land here. Keeping them in their own namespace
+# makes RBAC, NetworkPolicy, and ResourceQuota straightforward to
+# scope without pulling in unrelated Tekton control-plane objects.
+#
+# Labels:
+#   app.kubernetes.io/name=build-builder-image   — what's in here
+#   app.kubernetes.io/part-of=ceph-tekton        — which stack it belongs to
+#
+# The kyverno ClusterPolicies + the observability stack both select
+# namespaces by `app.kubernetes.io/part-of=ceph-tekton`, so this
+# label is what enrolls the namespace in those cluster-wide flows.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: build-builder-image
+  labels:
+    app.kubernetes.io/name: build-builder-image
+    app.kubernetes.io/part-of: ceph-tekton

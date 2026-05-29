@@ -1,0 +1,23 @@
+# Binds the `build-builder-image-cron` Role to the
+# `build-builder-image-cron` ServiceAccount in the
+# `build-builder-image` namespace. Same name on both sides is
+# intentional — RoleBinding is the only thing tying them together,
+# so when an operator greps for `build-builder-image-cron` the three
+# objects (SA, Role, RoleBinding) line up by name in the output.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: build-builder-image-cron
+  namespace: build-builder-image
+  labels:
+    app.kubernetes.io/name: build-builder-image
+    app.kubernetes.io/component: cron-submitter
+    app.kubernetes.io/part-of: ceph-tekton
+subjects:
+  - kind: ServiceAccount
+    name: build-builder-image-cron
+    namespace: build-builder-image
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: build-builder-image-cron

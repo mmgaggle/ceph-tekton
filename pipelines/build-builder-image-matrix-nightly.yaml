@@ -1,0 +1,292 @@
+# build-builder-image-matrix-nightly — CronJob driver for the daily
+# rebuild of every (distro, x86_64) ceph-builder image.
+#
+# Per issue #12 ("Builder-image nightly schedule + install-deps.sh
+# trigger"). Companion to `pipelines/build-builder-image-matrix.yaml`,
+# which is the Pipeline this CronJob submits PipelineRuns against.
+#
+# WHY A SCHEDULED REBUILD (issue body summary):
+# Builder images pin base OS packages at bake time. Base images
+# (registry.access.redhat.com/ubi9, docker.io/library/ubuntu:noble,
+# etc.) ship security-fix layers between our rebuilds; a daily
+# rebuild picks up those layers so make-check and package-build
+# pods inherit fresh CVE patches without waiting on a code change
+# to ceph/ceph or ceph-tekton.
+#
+# WHY THIS SHAPE — vanilla `batch/v1.CronJob` shelling out to
+# `kubectl create -f - <PipelineRun>`:
+#
+#   The verbatim same rationale as
+#   pipelines/build-grype-db.yaml's CronJob (issue #61). Repeating
+#   the headline so a reader of THIS file sees it:
+#
+#     - Pipelines-as-Code's `on-cron` annotation is fragile for
+#       unattended jobs that don't originate from a git push —
+#       events get suppressed if the watched repo has no recent
+#       activity (PaC issues #1547, #1612).
+#     - A k8s CronJob is a single-purpose primitive every k8s
+#       operator understands, has crystal-clear success/failure
+#       semantics, and does NOT depend on the PaC controller being
+#       healthy.
+#     - We lose PaC's inline GitHub Check reporting, but a scheduled
+#       rebuild is not gated on a PR — there is no PR to post to.
+#
+#   The OTHER trigger in issue #12 — rebuild when ceph/ceph's
+#   `install-deps.sh` changes — IS event-driven from a git push, so
+#   that one DOES use PaC (see `.tekton/builder-image-on-install-deps.yaml`
+#   in the same change). PaC for the event-driven trigger, CronJob
+#   for the scheduled one — different tools for different jobs.
+#
+# WHY `pipelineSpec:` INLINE INSTEAD OF `pipelineRef: build-builder-image-matrix`:
+#
+#   The matrix Pipeline (`pipelines/build-builder-image-matrix.yaml`)
+#   expects its `source` workspace pre-populated with the ceph-tekton
+#   repo's `images/builders/` tree — `tasks/build-builder-image/task.yaml`
+#   reads the Containerfile out of that workspace. The smoke-test
+#   driver stages source via a busybox PVC stager; CI typically wires
+#   a `git-clone` Task in front. For an UNATTENDED CronJob, neither
+#   precondition is set up for us.
+#
+#   The simplest portable answer: the PipelineRun this CronJob
+#   submits embeds a `pipelineSpec:` that prefixes a minimal inline
+#   `git-clone` Task in front of the existing
+#   `build-builder-image` Task (with the same `matrix.include`
+#   fan-out as `build-builder-image-matrix`). That keeps every
+#   moving part visible in this one file and avoids any dependency
+#   on the Tekton Hub catalog `git-clone` Task being pre-installed
+#   in the cluster. The matrix Pipeline itself stays unchanged so
+#   the e2e smoke and any future Sepia consumer that supplies its
+#   own source-stage continue to work without surprise.
+#
+# RETENTION + SLACK NOTIFICATION (issue body items 3 and 4):
+#   This file ships the schedule + CronJob and nothing else. The
+#   issue body marks both retention and Slack notification as
+#   layered concerns ("via a CronJob that prunes... OR registry-
+#   native policy" / "channel TBD"), so:
+#     - Tag-pruning belongs in a separate prune CronJob that lists
+#       in-cluster registry tags by label and keeps the last N per
+#       (distro, arch). The bookkeeping label scheme is in this
+#       file (see `.metadata.labels` on the PipelineRun) so a
+#       follow-up prune Job can match on it.
+#     - Slack/email notification depends on which channel + which
+#       Slack/SMTP transport the team picks. Wiring is one Task
+#       in `finally:` once that decision lands; the matrix
+#       Pipeline already has the per-cell IMAGE_URLs in its
+#       Pipeline-level Results, which is the input a notification
+#       Task needs.
+#   Both are tracked as TODO references on the issue, not blockers
+#   for THIS slice.
+---
+# ============================================================================
+# CronJob — schedules a daily PipelineRun against the matrix Pipeline.
+# ============================================================================
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: build-builder-image-matrix-nightly
+  labels:
+    app.kubernetes.io/name: build-builder-image
+    app.kubernetes.io/component: cron-driver
+    app.kubernetes.io/part-of: ceph-tekton
+spec:
+  # Daily at 02:47 UTC. Off-the-hour to avoid clustering with other
+  # "daily" crons on the same cluster (build-grype-db runs at 03:17;
+  # this one runs upstream of that so a nightly vuln-scan on the
+  # fresh builder images, when it lands, sees BOTH yesterday's DB and
+  # today's images).
+  schedule: "47 2 * * *"
+
+  # Skip the run if the previous one is still going. A full-matrix
+  # rebuild can take 30-60 min per cell on a kind dev cluster (the
+  # real `install-deps.sh` is long); under cluster contention the
+  # whole matrix has occasionally run >12h. We would rather miss a
+  # day than queue catch-up runs.
+  concurrencyPolicy: Forbid
+
+  # Keep recent history visible in `kubectl get jobs` for triage;
+  # cleanup is hands-off otherwise.
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 7
+
+  # Don't drift more than 1h if the controller was down at the
+  # scheduled time — past that, skip rather than catch up.
+  startingDeadlineSeconds: 3600
+
+  jobTemplate:
+    spec:
+      # The Job pod exits as soon as the kubectl-apply succeeds — we
+      # don't wait for the PipelineRun to complete (Tekton's
+      # controller takes over from there). Job success = PipelineRun
+      # was successfully *submitted*, not that it succeeded.
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          # SA + Role + RoleBinding provisioned by
+          # kustomize/base/build-builder-image/. Same single-purpose
+          # "create PipelineRuns, read PipelineRuns, read Pipelines"
+          # shape as the build-grype-db cron submitter.
+          serviceAccountName: build-builder-image-cron
+          containers:
+            - name: kubectl
+              # Same image as the build-grype-db cron — Chainguard's
+              # kubectl `-dev` variant ships a busybox shell, which
+              # the heredoc-apply script below needs. The plain
+              # `:latest` tag is distroless and would not run the
+              # script. Chainguard images are rolling-tag-only — pin
+              # to the rolling tag and let upstream rebuilds carry
+              # CVE fixes.
+              image: cgr.dev/chainguard/kubectl:latest-dev
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  cat <<'YAML' | kubectl create -f -
+                  apiVersion: tekton.dev/v1
+                  kind: PipelineRun
+                  metadata:
+                    generateName: build-builder-image-matrix-nightly-
+                    labels:
+                      app.kubernetes.io/name: build-builder-image
+                      app.kubernetes.io/component: scheduled-run
+                      # The retention follow-up's pruner Job filters
+                      # PipelineRuns + their pushed image tags by this
+                      # label, so it can apply the "keep last 14
+                      # nightlies" half of the issue #12 retention AC
+                      # independently from the "keep last 5
+                      # install-deps-driven builds" half (which is
+                      # labeled `trigger: install-deps` by the PaC
+                      # template).
+                      ceph-tekton.mmgaggle.io/trigger: nightly
+                  spec:
+                    pipelineSpec:
+                      # See the WHY `pipelineSpec:` INLINE comment at
+                      # the top of this file. The shape mirrors
+                      # `pipelines/build-builder-image-matrix.yaml`'s
+                      # build-x86_64 fan-out, with a clone Task
+                      # prefixed.
+                      params:
+                        - name: source-revision
+                          type: string
+                          default: main
+                        - name: output-image-base
+                          type: string
+                          default: image-registry.openshift-image-registry.svc:5000/ceph-tekton/ceph-builder
+                      workspaces:
+                        - name: source
+                        - name: registry-credentials
+                          optional: true
+                      tasks:
+                        # ----------------------------------------------------
+                        # clone — fetch ceph-tekton at $(params.source-revision)
+                        # into the `source` workspace. Inline taskSpec so the
+                        # CronJob is self-contained — no dependency on the
+                        # Tekton Hub catalog `git-clone` Task being installed.
+                        # ----------------------------------------------------
+                        - name: clone
+                          params:
+                            - name: revision
+                              value: $(params.source-revision)
+                          workspaces:
+                            - name: output
+                              workspace: source
+                          taskSpec:
+                            params:
+                              - name: revision
+                                type: string
+                            workspaces:
+                              - name: output
+                                description: ceph-tekton repo lands here.
+                            steps:
+                              - name: clone
+                                image: docker.io/alpine/git:2.45.2
+                                workingDir: $(workspaces.output.path)
+                                script: |
+                                  #!/bin/sh
+                                  set -eu
+                                  git clone --depth 1 \
+                                    --branch "$(params.revision)" \
+                                    https://github.com/mmgaggle/ceph-tekton.git \
+                                    .
+                                  echo "cloned ceph-tekton @ $(git rev-parse HEAD)"
+                        # ----------------------------------------------------
+                        # build-x86_64 — same matrix.include shape as
+                        # pipelines/build-builder-image-matrix.yaml. Kept
+                        # in sync with that file by code review: the
+                        # `include:` list and the per-cell params here
+                        # must match the matrix Pipeline.
+                        # ----------------------------------------------------
+                        - name: build-x86_64
+                          runAfter: [clone]
+                          taskRef:
+                            name: build-builder-image
+                          matrix:
+                            include:
+                              - name: centos9
+                                params:
+                                  - name: distro
+                                    value: centos9
+                              - name: centos10
+                                params:
+                                  - name: distro
+                                    value: centos10
+                              - name: ubuntu-jammy
+                                params:
+                                  - name: distro
+                                    value: ubuntu-jammy
+                              - name: ubuntu-noble
+                                params:
+                                  - name: distro
+                                    value: ubuntu-noble
+                          params:
+                            - name: dockerfile-path
+                              value: images/builders/Dockerfile.$(matrix.distro)
+                            - name: build-context
+                              value: images/builders
+                            - name: output-image
+                              value: $(params.output-image-base):$(matrix.distro)-x86_64-$(params.source-revision)
+                            - name: extra-tags
+                              value:
+                                - $(params.output-image-base):$(matrix.distro)-x86_64
+                            - name: build-args
+                              value:
+                                - "BUILDER_IMAGE_VERSION=0.1.0-$(matrix.distro)"
+                                - "INSTALL_DEPS_FOR_MAKE_CHECK=true"
+                          workspaces:
+                            - name: source
+                              workspace: source
+                            - name: registry-credentials
+                              workspace: registry-credentials
+                    params:
+                      - name: source-revision
+                        # `main` is correct for a NIGHTLY rebuild — the
+                        # purpose is "pick up base-image security
+                        # updates against current main", not "rebuild
+                        # at a specific historical SHA". Operators
+                        # wanting an ad-hoc rebuild at a specific SHA
+                        # use `tkn pipeline start build-builder-image-matrix ...`
+                        # against the standing Pipeline, not this cron.
+                        value: main
+                      - name: output-image-base
+                        # Sepia default; the dev-local overlay swaps
+                        # this for the in-cluster kind registry.
+                        value: image-registry.openshift-image-registry.svc:5000/ceph-tekton/ceph-builder
+                    workspaces:
+                      - name: source
+                        # Fresh PVC per run — the matrix builds ~4
+                        # images sharing one clone, so a single ~2GB
+                        # workspace is plenty. storageClassName left
+                        # unset = cluster default.
+                        volumeClaimTemplate:
+                          spec:
+                            accessModes: ["ReadWriteOnce"]
+                            resources:
+                              requests:
+                                storage: 2Gi
+                      - name: registry-credentials
+                        # In-cluster OpenShift registry uses SA token,
+                        # not a docker auth Secret — leave this an
+                        # emptyDir so the buildah Task's optional-
+                        # workspace branch fires.
+                        emptyDir: {}
+                  YAML
