@@ -3,8 +3,10 @@
 # Builds either a Debian-format apt repository (`mode=deb`, #20) or an
 # RPM-format yum repository (`mode=rpm`, #19) from a workspace full of
 # `.deb` or `.rpm` artefacts, signs the canonical repo-metadata file
-# via Vault transit (key never leaves Vault), and uploads the signed
-# metadata tree to a staging prefix in S3.
+# via Vault transit (key never leaves Vault), uploads the signed
+# metadata tree to a staging prefix in S3, then atomically swaps the
+# staging prefix to the live prefix and writes the `<branch>/latest`
+# pointer manifest (#21).
 #
 # The S3 prefix shape differs between modes to match the canonical
 # layout each tool emits:
@@ -17,13 +19,72 @@
 #
 # SCOPE
 # -----
-# This Task ships both the `mode=deb` (reprepro) path (#20) and the
-# `mode=rpm` (createrepo_c) path (#19). The dispatch step at the top
-# of `steps:` selects which mode-specific build step runs; both modes
-# converge on the same Vault-sign-then-upload scaffolding (steps
-# write-sa-token / vault-login / sign-metadata / upload), parameterised
-# by `mode` so the sign + upload steps know what file to sign and
-# where to write it.
+# This Task ships the `mode=deb` (reprepro, #20) and `mode=rpm`
+# (createrepo_c, #19) build paths and the staging→live swap + latest
+# pointer (#21). The dispatch step at the top of `steps:` selects
+# which mode-specific build step runs; both modes converge on the
+# same Vault-sign-then-upload scaffolding (steps write-sa-token /
+# vault-login / sign-metadata / upload), parameterised by `mode` so
+# the sign + upload steps know what file to sign and where to write
+# it. After upload, the `swap` + `manifest-write` steps run for both
+# modes uniformly — they care only about the `<branch>/<sha>-staging/`
+# vs `<branch>/<sha>/` prefix rename, not what's inside it.
+#
+# ATOMIC STAGING→LIVE SWAP + LATEST POINTER (#21)
+# -----------------------------------------------
+# Upload writes to `<branch>/<sha>-staging/`. The `swap` step that
+# runs after upload promotes that prefix to `<branch>/<sha>/` via
+# S3 server-side copy (`aws s3 cp --recursive`, no bytes traverse
+# the Tekton pod). The `manifest-write` step then writes the
+# `<branch>/latest/manifest.json` pointer object and, last, removes
+# the staging prefix.
+#
+# Concurrency primitive: a single S3 conditional PUT on the
+# per-sha live manifest (`<branch>/<sha>/manifest.json`) using
+# `aws s3api put-object --if-none-match '*'`. If two PipelineRuns
+# for the same (branch, sha) try to publish concurrently, the second
+# `PutObject` returns `412 PreconditionFailed` and the step exits
+# non-zero. The first writer wins; the loser fails fast and leaves
+# the winner's live tree intact.
+#
+# Different-sha concurrent publishes against the same branch both
+# succeed in publishing their own `<sha>/` prefix; the
+# `<branch>/latest/manifest.json` pointer is then a last-writer-wins
+# overwrite (intentional — whichever publish finishes most recently
+# is "latest"). The conditional-PUT mutex is on the per-sha manifest,
+# not the latest pointer, because S3 only supports `If-None-Match: *`
+# (create-if-not-exists), not CAS on a previous ETag.
+#
+# Failure modes are fail-closed:
+#   * server-side copy fails  → step exits non-zero, no latest write
+#   * 412 on per-sha PutObject → step exits non-zero, no latest write,
+#                                staging prefix retained for debug
+#   * latest-pointer PUT fails → step exits non-zero, staging retained
+# Staging cleanup (`aws s3 rm --recursive`) only runs after the
+# latest-pointer write succeeds.
+#
+# MANIFEST SCHEMA — `<branch>/<sha>/manifest.json`
+#                   and `<branch>/latest/manifest.json`
+# --------------------------------------------------
+# Same JSON shape lives at both locations. The per-sha copy is the
+# durable record of the build; the latest copy is the moving pointer
+# consumers read first. Both are written with
+# `Content-Type: application/json`.
+#
+#   {
+#     "schema_version": 1,
+#     "sha":              "<git commit sha of the build>",
+#     "branch":           "<git branch name>",
+#     "timestamp":        "<RFC-3339 UTC, e.g. 2026-05-29T12:34:56Z>",
+#     "attestation_url":  "<URL of the SLSA v1.0 attestation, or empty>",
+#     "repo_url":         "s3://<bucket>/<branch>/<sha>/<distro>/<arch>/...",
+#     "release_digest":   "sha256:<hex of canonical metadata file>",
+#     "mode":             "deb" | "rpm"
+#   }
+#
+# The canonical reference is the "Artifact storage / Latest pointer
+# manifest schema" subsection of `docs/architecture.md`. Adding,
+# removing, or changing the meaning of a field bumps `schema_version`.
 #
 # WHAT REPREPRO DOES HERE
 # -----------------------
@@ -173,8 +234,15 @@
 #   * Vault is unreachable, returns an empty client_token, or refuses
 #     the transit/sign call
 #   * S3 upload of the signed metadata tree fails
+#   * the swap server-side copy fails
+#   * the per-sha conditional-PUT on `<branch>/<sha>/manifest.json`
+#     returns 412 PreconditionFailed (a concurrent publisher won the
+#     race) — staging prefix retained, no latest pointer rewrite
+#   * the latest-pointer write fails — staging prefix retained
 # There is no path through this Task that publishes an unsigned
-# `Release` (DEB) or `repomd.xml` (RPM) to S3.
+# `Release` (DEB) or `repomd.xml` (RPM) to S3, and no path that
+# updates the `<branch>/latest` pointer without a successful per-sha
+# manifest write.
 ---
 apiVersion: tekton.dev/v1
 kind: Task
@@ -185,14 +253,22 @@ spec:
     Build a Debian-format apt repository (mode=deb, reprepro) or an
     RPM-format yum repository (mode=rpm, createrepo_c) from artefacts
     in the artifacts workspace, sign the canonical metadata file via
-    Vault transit, and upload the signed metadata subtree to a
-    staging S3 prefix.
+    Vault transit, upload the signed metadata subtree to a staging
+    S3 prefix, then atomically swap staging→live and write the
+    `<branch>/latest/manifest.json` pointer (#21).
 
     DEB signs `dists/<codename>/Release`, emits `Release.gpg` +
     `InRelease`, uploads `dists/<codename>/`.
 
     RPM signs `repodata/repomd.xml`, emits `repomd.xml.asc`, uploads
     `repodata/`.
+
+    Both modes converge on the same swap + manifest-write steps:
+    server-side `aws s3 cp --recursive` from `<branch>/<sha>-staging/`
+    to `<branch>/<sha>/`, then a conditional PUT
+    (`aws s3api put-object --if-none-match '*'`) of the per-sha
+    manifest as the concurrency mutex, then the latest-pointer write,
+    then staging GC.
   params:
     - name: mode
       type: string
@@ -318,11 +394,12 @@ spec:
       type: string
       default: "smoke"
       description: |
-        Commit SHA component of the S3 key prefix. The published
-        path is `<branch>/<sha>-staging/<distro>/<arch>/dists/...`
-        per the issue tracker; the `-staging` suffix is appended
-        automatically by the upload step (callers pass the bare
-        SHA, NOT `<sha>-staging`).
+        Commit SHA component of the S3 key prefix. The upload step
+        writes to `<branch>/<sha>-staging/<distro>/<arch>/dists/...`
+        (appending `-staging` automatically — callers pass the bare
+        SHA), then the swap step server-side copies that prefix to
+        `<branch>/<sha>/` and writes the live manifest. Callers
+        pass the bare SHA in all cases.
     - name: s3-distro
       type: string
       default: "ubuntu-noble"
@@ -339,13 +416,27 @@ spec:
         (`x86_64`), distinct from reprepro's `Architectures:`
         list (`amd64`) — Debian and the Ceph S3 layout use
         different arch names and we don't conflate them.
+    - name: attestation-url
+      type: string
+      default: ""
+      description: |
+        URL of the SLSA v1.0 provenance attestation for this build
+        (#27 / #28). Written into the per-sha + latest manifests as
+        the `attestation_url` field so consumers can fetch + verify
+        the attestation by following the latest pointer. Empty is
+        accepted (smoke runs without Chains have no attestation yet)
+        and the manifest field is written as the empty string in
+        that case — the schema field is always present so consumers
+        can rely on its presence even if its value is empty.
   results:
     - name: REPO_URL
       type: string
       description: |
-        Final S3 URL of the published signed-metadata directory —
-        `dists/<codename>/` for DEB, `repodata/` for RPM. Empty
-        when `s3-bucket` is unset (smoke / no-upload).
+        Final S3 URL of the published signed-metadata directory at
+        the LIVE prefix (post-swap) — `<branch>/<sha>/<distro>/<arch>/
+        dists/<codename>/` for DEB, `<branch>/<sha>/<distro>/<arch>/
+        repodata/` for RPM. Empty when `s3-bucket` is unset
+        (smoke / no-upload).
     - name: RELEASE_DIGEST
       type: string
       description: |
@@ -355,6 +446,12 @@ spec:
         `RELEASE_DIGEST` for DEB-side continuity; downstream
         verifiers cross-reference this against the Vault audit log
         entry for the transit/sign call.
+    - name: MANIFEST_URL
+      type: string
+      description: |
+        S3 URL of the `<branch>/latest/manifest.json` pointer object
+        written by the manifest-write step (#21). Empty when
+        `s3-bucket` is unset (smoke / no-upload).
   workspaces:
     - name: artifacts
       description: |
@@ -374,10 +471,11 @@ spec:
           DEB: `dists/`, `pool/`, `conf/` (reprepro)
           RPM: `repodata/` + flat `.rpm`s (createrepo_c)
         Must be writable across steps (build-repo writes; sign
-        reads/writes the canonical metadata + its signature;
-        upload reads). emptyDir is fine for smoke; real pipelines
-        use a PVC so a follow-up `swap-staging-to-live` Task (#21)
-        can see the same tree.
+        reads/writes the canonical metadata + its signature; upload
+        reads; swap writes the manifest body the manifest-write step
+        re-uses). emptyDir is fine for smoke; real pipelines use a
+        PVC so the same tree is visible to every step including the
+        swap + manifest-write pair (#21).
       mountPath: /workspace/repo
     - name: s3-credentials
       description: |
@@ -921,5 +1019,304 @@ spec:
         # shellcheck disable=SC2086
         aws s3 cp --recursive "${SRC}" "${DEST}" ${ENDPOINT_ARG}
 
+        # The REPO_URL result is rewritten by the swap step to point
+        # at the live (post-swap) prefix. Writing the staging URL
+        # here is an intermediate so a Pipeline that for any reason
+        # stops between upload and swap still has a debug breadcrumb.
         printf '%s' "${DEST}" > "$(results.REPO_URL.path)"
-        echo "[upload] REPO_URL=${DEST}"
+        echo "[upload] REPO_URL=${DEST} (will be overwritten by swap)"
+
+    # ----------------------------------------------------------------
+    # Step 6: atomic staging→live prefix swap (#21).
+    #
+    # Server-side `aws s3 cp --recursive` from
+    #   s3://${S3_BUCKET}/${S3_BRANCH}/${S3_SHA}-staging/
+    # to
+    #   s3://${S3_BUCKET}/${S3_BRANCH}/${S3_SHA}/
+    # No bytes traverse this pod — S3 copies between keys inside the
+    # same bucket as a server-side operation.
+    #
+    # Concurrency mutex: a conditional PUT on the per-sha live
+    # manifest at `<branch>/<sha>/manifest.json` using
+    # `aws s3api put-object --if-none-match '*'`. If two PipelineRuns
+    # for the same (branch, sha) reach this step concurrently, the
+    # second `PutObject` returns 412 PreconditionFailed and this step
+    # exits non-zero — the first writer wins and its live tree stays
+    # intact. The manifest is the mutex (rather than a separate lock
+    # file) so we never end up with a half-published live tree paired
+    # with an orphaned lock object.
+    #
+    # On the conditional-PUT path: AWS S3 supports `If-None-Match: *`
+    # on PutObject as of November 2024 (Ceph RGW added the same
+    # semantics in Reef). The shape we use is documented at
+    # https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html
+    # and the aws CLI flag is `--if-none-match '*'`.
+    #
+    # The manifest body is written to `/workspace/repo/.manifest.json`
+    # (in the repo workspace, not the in-memory vault scratch) so the
+    # next step (manifest-write) can read the exact same bytes when
+    # writing the latest-pointer object — same content, different key.
+    #
+    # On any failure here (copy, conditional PUT, network) the step
+    # exits non-zero and the staging prefix is left in place. No
+    # latest-pointer write, no staging cleanup — staging is only
+    # garbage-collected after the latest-pointer write succeeds.
+    # ----------------------------------------------------------------
+    - name: swap
+      image: $(params.uploader-image)
+      workingDir: /workspace/repo
+      env:
+        - name: MODE
+          value: $(params.mode)
+        - name: S3_BUCKET
+          value: $(params.s3-bucket)
+        - name: S3_ENDPOINT
+          value: $(params.s3-endpoint)
+        - name: S3_BRANCH
+          value: $(params.s3-branch)
+        - name: S3_SHA
+          value: $(params.s3-sha)
+        - name: S3_DISTRO
+          value: $(params.s3-distro)
+        - name: S3_ARCH
+          value: $(params.s3-arch)
+        - name: CODENAME
+          value: $(params.codename)
+        - name: ATTESTATION_URL
+          value: $(params.attestation-url)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        if [ -z "${S3_BUCKET}" ]; then
+          echo "[swap] s3-bucket empty; skipping swap (smoke / no-upload run)"
+          exit 0
+        fi
+
+        # Same credentials precedence as the upload step (see comment
+        # block there). Duplicated rather than factored to keep the
+        # step self-contained — start simple.
+        CRED_DIR="$(workspaces.s3-credentials.path)"
+        if [ -d "${CRED_DIR}" ]; then
+          for k in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN; do
+            if [ -f "${CRED_DIR}/${k}" ]; then
+              export "${k}=$(cat "${CRED_DIR}/${k}")"
+            fi
+          done
+        fi
+        SA_TOKEN_FILE="${AWS_WEB_IDENTITY_TOKEN_FILE:-/var/run/secrets/openshift/serviceaccount/token}"
+        if [ -z "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_ROLE_ARN:-}" ] && [ -f "${SA_TOKEN_FILE}" ]; then
+          echo "[swap] minting STS creds via AssumeRoleWithWebIdentity (role=${AWS_ROLE_ARN})"
+          ENDPOINT_ARG=""
+          [ -n "${S3_ENDPOINT}" ] && ENDPOINT_ARG="--endpoint-url ${S3_ENDPOINT}"
+          # shellcheck disable=SC2086
+          CREDS_JSON=$(aws sts assume-role-with-web-identity \
+            --role-arn "${AWS_ROLE_ARN}" \
+            --role-session-name "tekton-publish-repo-swap" \
+            --web-identity-token "$(cat "${SA_TOKEN_FILE}")" \
+            ${ENDPOINT_ARG})
+          export AWS_ACCESS_KEY_ID=$(echo "${CREDS_JSON}"     | sed -n 's/.*"AccessKeyId": *"\([^"]*\)".*/\1/p')
+          export AWS_SECRET_ACCESS_KEY=$(echo "${CREDS_JSON}" | sed -n 's/.*"SecretAccessKey": *"\([^"]*\)".*/\1/p')
+          export AWS_SESSION_TOKEN=$(echo "${CREDS_JSON}"     | sed -n 's/.*"SessionToken": *"\([^"]*\)".*/\1/p')
+        fi
+        if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+          echo "FATAL: no S3 credentials available in swap step" >&2
+          exit 1
+        fi
+
+        ENDPOINT_ARG=""
+        [ -n "${S3_ENDPOINT}" ] && ENDPOINT_ARG="--endpoint-url ${S3_ENDPOINT}"
+
+        STAGING_PREFIX="${S3_BRANCH}/${S3_SHA}-staging"
+        LIVE_PREFIX="${S3_BRANCH}/${S3_SHA}"
+        STAGING_URL="s3://${S3_BUCKET}/${STAGING_PREFIX}/"
+        LIVE_URL="s3://${S3_BUCKET}/${LIVE_PREFIX}/"
+
+        # Server-side copy. The aws CLI v2 default behavior for
+        # `s3 cp` copies bytes and metadata (including Content-Type)
+        # without us writing the object data through this pod.
+        echo "[swap] server-side copy ${STAGING_URL} → ${LIVE_URL}"
+        # shellcheck disable=SC2086
+        aws s3 cp --recursive \
+          "${STAGING_URL}" "${LIVE_URL}" ${ENDPOINT_ARG}
+
+        # Build the manifest JSON. The same bytes will be PUT once at
+        # <branch>/<sha>/manifest.json (the mutex) and once at
+        # <branch>/latest/manifest.json (the pointer). The mode-
+        # specific REPO_URL (live prefix) is what the upload step
+        # uploaded into, with -staging stripped.
+        TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        RELEASE_DIGEST="$(cat "$(results.RELEASE_DIGEST.path)" 2>/dev/null || echo '')"
+        case "${MODE}" in
+          deb) LIVE_REPO_URL="${LIVE_URL}${S3_DISTRO}/${S3_ARCH}/dists/${CODENAME}/" ;;
+          rpm) LIVE_REPO_URL="${LIVE_URL}${S3_DISTRO}/${S3_ARCH}/repodata/" ;;
+          *)
+            echo "FATAL: unexpected mode '${MODE}' in swap step (dispatch step bug)" >&2
+            exit 1
+            ;;
+        esac
+
+        # Pure-shell JSON emit. Fields are all string-typed except
+        # schema_version. No untrusted input ends up in these values
+        # (everything is a Task param or a digest we computed) so we
+        # don't need a JSON encoder for escaping. Order matches the
+        # schema documented in the Task header and docs/architecture.md.
+        MANIFEST_FILE="/workspace/repo/.manifest.json"
+        cat > "${MANIFEST_FILE}" <<EOF
+        {
+          "schema_version": 1,
+          "sha": "${S3_SHA}",
+          "branch": "${S3_BRANCH}",
+          "timestamp": "${TIMESTAMP}",
+          "attestation_url": "${ATTESTATION_URL}",
+          "repo_url": "${LIVE_REPO_URL}",
+          "release_digest": "${RELEASE_DIGEST}",
+          "mode": "${MODE}"
+        }
+        EOF
+        echo "[swap] manifest body:"
+        cat "${MANIFEST_FILE}"
+
+        # Concurrency mutex — conditional PUT of the per-sha manifest.
+        # If two publishes race for the same (branch, sha), the second
+        # one's PutObject returns 412 PreconditionFailed; we let the
+        # aws CLI's non-zero exit propagate.
+        PER_SHA_KEY="${LIVE_PREFIX}/manifest.json"
+        echo "[swap] conditional PUT (If-None-Match: *) → s3://${S3_BUCKET}/${PER_SHA_KEY}"
+        # shellcheck disable=SC2086
+        if ! aws s3api put-object \
+              --bucket "${S3_BUCKET}" \
+              --key "${PER_SHA_KEY}" \
+              --body "${MANIFEST_FILE}" \
+              --content-type application/json \
+              --if-none-match '*' \
+              ${ENDPOINT_ARG}; then
+          echo "FATAL: per-sha manifest PUT failed — either a concurrent" >&2
+          echo "       publisher won the race (412 PreconditionFailed) or" >&2
+          echo "       the bucket/credentials are misconfigured. Staging" >&2
+          echo "       prefix ${STAGING_URL} is RETAINED for debug." >&2
+          exit 1
+        fi
+        echo "[swap] per-sha manifest PUT OK — this publisher won the mutex"
+
+        # Rewrite REPO_URL to the live prefix now that the swap is
+        # committed. The manifest-write step will also overwrite this
+        # if it succeeds; if anything fails between here and there the
+        # downstream Pipeline at least sees the live URL, not staging.
+        printf '%s' "${LIVE_REPO_URL}" > "$(results.REPO_URL.path)"
+        echo "[swap] REPO_URL=${LIVE_REPO_URL}"
+
+    # ----------------------------------------------------------------
+    # Step 7: write the `<branch>/latest/manifest.json` pointer and
+    # delete the staging prefix (#21).
+    #
+    # Last step intentionally. The per-sha manifest already exists at
+    # `<branch>/<sha>/manifest.json` (from the swap step's conditional
+    # PUT); this step rewrites the moving pointer at
+    # `<branch>/latest/manifest.json` to the same bytes, then garbage-
+    # collects the staging prefix.
+    #
+    # Last-writer-wins on the latest pointer is intentional: different-
+    # sha concurrent publishes both succeed at their per-sha manifest
+    # (different keys, the conditional PUT doesn't collide), and the
+    # latest pointer ends up at whichever publish committed most
+    # recently. That's the right semantics for "which build is the
+    # current latest on this branch" — most-recently-published wins.
+    #
+    # Staging cleanup runs AFTER the latest write. If the latest write
+    # fails, staging is retained for debug (and a future publish of
+    # the same sha will fail the conditional PUT, so the operator's
+    # path forward is to delete the orphan per-sha manifest +
+    # staging tree manually).
+    # ----------------------------------------------------------------
+    - name: manifest-write
+      image: $(params.uploader-image)
+      workingDir: /workspace/repo
+      env:
+        - name: S3_BUCKET
+          value: $(params.s3-bucket)
+        - name: S3_ENDPOINT
+          value: $(params.s3-endpoint)
+        - name: S3_BRANCH
+          value: $(params.s3-branch)
+        - name: S3_SHA
+          value: $(params.s3-sha)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        if [ -z "${S3_BUCKET}" ]; then
+          echo "[manifest-write] s3-bucket empty; skipping (smoke / no-upload run)"
+          printf '' > "$(results.MANIFEST_URL.path)"
+          exit 0
+        fi
+
+        # Same credentials precedence as upload + swap.
+        CRED_DIR="$(workspaces.s3-credentials.path)"
+        if [ -d "${CRED_DIR}" ]; then
+          for k in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN; do
+            if [ -f "${CRED_DIR}/${k}" ]; then
+              export "${k}=$(cat "${CRED_DIR}/${k}")"
+            fi
+          done
+        fi
+        SA_TOKEN_FILE="${AWS_WEB_IDENTITY_TOKEN_FILE:-/var/run/secrets/openshift/serviceaccount/token}"
+        if [ -z "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_ROLE_ARN:-}" ] && [ -f "${SA_TOKEN_FILE}" ]; then
+          echo "[manifest-write] minting STS creds via AssumeRoleWithWebIdentity"
+          ENDPOINT_ARG=""
+          [ -n "${S3_ENDPOINT}" ] && ENDPOINT_ARG="--endpoint-url ${S3_ENDPOINT}"
+          # shellcheck disable=SC2086
+          CREDS_JSON=$(aws sts assume-role-with-web-identity \
+            --role-arn "${AWS_ROLE_ARN}" \
+            --role-session-name "tekton-publish-repo-manifest" \
+            --web-identity-token "$(cat "${SA_TOKEN_FILE}")" \
+            ${ENDPOINT_ARG})
+          export AWS_ACCESS_KEY_ID=$(echo "${CREDS_JSON}"     | sed -n 's/.*"AccessKeyId": *"\([^"]*\)".*/\1/p')
+          export AWS_SECRET_ACCESS_KEY=$(echo "${CREDS_JSON}" | sed -n 's/.*"SecretAccessKey": *"\([^"]*\)".*/\1/p')
+          export AWS_SESSION_TOKEN=$(echo "${CREDS_JSON}"     | sed -n 's/.*"SessionToken": *"\([^"]*\)".*/\1/p')
+        fi
+        if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+          echo "FATAL: no S3 credentials available in manifest-write step" >&2
+          exit 1
+        fi
+
+        ENDPOINT_ARG=""
+        [ -n "${S3_ENDPOINT}" ] && ENDPOINT_ARG="--endpoint-url ${S3_ENDPOINT}"
+
+        MANIFEST_FILE="/workspace/repo/.manifest.json"
+        if [ ! -s "${MANIFEST_FILE}" ]; then
+          echo "FATAL: ${MANIFEST_FILE} missing — did the swap step run?" >&2
+          exit 1
+        fi
+
+        LATEST_KEY="${S3_BRANCH}/latest/manifest.json"
+        LATEST_URL="s3://${S3_BUCKET}/${LATEST_KEY}"
+
+        # Latest pointer write is intentionally NOT conditional — it
+        # is the moving pointer and gets overwritten on every publish
+        # to the branch. The per-sha conditional PUT in the swap step
+        # is what enforces single-writer-per-sha.
+        echo "[manifest-write] PUT ${LATEST_URL}"
+        # shellcheck disable=SC2086
+        aws s3api put-object \
+          --bucket "${S3_BUCKET}" \
+          --key "${LATEST_KEY}" \
+          --body "${MANIFEST_FILE}" \
+          --content-type application/json \
+          ${ENDPOINT_ARG}
+
+        printf '%s' "${LATEST_URL}" > "$(results.MANIFEST_URL.path)"
+        echo "[manifest-write] MANIFEST_URL=${LATEST_URL}"
+
+        # Staging garbage-collect — only after the latest pointer
+        # write succeeded. A failure above leaves staging in place
+        # for debug.
+        STAGING_URL="s3://${S3_BUCKET}/${S3_BRANCH}/${S3_SHA}-staging/"
+        echo "[manifest-write] deleting staging prefix ${STAGING_URL}"
+        # shellcheck disable=SC2086
+        aws s3 rm --recursive "${STAGING_URL}" ${ENDPOINT_ARG} || {
+          echo "WARNING: staging cleanup failed; live tree + latest" >&2
+          echo "         pointer are committed, staging will need" >&2
+          echo "         manual GC (or wait for bucket lifecycle)." >&2
+          # Non-fatal: the publish itself is committed at this point.
+        }
