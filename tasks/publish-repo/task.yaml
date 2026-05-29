@@ -1,23 +1,29 @@
-# publish-repo — repository-publish Task (DEB path; #20).
+# publish-repo — repository-publish Task (DEB + RPM).
 #
-# Builds a Debian-format apt repository from a workspace full of `.deb`
-# artefacts, signs the Release file via Vault transit (key never leaves
-# Vault), and uploads the resulting `dists/<codename>/` tree to a
-# staging prefix in S3 under
+# Builds either a Debian-format apt repository (`mode=deb`, #20) or an
+# RPM-format yum repository (`mode=rpm`, #19) from a workspace full of
+# `.deb` or `.rpm` artefacts, signs the canonical repo-metadata file
+# via Vault transit (key never leaves Vault), and uploads the signed
+# metadata tree to a staging prefix in S3.
 #
-#   s3://${S3_BUCKET}/${S3_BRANCH}/${S3_SHA}-staging/${S3_DISTRO}/${S3_ARCH}/dists/${CODENAME}/
+# The S3 prefix shape differs between modes to match the canonical
+# layout each tool emits:
 #
-# matching the S3 layout the issue tracker calls out for the DEB
-# variant.
+#   DEB: s3://${S3_BUCKET}/${S3_BRANCH}/${S3_SHA}-staging/${S3_DISTRO}/${S3_ARCH}/dists/${CODENAME}/
+#   RPM: s3://${S3_BUCKET}/${S3_BRANCH}/${S3_SHA}-staging/${S3_DISTRO}/${S3_ARCH}/repodata/
+#
+# matching the S3 layouts the issue tracker calls out per variant
+# (#20 AC and #19 AC respectively).
 #
 # SCOPE
 # -----
-# This Task ships the `mode=deb` (reprepro) path for issue #20. The
-# `mode=rpm` (createrepo_c) path is the sibling issue (#19); the
-# dispatching skeleton at step 0 below is intentionally explicit so
-# the RPM path can land alongside this one without restructuring the
-# Task. Today, `mode=rpm` exits with a non-zero "not yet implemented"
-# error.
+# This Task ships both the `mode=deb` (reprepro) path (#20) and the
+# `mode=rpm` (createrepo_c) path (#19). The dispatch step at the top
+# of `steps:` selects which mode-specific build step runs; both modes
+# converge on the same Vault-sign-then-upload scaffolding (steps
+# write-sa-token / vault-login / sign-metadata / upload), parameterised
+# by `mode` so the sign + upload steps know what file to sign and
+# where to write it.
 #
 # WHAT REPREPRO DOES HERE
 # -----------------------
@@ -41,41 +47,68 @@
 # transit API and writes the two signed artefacts apt expects
 # (`Release.gpg` and `InRelease`).
 #
+# WHAT CREATEREPO_C DOES HERE (mode=rpm)
+# --------------------------------------
+# `createrepo_c` is the canonical yum/dnf-repository builder. Given a
+# directory containing `.rpm` files it emits a `repodata/` subtree:
+#
+#   <repo>/repodata/repomd.xml         metadata index (signed below)
+#   <repo>/repodata/<hash>-primary.xml.gz
+#   <repo>/repodata/<hash>-filelists.xml.gz
+#   <repo>/repodata/<hash>-other.xml.gz
+#   <repo>/<basename>.rpm              the original packages (copied/linked)
+#
+# yum/dnf clients verify `repomd.xml` against a detached OpenPGP
+# signature at `repomd.xml.asc`; the per-package signatures inside
+# each `.rpm` are a separate (build-time) concern and are not produced
+# by this Task. createrepo_c does NOT sign anything itself; the sign
+# step below produces `repomd.xml.asc` via Vault transit.
+#
 # VAULT TRANSIT FOR REPO SIGNING — WHAT'S REAL, WHAT'S STUBBED
 # ------------------------------------------------------------
 # Vault transit signs raw bytes with the configured key (`rsa-4096`
 # for the real ceph repo signing key — see docs/vault.md "For the
 # production GPG-signing flow"). It returns a Vault-native
-# `vault:v<n>:<base64-sig>` string. apt-get on the consumer side
-# requires those bytes to be wrapped in an OpenPGP packet
-# (RFC 4880) and a cleartext-signed framing (RFC 4880 §7) for
-# `Release.gpg` and `InRelease` respectively.
+# `vault:v<n>:<base64-sig>` string. apt-get / dnf on the consumer
+# side require those bytes to be wrapped in an OpenPGP packet
+# (RFC 4880) — a cleartext-signed framing (RFC 4880 §7) for the DEB
+# `InRelease` file, and a detached OpenPGP signature packet for the
+# DEB `Release.gpg` and the RPM `repomd.xml.asc`.
 #
-# For the #20 tracer this Task does the Vault-side half end-to-end
-# (k8s SA-token → vault login → transit/sign), and writes:
+# For these tracers (#20 + #19) this Task does the Vault-side half
+# end-to-end (k8s SA-token → vault login → transit/sign), and writes:
 #
-#   Release.gpg   — the raw `vault:v<n>:<b64>` bytes returned by
-#                   transit/sign of sha256(Release). This is NOT yet
-#                   a valid OpenPGP detached signature; apt-get will
-#                   reject it. The OpenPGP packet wrapping is the
-#                   follow-up that makes AC bullet 4 ("`apt-get
-#                   update` against the staging URL works") pass.
+#   DEB Release.gpg     — the raw `vault:v<n>:<b64>` bytes returned
+#                         by transit/sign of sha256(Release). NOT yet
+#                         a valid OpenPGP detached signature; apt-get
+#                         will reject it.
 #
-#   InRelease     — same bytes wrapped in the RFC-4880-§7 cleartext
-#                   framing (`-----BEGIN PGP SIGNED MESSAGE-----`
-#                   header + Release contents + `-----BEGIN PGP
-#                   SIGNATURE-----` footer). Same caveat as above —
-#                   the signature block itself is the raw vault
-#                   token, not an OpenPGP packet.
+#   DEB InRelease       — same bytes wrapped in the RFC-4880-§7
+#                         cleartext framing. Same caveat — the
+#                         signature block itself is the raw vault
+#                         token, not an OpenPGP packet.
+#
+#   RPM repomd.xml.asc  — the raw `vault:v<n>:<b64>` bytes returned
+#                         by transit/sign of sha256(repomd.xml). NOT
+#                         yet a valid OpenPGP detached signature;
+#                         `gpg --verify` will reject it for the same
+#                         reason `apt-get update` does on the DEB
+#                         side. This is AC bullet 5 for #19 ("gpg
+#                         --verify succeeds"); the OpenPGP packet
+#                         wrapping is the same follow-up that AC
+#                         bullet 4/5 for #20 calls out, and the only
+#                         thing the sign step has to change is the
+#                         bytes it emits — the filenames and S3 paths
+#                         are already correct.
 #
 # This shape proves:
-#   * reprepro runs and emits the expected tree
+#   * reprepro / createrepo_c run and emit the expected tree
 #   * the SA-token → k8s-auth → transit/sign chain works under the
 #     same identity model as the existing vault-sign-smoke Task
 #   * the resulting bytes land at the AC-specified S3 key prefix
 #   * `gpg --verify` against an OpenPGP-wrapped signature is a
-#     mechanical follow-up (open as #20-followup once the wrapping
-#     helper lands)
+#     mechanical follow-up (tracked as the shared #20/#19 follow-up
+#     once the packet-wrapping helper lands)
 #
 # The Task header is the contract: if you bump the Vault call to
 # return wrapped OpenPGP packets, you can flip the two TODO markers
@@ -84,6 +117,7 @@
 #
 # OUTPUT LAYOUT
 # -------------
+# DEB (mode=deb):
 #   /workspace/repo/conf/distributions          reprepro conf
 #   /workspace/repo/dists/<codename>/Release    unsigned summary
 #   /workspace/repo/dists/<codename>/Release.gpg detached sig (vault)
@@ -95,6 +129,19 @@
 # tree is not uploaded by this Task in #20 — pool publication is the
 # build-package Task's responsibility (#16); publish-repo only owns
 # the metadata under `dists/`.
+#
+# RPM (mode=rpm):
+#   /workspace/repo/<basename>.rpm              .rpms staged into the repo root
+#   /workspace/repo/repodata/repomd.xml         metadata index (unsigned)
+#   /workspace/repo/repodata/repomd.xml.asc     detached sig (vault)
+#   /workspace/repo/repodata/<hash>-*.xml.gz    primary / filelists / other
+#
+# After the sign step the upload step `aws s3 cp --recursive`s ONLY
+# the `repodata/` subtree into the staging prefix (matching #19 AC
+# bullet 3 — the path is `.../repodata/`, not the repo root). The
+# `.rpm` packages themselves are not uploaded by this Task; package
+# publication is the build-package Task's responsibility (#16),
+# same split as the DEB side.
 #
 # CREDENTIALS
 # -----------
@@ -121,13 +168,13 @@
 # -----------
 # The Task fails non-zero if:
 #   * `mode` is not one of {deb, rpm}
-#   * `mode=rpm` (until #19 lands the createrepo_c half)
-#   * the artifacts workspace contains zero `.deb` files
+#   * the artifacts workspace contains zero `.deb` files (mode=deb)
+#     or zero `.rpm` files (mode=rpm)
 #   * Vault is unreachable, returns an empty client_token, or refuses
 #     the transit/sign call
-#   * S3 upload of the signed `dists/<codename>/` tree fails
+#   * S3 upload of the signed metadata tree fails
 # There is no path through this Task that publishes an unsigned
-# Release file to S3.
+# `Release` (DEB) or `repomd.xml` (RPM) to S3.
 ---
 apiVersion: tekton.dev/v1
 kind: Task
@@ -135,61 +182,84 @@ metadata:
   name: publish-repo
 spec:
   description: |
-    Build a Debian-format apt repository from `.deb` artefacts in the
-    artifacts workspace, sign the `Release` file via Vault transit,
-    and upload the `dists/<codename>/` tree to a staging S3 prefix.
+    Build a Debian-format apt repository (mode=deb, reprepro) or an
+    RPM-format yum repository (mode=rpm, createrepo_c) from artefacts
+    in the artifacts workspace, sign the canonical metadata file via
+    Vault transit, and upload the signed metadata subtree to a
+    staging S3 prefix.
 
-    `mode=deb` (this PR / #20) runs reprepro. `mode=rpm` (sibling
-    issue #19) will run createrepo_c — until #19 lands the Task
-    exits non-zero on `mode=rpm`.
+    DEB signs `dists/<codename>/Release`, emits `Release.gpg` +
+    `InRelease`, uploads `dists/<codename>/`.
+
+    RPM signs `repodata/repomd.xml`, emits `repomd.xml.asc`, uploads
+    `repodata/`.
   params:
     - name: mode
       type: string
       default: "deb"
       description: |
-        Repository format to publish. `deb` runs reprepro
-        (this PR). `rpm` is reserved for #19's createrepo_c
-        path and currently exits with "not yet implemented".
+        Repository format to publish. `deb` runs reprepro on `.deb`
+        artefacts (#20). `rpm` runs createrepo_c on `.rpm` artefacts
+        (#19). Any other value is fatal in the dispatch step.
     - name: codename
       type: string
       default: "noble"
       description: |
-        Debian/Ubuntu codename for the `dists/<codename>/` subtree
-        (e.g. `noble`, `jammy`, `bookworm`). reprepro's
+        DEB-only. Debian/Ubuntu codename for the `dists/<codename>/`
+        subtree (e.g. `noble`, `jammy`, `bookworm`). reprepro's
         `conf/distributions` `Codename:` field. Must be a single
         codename — multi-suite publish (one Task per codename or a
-        matrix fan-out) is the calling Pipeline's job (#22).
+        matrix fan-out) is the calling Pipeline's job (#22). Ignored
+        when `mode=rpm` (createrepo_c has no codename concept; the
+        per-distro split lives in the S3 prefix via `s3-distro`).
     - name: component
       type: string
       default: "main"
       description: |
-        reprepro `Components:` field. `main` matches the upstream
-        ceph apt repo layout.
+        DEB-only. reprepro `Components:` field. `main` matches the
+        upstream ceph apt repo layout. Ignored when `mode=rpm`.
     - name: architectures
       type: string
       default: "amd64"
       description: |
-        Space-separated reprepro `Architectures:` list. `amd64`
-        only for this tracer; the build-package matrix (#16) will
-        thread `arm64` etc. through here.
+        DEB-only. Space-separated reprepro `Architectures:` list.
+        `amd64` only for this tracer; the build-package matrix (#16)
+        will thread `arm64` etc. through here. Ignored when
+        `mode=rpm` — RPM repos are per-arch on the filesystem layer
+        (the arch lives in the S3 prefix via `s3-arch`).
     - name: origin
       type: string
       default: "Ceph"
-      description: reprepro `Origin:` field on the published Release.
+      description: |
+        DEB-only. reprepro `Origin:` field on the published Release.
+        Ignored when `mode=rpm`.
     - name: label
       type: string
       default: "Ceph"
-      description: reprepro `Label:` field on the published Release.
+      description: |
+        DEB-only. reprepro `Label:` field on the published Release.
+        Ignored when `mode=rpm`.
     - name: reprepro-image
       type: string
       default: "docker.io/library/ubuntu:noble"
       description: |
-        Base image used by the build-repo step. We install reprepro,
-        gnupg, and ca-certificates at runtime (apt-get update +
-        install). Pinning to ubuntu:noble matches the codename
-        default and the build-builder-image matrix's ubuntu-noble
-        entry, so the e2e cluster reuses an image layer that's
-        already in cache.
+        Base image used by the DEB build-repo step. We install
+        reprepro, gnupg, and ca-certificates at runtime (apt-get
+        update + install). Pinning to ubuntu:noble matches the
+        codename default and the build-builder-image matrix's
+        ubuntu-noble entry, so the e2e cluster reuses an image
+        layer that's already in cache.
+    - name: createrepo-image
+      type: string
+      default: "quay.io/centos/centos:stream10"
+      description: |
+        Base image used by the RPM build-repo step. We install
+        createrepo_c at runtime (dnf install). centos:stream10
+        matches the centos10 default `s3-distro` and the rpm-family
+        build-builder-image matrix entries (centos10, rocky10,
+        fedora*); createrepo_c ships in stream10's default repos so
+        no CRB / EPEL enable is required. Same docs-blessed base as
+        docs/builder-images.md "RPM-family base image".
     - name: vault-image
       type: string
       default: "docker.io/hashicorp/vault:1.17.2"
@@ -258,7 +328,8 @@ spec:
       default: "ubuntu-noble"
       description: |
         Distro component of the S3 key prefix
-        (e.g. `ubuntu-noble`, `ubuntu-jammy`).
+        (e.g. `ubuntu-noble`, `ubuntu-jammy`, `centos10`, `rocky10`).
+        Real RPM pipelines pass `centos10` (matches #19 AC bullet 3).
     - name: s3-arch
       type: string
       default: "x86_64"
@@ -272,35 +343,41 @@ spec:
     - name: REPO_URL
       type: string
       description: |
-        Final S3 URL of the published `dists/<codename>/`
-        directory. Empty when `s3-bucket` is unset (smoke /
-        no-upload).
+        Final S3 URL of the published signed-metadata directory —
+        `dists/<codename>/` for DEB, `repodata/` for RPM. Empty
+        when `s3-bucket` is unset (smoke / no-upload).
     - name: RELEASE_DIGEST
       type: string
       description: |
-        `sha256:<hex>` of the (unsigned) Release file the sign
-        step asked Vault to sign. Useful for downstream verifiers
-        that want to recompute the digest and compare against the
-        Vault audit log entry.
+        `sha256:<hex>` of the (unsigned) canonical metadata file
+        the sign step asked Vault to sign — `Release` for DEB,
+        `repodata/repomd.xml` for RPM. Name is kept as
+        `RELEASE_DIGEST` for DEB-side continuity; downstream
+        verifiers cross-reference this against the Vault audit log
+        entry for the transit/sign call.
   workspaces:
     - name: artifacts
       description: |
-        Workspace containing `.deb` files to import into the apt
-        repo. The Task discovers them via `find … -name '*.deb'`,
-        so subdirectory layout doesn't matter. In real pipelines
-        this is the build-output workspace produced by
-        build-package (#16); in smoke the e2e harness seeds a
-        single tiny `.deb` synthetically.
+        Workspace containing `.deb` files (mode=deb) or `.rpm`
+        files (mode=rpm) to import into the repo. The Task
+        discovers them via `find … -name '*.deb'` /
+        `find … -name '*.rpm'`, so subdirectory layout doesn't
+        matter. In real pipelines this is the build-output
+        workspace produced by build-package (#16); in smoke the
+        e2e harness seeds a single tiny `.deb` / `.rpm`
+        synthetically.
       mountPath: /workspace/artifacts
     - name: repo
       description: |
-        Workspace where reprepro materialises the `dists/`,
-        `pool/`, and `conf/` subtrees. Must be writable across
-        steps (reprepro writes here; sign reads/writes
-        `dists/<codename>/Release{.gpg,}` + `InRelease`; upload
-        reads). emptyDir is fine for smoke; real pipelines use a
-        PVC so a follow-up `swap-staging-to-live` Task (#21) can
-        see the same tree.
+        Workspace where the mode-specific build step materialises
+        the repo tree:
+          DEB: `dists/`, `pool/`, `conf/` (reprepro)
+          RPM: `repodata/` + flat `.rpm`s (createrepo_c)
+        Must be writable across steps (build-repo writes; sign
+        reads/writes the canonical metadata + its signature;
+        upload reads). emptyDir is fine for smoke; real pipelines
+        use a PVC so a follow-up `swap-staging-to-live` Task (#21)
+        can see the same tree.
       mountPath: /workspace/repo
     - name: s3-credentials
       description: |
@@ -332,10 +409,11 @@ spec:
         mountPath: /vault-scratch
   steps:
     # ----------------------------------------------------------------
-    # Step 0: dispatch on `mode`. `deb` falls through; `rpm` aborts
-    # with the documented "not yet implemented" error pointing at #19.
-    # An unrecognised mode is also fatal — silently no-op'ing would
-    # let a typo'd Pipeline produce empty staging dirs.
+    # Step 0: dispatch on `mode`. Both `deb` and `rpm` fall through;
+    # the mode-specific build-repo step (1a for deb, 1b for rpm)
+    # no-ops when the mode doesn't match. An unrecognised mode is
+    # fatal — silently no-op'ing would let a typo'd Pipeline produce
+    # empty staging dirs.
     # ----------------------------------------------------------------
     - name: dispatch
       image: docker.io/library/busybox:1.36
@@ -347,14 +425,10 @@ spec:
         set -eu
         case "${MODE}" in
           deb)
-            echo "[dispatch] mode=deb → reprepro path (this Task)"
+            echo "[dispatch] mode=deb → reprepro path"
             ;;
           rpm)
-            echo "FATAL: mode=rpm is not yet implemented in this Task." >&2
-            echo "       The createrepo_c path is sibling issue #19;"   >&2
-            echo "       this PR (#20) implements only the reprepro"    >&2
-            echo "       (DEB) path. Pass mode=deb."                     >&2
-            exit 1
+            echo "[dispatch] mode=rpm → createrepo_c path"
             ;;
           *)
             echo "FATAL: unknown mode '${MODE}' — expected 'deb' or 'rpm'" >&2
@@ -363,18 +437,22 @@ spec:
         esac
 
     # ----------------------------------------------------------------
-    # Step 1: build the apt repo with reprepro.
+    # Step 1a: build the apt repo with reprepro (mode=deb).
     #
     # Materialises `conf/distributions`, runs `reprepro includedeb`
     # against every `.deb` discovered in the artifacts workspace, and
     # produces an UNSIGNED `dists/<codename>/Release` (no `SignWith:`
     # field). The Vault sign step downstream wraps `Release` into the
     # `Release.gpg` + `InRelease` artefacts apt expects.
+    #
+    # No-ops when `mode!=deb`.
     # ----------------------------------------------------------------
-    - name: build-repo
+    - name: build-repo-deb
       image: $(params.reprepro-image)
       workingDir: /workspace/repo
       env:
+        - name: MODE
+          value: $(params.mode)
         - name: CODENAME
           value: $(params.codename)
         - name: COMPONENT
@@ -391,12 +469,17 @@ spec:
         #!/bin/bash
         set -euo pipefail
 
+        if [ "${MODE}" != "deb" ]; then
+          echo "[build-repo-deb] mode=${MODE} — skipping reprepro step"
+          exit 0
+        fi
+
         # The ubuntu:noble image is bare — install reprepro + gnupg
         # (gnupg pulls in the libraries reprepro links against even
         # though we don't sign here) + ca-certificates so apt over
         # https works in case the image's apt sources resolve to a
         # mirror that requires it.
-        echo "[build-repo] installing reprepro + gnupg..."
+        echo "[build-repo-deb] installing reprepro + gnupg..."
         apt-get update -qq
         apt-get install -y --no-install-recommends \
           reprepro gnupg ca-certificates >/dev/null
@@ -417,7 +500,7 @@ spec:
         Components: ${COMPONENT}
         Description: Ceph apt repository (staging)
         EOF
-        echo "[build-repo] conf/distributions:"
+        echo "[build-repo-deb] conf/distributions:"
         cat conf/distributions
 
         # Discover .debs. Empty match is fatal — publishing an empty
@@ -429,7 +512,7 @@ spec:
           ls -la /workspace/artifacts >&2 || true
           exit 1
         fi
-        echo "[build-repo] importing ${#DEBS[@]} .deb(s) into ${CODENAME}/${COMPONENT}:"
+        echo "[build-repo-deb] importing ${#DEBS[@]} .deb(s) into ${CODENAME}/${COMPONENT}:"
         for d in "${DEBS[@]}"; do
           echo "  - ${d}"
         done
@@ -451,8 +534,87 @@ spec:
           find /workspace/repo -maxdepth 4 >&2 || true
           exit 1
         fi
-        echo "[build-repo] Release emitted ($(wc -c <"${REL}") bytes):"
+        echo "[build-repo-deb] Release emitted ($(wc -c <"${REL}") bytes):"
         head -20 "${REL}"
+
+    # ----------------------------------------------------------------
+    # Step 1b: build the rpm repo with createrepo_c (mode=rpm).
+    #
+    # Stages every `.rpm` discovered in the artifacts workspace flat
+    # under /workspace/repo/, then runs `createrepo_c .` which writes
+    # `repodata/repomd.xml` + a handful of `<hash>-{primary,filelists,
+    # other}.xml.gz` and `<hash>-{primary,filelists,other}.sqlite.*`
+    # files into `repodata/`. The sign step downstream signs
+    # `repodata/repomd.xml` via Vault transit and writes
+    # `repodata/repomd.xml.asc`.
+    #
+    # No-ops when `mode!=rpm`.
+    # ----------------------------------------------------------------
+    - name: build-repo-rpm
+      image: $(params.createrepo-image)
+      workingDir: /workspace/repo
+      env:
+        - name: MODE
+          value: $(params.mode)
+      script: |
+        #!/bin/bash
+        set -euo pipefail
+
+        if [ "${MODE}" != "rpm" ]; then
+          echo "[build-repo-rpm] mode=${MODE} — skipping createrepo_c step"
+          exit 0
+        fi
+
+        # centos:stream10 ships createrepo_c in the default repos
+        # (AppStream); no CRB / EPEL enable needed. dnf is slow on a
+        # cold image — `-q` keeps the log readable and `-y` skips
+        # the prompt.
+        echo "[build-repo-rpm] installing createrepo_c..."
+        dnf install -y -q createrepo_c >/dev/null
+        createrepo_c --version
+
+        # Discover .rpms. Empty match is fatal — publishing an empty
+        # repo is never useful and is almost certainly a misconfigured
+        # upstream build-package matrix (mirrors the DEB branch).
+        mapfile -t RPMS < <(find /workspace/artifacts -type f -name '*.rpm' | sort)
+        if [ "${#RPMS[@]}" -eq 0 ]; then
+          echo "FATAL: no .rpm files found under /workspace/artifacts" >&2
+          ls -la /workspace/artifacts >&2 || true
+          exit 1
+        fi
+        echo "[build-repo-rpm] staging ${#RPMS[@]} .rpm(s) into /workspace/repo:"
+        for r in "${RPMS[@]}"; do
+          echo "  - ${r}"
+        done
+
+        # Stage .rpms flat at the repo root. We `cp` rather than `mv`
+        # to leave the artifacts workspace intact for any downstream
+        # consumer (e.g. attach-sbom #55, vuln-scan, the eventual
+        # build-package-side package upload). createrepo_c walks the
+        # directory it's pointed at and writes repodata/ alongside
+        # the packages.
+        for r in "${RPMS[@]}"; do
+          cp -f "${r}" /workspace/repo/
+        done
+
+        # createrepo_c writes `repodata/repomd.xml` + the per-section
+        # `<hash>-*.xml.gz` files. `.` is intentional — pointing at
+        # the cwd matches our staged-rpms-at-repo-root convention.
+        # Re-running createrepo_c against the same dir is idempotent
+        # (it rewrites repodata/ from scratch).
+        createrepo_c .
+
+        # Sanity check — repomd.xml must exist for the sign step.
+        REPOMD="/workspace/repo/repodata/repomd.xml"
+        if [ ! -s "${REPOMD}" ]; then
+          echo "FATAL: createrepo_c did not emit ${REPOMD}" >&2
+          find /workspace/repo -maxdepth 3 >&2 || true
+          exit 1
+        fi
+        echo "[build-repo-rpm] repomd.xml emitted ($(wc -c <"${REPOMD}") bytes):"
+        head -20 "${REPOMD}"
+        echo "[build-repo-rpm] repodata/ contents:"
+        ls -la /workspace/repo/repodata/
 
     # ----------------------------------------------------------------
     # Step 2: write the projected SA token into the shared scratch
@@ -501,28 +663,36 @@ spec:
         echo "[vault-login] OK: vault login succeeded for role $(params.vault-role)"
 
     # ----------------------------------------------------------------
-    # Step 4: sign Release via Vault transit and write Release.gpg +
-    # InRelease.
+    # Step 4: sign the canonical repo-metadata file via Vault transit.
     #
-    # Vault transit signs the sha256 of the Release contents (base64
+    # DEB (mode=deb): signs `dists/<codename>/Release` and writes
+    # `Release.gpg` + `InRelease` (RFC-4880-§7 cleartext framing).
+    #
+    # RPM (mode=rpm): signs `repodata/repomd.xml` and writes
+    # `repodata/repomd.xml.asc` (detached signature, by-convention
+    # filename yum/dnf clients look for).
+    #
+    # Vault transit signs the sha256 of the input bytes (base64
     # input) and returns `vault:v<n>:<b64>`. We write that string as
-    # `Release.gpg` and wrap it in the RFC-4880-§7 cleartext-signed
-    # framing as `InRelease`.
+    # the canonical detached-signature file.
     #
-    # TODO (#20 follow-up): the bytes Vault returns are not a valid
-    # OpenPGP packet. AC bullets 4 ("apt-get update works") and 5
-    # ("gpg --verify succeeds") require wrapping the raw RSA
-    # signature into an OpenPGP signature packet (RFC 4880 §5.2.3)
-    # before writing Release.gpg / InRelease. The Vault call site is
-    # the only thing that has to change — emit packet-wrapped bytes
-    # here and the upload step downstream is already correct. Tracked
-    # in a follow-up issue.
+    # TODO (#20 + #19 follow-up): the bytes Vault returns are not a
+    # valid OpenPGP packet. The DEB AC bullets ("apt-get update works"
+    # / "gpg --verify succeeds") and the RPM AC bullet 5 ("gpg
+    # --verify succeeds against the signed repomd.xml") both require
+    # wrapping the raw RSA signature in an OpenPGP signature packet
+    # (RFC 4880 §5.2.3) before writing the .asc / .gpg files. The
+    # Vault call site is the only thing that has to change — emit
+    # packet-wrapped bytes here and the upload step downstream is
+    # already correct. Tracked as a shared follow-up for both modes.
     # ----------------------------------------------------------------
-    - name: sign-release
+    - name: sign-metadata
       image: $(params.vault-image)
       env:
         - name: VAULT_ADDR
           value: $(params.vault-addr)
+        - name: MODE
+          value: $(params.mode)
         - name: CODENAME
           value: $(params.codename)
         - name: TRANSIT_KEY
@@ -533,18 +703,35 @@ spec:
         VAULT_TOKEN="$(cat /vault-scratch/client.token)"
         export VAULT_TOKEN
 
-        REL="/workspace/repo/dists/${CODENAME}/Release"
-        if [ ! -s "${REL}" ]; then
-          echo "FATAL: ${REL} missing or empty — did build-repo run?" >&2
+        # Mode-specific input path. DEB signs dists/<codename>/Release,
+        # RPM signs repodata/repomd.xml; the dispatch step has already
+        # rejected anything other than {deb,rpm}.
+        case "${MODE}" in
+          deb)
+            INPUT_FILE="/workspace/repo/dists/${CODENAME}/Release"
+            HUMAN_NAME="Release"
+            ;;
+          rpm)
+            INPUT_FILE="/workspace/repo/repodata/repomd.xml"
+            HUMAN_NAME="repomd.xml"
+            ;;
+          *)
+            echo "FATAL: unexpected mode '${MODE}' in sign-metadata (dispatch step bug)" >&2
+            exit 1
+            ;;
+        esac
+
+        if [ ! -s "${INPUT_FILE}" ]; then
+          echo "FATAL: ${INPUT_FILE} missing or empty — did the mode=${MODE} build-repo step run?" >&2
           exit 1
         fi
 
-        # Base64-encode the Release contents for the transit/sign
+        # Base64-encode the input contents for the transit/sign
         # input field. The vault CLI does not chunk input on stdin,
-        # so we keep it inline — Release files are O(few KB) even
-        # for large repos.
-        PAYLOAD_B64=$(base64 -w0 < "${REL}")
-        echo "[sign] signing $(wc -c <"${REL}") bytes of Release via transit/${TRANSIT_KEY}"
+        # so we keep it inline — Release / repomd.xml are O(few KB)
+        # even for large repos.
+        PAYLOAD_B64=$(base64 -w0 < "${INPUT_FILE}")
+        echo "[sign] signing $(wc -c <"${INPUT_FILE}") bytes of ${HUMAN_NAME} via transit/${TRANSIT_KEY}"
 
         SIG=$(vault write -field=signature \
                 "transit/sign/${TRANSIT_KEY}" \
@@ -571,42 +758,68 @@ spec:
         fi
         echo "[sign] OK: transit/verify accepted the signature"
 
-        # Release.gpg — detached signature. TODO #20-followup: wrap
-        # the raw RSA signature in an OpenPGP packet so apt-get
-        # accepts this. Today this is the raw vault: token, written
-        # so the upload-side and reviewer can see the publish-path
-        # is wired through.
-        printf '%s\n' "${SIG}" > "/workspace/repo/dists/${CODENAME}/Release.gpg"
+        # Write the mode-specific detached-signature file(s).
+        case "${MODE}" in
+          deb)
+            # Release.gpg — detached signature. TODO follow-up:
+            # wrap the raw RSA signature in an OpenPGP packet so
+            # apt-get accepts this. Today this is the raw vault:
+            # token, written so the upload-side and reviewer can
+            # see the publish-path is wired through.
+            printf '%s\n' "${SIG}" > "/workspace/repo/dists/${CODENAME}/Release.gpg"
 
-        # InRelease — cleartext-signed Release. Same TODO as
-        # Release.gpg: the signature block inside the framing is the
-        # raw vault: token rather than an OpenPGP packet. The framing
-        # itself is correct so the file shape is recognisable.
-        {
-          printf -- '-----BEGIN PGP SIGNED MESSAGE-----\n'
-          printf 'Hash: SHA256\n\n'
-          cat "${REL}"
-          printf -- '-----BEGIN PGP SIGNATURE-----\n\n'
-          printf '%s\n' "${SIG}"
-          printf -- '-----END PGP SIGNATURE-----\n'
-        } > "/workspace/repo/dists/${CODENAME}/InRelease"
+            # InRelease — cleartext-signed Release. Same TODO as
+            # Release.gpg: the signature block inside the framing
+            # is the raw vault: token rather than an OpenPGP packet.
+            # The framing itself is correct so the file shape is
+            # recognisable.
+            {
+              printf -- '-----BEGIN PGP SIGNED MESSAGE-----\n'
+              printf 'Hash: SHA256\n\n'
+              cat "${INPUT_FILE}"
+              printf -- '-----BEGIN PGP SIGNATURE-----\n\n'
+              printf '%s\n' "${SIG}"
+              printf -- '-----END PGP SIGNATURE-----\n'
+            } > "/workspace/repo/dists/${CODENAME}/InRelease"
 
-        echo "[sign] wrote Release.gpg + InRelease:"
-        ls -la "/workspace/repo/dists/${CODENAME}/" \
-          | grep -E 'Release(.gpg|$)|InRelease' || true
+            echo "[sign] wrote Release.gpg + InRelease:"
+            ls -la "/workspace/repo/dists/${CODENAME}/" \
+              | grep -E 'Release(.gpg|$)|InRelease' || true
+            ;;
+          rpm)
+            # repodata/repomd.xml.asc — detached signature. yum/dnf
+            # clients fetch this filename by convention (the
+            # `gpgkey=` / `repo_gpgcheck=1` configuration tells the
+            # client to verify it against the imported public key).
+            # TODO follow-up: same OpenPGP-packet wrapping caveat as
+            # the DEB Release.gpg above — the raw vault: token is
+            # written so the publish chain is observable end-to-end,
+            # but `gpg --verify repomd.xml.asc repomd.xml` will not
+            # accept it until the wrapping helper lands. AC bullet 5
+            # of #19 lives or dies on that follow-up.
+            printf '%s\n' "${SIG}" > "/workspace/repo/repodata/repomd.xml.asc"
 
-        # RELEASE_DIGEST result — sha256 of the (unsigned) Release
-        # file. Verifiers cross-reference this with the Vault audit
-        # log entry for the transit/sign call.
-        REL_SHA="sha256:$(sha256sum "${REL}" | awk '{print $1}')"
+            echo "[sign] wrote repodata/repomd.xml.asc:"
+            ls -la "/workspace/repo/repodata/" \
+              | grep -E 'repomd\.xml(\.asc)?$' || true
+            ;;
+        esac
+
+        # RELEASE_DIGEST result — sha256 of the (unsigned) signed-
+        # input file (Release for DEB, repomd.xml for RPM). The
+        # result name keeps "RELEASE" for back-compat with the DEB
+        # side; downstream verifiers cross-reference this against
+        # the Vault audit log entry for the transit/sign call.
+        REL_SHA="sha256:$(sha256sum "${INPUT_FILE}" | awk '{print $1}')"
         printf '%s' "${REL_SHA}" > "$(results.RELEASE_DIGEST.path)"
         echo "[sign] RELEASE_DIGEST=${REL_SHA}"
 
     # ----------------------------------------------------------------
-    # Step 5: upload the signed `dists/<codename>/` subtree to S3.
+    # Step 5: upload the signed-metadata subtree to S3.
     #
-    # Output path matches the issue:
-    #   s3://${S3_BUCKET}/${S3_BRANCH}/${S3_SHA}-staging/${S3_DISTRO}/${S3_ARCH}/dists/${CODENAME}/
+    # Output path matches each variant's AC:
+    #   DEB: s3://${S3_BUCKET}/${S3_BRANCH}/${S3_SHA}-staging/${S3_DISTRO}/${S3_ARCH}/dists/${CODENAME}/
+    #   RPM: s3://${S3_BUCKET}/${S3_BRANCH}/${S3_SHA}-staging/${S3_DISTRO}/${S3_ARCH}/repodata/
     #
     # Callers pass the bare SHA in `s3-sha`; this step appends the
     # `-staging` suffix so a future swap-to-live Task (#21) only has
@@ -621,6 +834,8 @@ spec:
       image: $(params.uploader-image)
       workingDir: /workspace/repo
       env:
+        - name: MODE
+          value: $(params.mode)
         - name: S3_BUCKET
           value: $(params.s3-bucket)
         - name: S3_ENDPOINT
@@ -680,10 +895,24 @@ spec:
           exit 1
         fi
 
-        # Per-issue path: <branch>/<sha>-staging/<distro>/<arch>/dists/<codename>/
-        KEY_PREFIX="${S3_BRANCH}/${S3_SHA}-staging/${S3_DISTRO}/${S3_ARCH}/dists/${CODENAME}"
+        # Per-issue path. DEB uses `dists/<codename>/` (#20 AC), RPM
+        # uses `repodata/` (#19 AC bullet 3). The dispatch step has
+        # already rejected anything other than {deb,rpm}.
+        case "${MODE}" in
+          deb)
+            KEY_PREFIX="${S3_BRANCH}/${S3_SHA}-staging/${S3_DISTRO}/${S3_ARCH}/dists/${CODENAME}"
+            SRC="/workspace/repo/dists/${CODENAME}/"
+            ;;
+          rpm)
+            KEY_PREFIX="${S3_BRANCH}/${S3_SHA}-staging/${S3_DISTRO}/${S3_ARCH}/repodata"
+            SRC="/workspace/repo/repodata/"
+            ;;
+          *)
+            echo "FATAL: unexpected mode '${MODE}' in upload step (dispatch step bug)" >&2
+            exit 1
+            ;;
+        esac
         DEST="s3://${S3_BUCKET}/${KEY_PREFIX}/"
-        SRC="/workspace/repo/dists/${CODENAME}/"
 
         ENDPOINT_ARG=""
         [ -n "${S3_ENDPOINT}" ] && ENDPOINT_ARG="--endpoint-url ${S3_ENDPOINT}"
