@@ -490,6 +490,68 @@ byproduct convention above, and the file extension on the
 `SBOM_IMAGES` / `sbom-ARTIFACT_OUTPUTS.uri` values (`*.cdx.json`)
 conveys the mediaType.
 
+### Per-package SLSA attestations as S3 siblings (#27)
+
+The Chains SLSA attestation that signs each `build-package`
+PipelineRun is exposed by the Chains controller on the PipelineRun
+itself as
+
+```
+metadata.annotations:
+  chains.tekton.dev/payload-pipelinerun-<uid>:  <base64 in-toto Statement>
+  chains.tekton.dev/signature-pipelinerun-<uid>: <base64 DSSE envelope>
+```
+
+with `artifacts.pipelinerun.enable-deep-inspection: "true"` rolling
+every child TaskRun's `IMAGES` Results up into one PipelineRun-level
+Statement whose `subject[]` lists every `.deb` / `.rpm` the matrix
+produced (one entry per `<uri>@sha256:<digest>` line).
+
+The `publish-repo` Task (deferred — lands alongside the
+`build-package` Task in the package-build pipeline slice) reads
+that annotation off its own enclosing PipelineRun and writes one
+`.intoto.jsonl` sibling object per artifact next to the package in
+S3:
+
+```
+s3://ceph-artifacts-<class>/<branch>/<sha>/<distro>/<arch>/
+├── ceph-mds_19.2.0_arm64.deb               <- build-package
+├── ceph-common_19.2.0_arm64.deb            <- build-package
+├── ...
+├── sboms/
+│   ├── ceph-mds_19.2.0_arm64.deb.cdx.json
+│   └── ceph-common_19.2.0_arm64.deb.cdx.json
+└── attestations/
+    ├── ceph-mds_19.2.0_arm64.deb.intoto.jsonl     <- publish-repo (this slice)
+    └── ceph-common_19.2.0_arm64.deb.intoto.jsonl  <- publish-repo (this slice)
+```
+
+The path `<branch>/<sha>/<distro>/<arch>/attestations/<package>.intoto.jsonl`
+matches issue #27's "Stored as sibling objects" AC verbatim. One
+attestation per package; the publish-repo Task splits the
+PipelineRun-level Statement (N subjects) into N single-subject
+Statements before upload so each `.deb` / `.rpm` has a self-
+contained in-toto file that `cosign verify-blob-attestation` (the
+#28 verifier path) can validate independently.
+
+The Chains config that produces the upstream PipelineRun
+annotation is in **`kustomize/overlays/sepia/tektonconfig-pruner.yaml`**
+under `spec.chain.*`: SLSA v1.0 (`slsa/v2alpha4`), Fulcio keyless
+signing (cluster SA-token OIDC → short-lived X.509 cert), public
+Rekor transparency. The block is the operator pass-through to the
+`chains-config` ConfigMap — same keys as the dev install's
+`kustomize/base/tekton-chains/chains-config.patch.yaml`, with
+`signers.x509.fulcio.enabled` flipped to `"true"` for Sepia.
+
+Why not configure Chains to write directly to S3: Chains 0.26
+ships a `gcs` file-storage backend and no `s3` backend; using
+`gcs` here would couple Sepia to Google infrastructure (the whole
+point of running on Sepia Ceph S3 is to keep the build pipeline
+on the same RGW). Keeping Chains at `storage=tekton` and letting
+the publish-repo Task do the S3 PUT keeps Chains stateless and
+keeps the S3 credential surface (STS OIDC role + RGW trust
+policy) co-located with every other publish-repo upload.
+
 ### OIDC S3 upload path
 
 The `generate-sbom` Task's `upload` step has three credentials modes
@@ -598,15 +660,24 @@ registry as a cosign referrer.
 
 ## Promoting to Fulcio keyless (Sepia)
 
-When the `overlays/sepia/` chains patch lands (deferred), it will:
+The Sepia chain wiring lives on the operator-managed `TektonConfig`
+at `kustomize/overlays/sepia/tektonconfig-pruner.yaml` under
+`spec.chain.*` (issue #27). Versus the dev install above, the
+Sepia block:
 
-1. Set `signers.x509.fulcio.enabled=true` in `chains-config`.
-2. Add `signers.x509.fulcio.address=https://fulcio.sigstore.dev`.
-3. Add `signers.x509.fulcio.issuer=$CLUSTER_OIDC_ISSUER` — the
-   publicly-reachable URL of Sepia OpenShift's SA token issuer
-   discovery doc.
-4. Add `transparency.url=https://rekor.sigstore.dev` (already in dev).
-5. Stop creating `signing-secrets` — Fulcio mints per-run certs.
+1. Flips `signers.x509.fulcio.enabled` to `"true"`.
+2. Adds `signers.x509.fulcio.address: "https://fulcio.sigstore.dev"`.
+3. Adds `signers.x509.fulcio.provider: "kubernetes"` so Chains
+   uses the in-cluster SA-token convention (the alternative,
+   `spiffe`, would require SPIRE).
+4. Leaves `signers.x509.fulcio.issuer` unset so Fulcio reads the
+   issuer URL from the SA token's `iss` claim — the cluster's
+   `--service-account-issuer` value. A future overlay can pin
+   it (e.g. for an air-gapped Fulcio) by adding the key.
+5. Keeps `transparency.enabled: "true"` + `transparency.url:
+   "https://rekor.sigstore.dev"` (same as dev).
+6. Does NOT create `signing-secrets` — Fulcio mints per-run certs,
+   so the dev cosign-key Secret has no Sepia analog.
 
 The smoke-test flow is identical. Only verification changes: instead of
 `cosign verify-blob --key`, use:
@@ -632,8 +703,14 @@ overlays as their issues land:
   to `storage=oci` and pushes to quay.io / in-cluster registry.
 - **Per-arch container attestation in the manifest list** (#25 + #26).
   Multi-arch attestations follow once the buildah pipeline lands.
-- **Package attestation in S3** (#27). Sibling `.intoto.jsonl` upload
-  pairs with the publish-repo task.
+- **Package attestation in S3** (#27). The Chains-side wiring (SLSA
+  v1.0 attestation per `build-package` PipelineRun, Fulcio keyless,
+  public Rekor) ships on Sepia in `kustomize/overlays/sepia/tektonconfig-pruner.yaml`
+  `spec.chain.*` — see the "Per-package SLSA attestations as S3
+  siblings" section below. The S3 sibling `.intoto.jsonl` upload
+  itself is part of the `publish-repo` Task and lands when that Task
+  does (alongside `build-package`, #16-adjacent). Verification with
+  `cosign verify-blob-attestation` is the sister slice #28.
 - **Fulcio keyless** — see the previous section.
 
 ## Troubleshooting

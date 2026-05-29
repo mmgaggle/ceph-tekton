@@ -26,9 +26,19 @@ kind: Kustomization
 #     nightly CronJob (issue #12). The PipelineRun executor SA
 #     (in-cluster registry pusher token + Chains signing key) is a
 #     separate Sepia-only follow-up.
-#   - chains-config overrides (fulcio/keyless, OCI artifact storage,
-#     OIDC issuer URL) ALSO land here in a follow-up — same overlay,
-#     separate PR — per kustomize/base/tekton-chains/chains-config.patch.yaml.
+#   - chains-config overrides (fulcio/keyless, SLSA v1.0 format,
+#     public Rekor) live in `spec.chain.*` on the same TektonConfig
+#     CR the pruner + cloudevents wiring use — added by issue #27
+#     (the in-file chain: block on tektonconfig-pruner.yaml). The
+#     OpenShift Pipelines operator pass-throughs that block to the
+#     `chains-config` ConfigMap. The standalone
+#     `kustomize/base/tekton-chains/` base is NOT included in this
+#     overlay's resources list — that base ships the upstream Chains
+#     release.yaml + ConfigMap and is dev-only (the dev overlays
+#     install raw Tekton via release.yaml and the script
+#     hack/dev-chains-setup.sh layers Chains on top). On Sepia the
+#     operator owns the Chains install; pulling the standalone base
+#     in would race the operator's reconcile.
 #
 # Resource ordering: Tekton first so its CRDs land before the
 # build-grype-db and build-builder-image Roles name them. The
