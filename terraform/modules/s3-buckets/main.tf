@@ -279,6 +279,59 @@ resource "aws_s3_bucket_lifecycle_configuration" "events_mpu_only" {
 }
 
 # ===========================================================================
+# ceph-builder-cache
+#   sccache S3 backend for the build cache (ceph-tekton issue #14). The
+#   make-check + build-package Tasks wrap their C/C++ compiler with
+#   `sccache`; sccache content-addresses each preprocessor output and
+#   stores the resulting object file under `<branch>/<distro>/<arch>/<hash>`
+#   so a hit on `wip-foo` can't accidentally serve objects compiled
+#   against a different toolchain.
+#
+#   Distinct content class from the four artifact / tooling buckets above:
+#     - PRIVATE only — sccache objects are raw build artefacts mid-flight,
+#       never something a downstream consumer should fetch directly. No
+#       `*_public_read` companion knob.
+#     - No versioning — sccache objects are content-addressed; same hash
+#       always means same bytes.
+#     - No object-lock — these are tooling state, regenerable from source.
+#     - Short retention via lifecycle expiry on last-modified. sccache
+#       re-PUTs an object every time it serves a hit (refreshing the
+#       last-modified stamp), so lifecycle expiry on lastmod
+#       approximates LRU eviction — cold objects (no longer referenced
+#       by any active branch's compile) age out; hot objects stay.
+# ===========================================================================
+
+resource "aws_s3_bucket" "sccache" {
+  bucket        = var.sccache_bucket_name
+  force_destroy = var.force_destroy
+  tags          = var.tags
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "sccache" {
+  count  = var.enable_lifecycle ? 1 : 0
+  bucket = aws_s3_bucket.sccache.id
+
+  rule {
+    id     = "expire-cold-objects"
+    status = "Enabled"
+
+    filter {}
+
+    # LRU-ish: sccache refreshes lastmod on every hit, so cold
+    # (no longer referenced) objects age out on this timer while hot
+    # ones stay indefinitely. 30d is the conservative default —
+    # operators can tighten on storage pressure.
+    expiration {
+      days = var.sccache_expiration_days
+    }
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 1
+    }
+  }
+}
+
+# ===========================================================================
 # AWS-only hardening (toggled off by default for zgw-posix / older-RGW compatibility)
 # ===========================================================================
 
@@ -289,6 +342,7 @@ locals {
     release  = aws_s3_bucket.release.id
     grype_db = aws_s3_bucket.grype_db.id
     events   = aws_s3_bucket.events.id
+    sccache  = aws_s3_bucket.sccache.id
   }
 }
 
@@ -344,6 +398,9 @@ locals {
     # the only supported posture is private. See variables.tf §
     # "events bucket" for the rationale.
     events = false
+    # sccache likewise has no `*_public_read` knob — the bucket holds
+    # raw build artefacts mid-flight, never a downstream-consumable.
+    sccache = false
   }
   buckets_with_public_read = {
     for k, v in local.bucket_public_read : k => local.bucket_ids[k] if v

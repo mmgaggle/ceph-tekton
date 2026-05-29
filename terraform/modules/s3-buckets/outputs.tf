@@ -23,6 +23,11 @@ output "events_bucket" {
   value       = aws_s3_bucket.events.id
 }
 
+output "sccache_bucket" {
+  description = "Name of the sccache build-cache bucket (issue #14)."
+  value       = aws_s3_bucket.sccache.id
+}
+
 output "buckets" {
   description = "All bucket names keyed by content class."
   value = {
@@ -31,6 +36,7 @@ output "buckets" {
     release  = aws_s3_bucket.release.id
     grype_db = aws_s3_bucket.grype_db.id
     events   = aws_s3_bucket.events.id
+    sccache  = aws_s3_bucket.sccache.id
   }
 }
 

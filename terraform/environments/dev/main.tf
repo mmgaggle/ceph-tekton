@@ -70,6 +70,7 @@ module "artifacts" {
   release_bucket_name  = "${var.bucket_prefix}ceph-artifacts-release"
   grype_db_bucket_name = "${var.bucket_prefix}ceph-grype-db"
   events_bucket_name   = "${var.bucket_prefix}ceph-tekton-events"
+  sccache_bucket_name  = "${var.bucket_prefix}ceph-builder-cache"
 
   # Dev defaults: force_destroy true so `terraform destroy` works
   # cleanly for an ephemeral environment. The release-bucket
@@ -79,6 +80,7 @@ module "artifacts" {
   dev_expiration_days      = 30
   branch_expiration_days   = 180
   grype_db_expiration_days = 30
+  sccache_expiration_days  = 30
   # 0 = never expire. Mirrors the Sepia posture; events_expiration is
   # a moot value here anyway because enable_lifecycle = false below
   # (zgw-posix can't service lifecycle calls).

@@ -179,6 +179,64 @@ variable "events_expiration_days" {
   }
 }
 
+# ---------------------------------------------------------------------------
+# sccache bucket (issue #14)
+#
+# S3 backend for the sccache build cache. The make-check + build-package
+# Tasks wrap their C/C++ compiler with `sccache`; sccache content-
+# addresses each preprocessor output and writes the resulting object
+# file under `<branch>/<distro>/<arch>/<hash>`.
+#
+# Distinct content class from the four artifact / tooling buckets:
+#   - PRIVATE. The bucket holds raw build artefacts mid-flight, never
+#     something a downstream consumer should fetch directly. No
+#     `*_public_read` companion knob (same posture as the events
+#     bucket).
+#   - No versioning. sccache objects are content-addressed; same hash
+#     always means same bytes.
+#   - No object-lock. These are tooling state, regenerable from source.
+#   - LRU-ish retention via lifecycle expiry on last-modified. sccache
+#     re-PUTs an object every time it serves a hit (refreshing the
+#     stamp), so expiry on lastmod approximates LRU eviction.
+# ---------------------------------------------------------------------------
+
+variable "sccache_bucket_name" {
+  description = <<-EOT
+    Bucket for the sccache S3 backend (ceph-tekton issue #14). The
+    make-check + build-package Tasks set `SCCACHE_BUCKET` to this
+    value and `SCCACHE_S3_KEY_PREFIX` to `<branch>/<distro>/<arch>/`
+    so cache hits can never serve objects compiled with a different
+    toolchain.
+
+    Private bucket; there is no `*_public_read` companion. See the
+    header comment in main.tf for the rationale.
+  EOT
+  type        = string
+  default     = "ceph-builder-cache"
+}
+
+variable "sccache_expiration_days" {
+  description = <<-EOT
+    Days until objects in the sccache bucket expire. Lifecycle
+    expiration is on last-modified; sccache refreshes lastmod every
+    time it serves a hit, so this approximates LRU eviction — cold
+    objects (no longer referenced by any active branch's compile) age
+    out, hot ones stay.
+
+    30 is the conservative default; tighten on storage pressure or
+    if the branch matrix shrinks. Setting too low evicts objects
+    mid-build and tanks the hit rate; setting too high keeps stale
+    main-branch objects after a major refactor.
+  EOT
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.sccache_expiration_days > 0 && var.sccache_expiration_days <= 365
+    error_message = "sccache_expiration_days must be in (0, 365]."
+  }
+}
+
 variable "release_object_lock_years" {
   description = <<-EOT
     Default retention period applied to every object PUT into the
