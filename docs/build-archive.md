@@ -90,19 +90,24 @@ ceph-tekton S3 bucket without `*_public_read = true`; see
 | `cloudevents-sink` Deployment + Service + SA + Role | [`kustomize/base/cloudevents-sink/`](../kustomize/base/cloudevents-sink/) |
 | This doc | `docs/build-archive.md` |
 
-### Out of scope for the minimal slice
+### What landed in the follow-up slice
+
+The Sepia TektonConfig wiring + e2e assertion shipped after the
+initial minimal slice (still under #63):
+
+| Component | Where it lives |
+|---|---|
+| `spec.pipeline.send-cloudevents-for-runs` + `default-cloud-events-sink` on Sepia TektonConfig | [`kustomize/overlays/sepia/tektonconfig-pruner.yaml`](../kustomize/overlays/sepia/tektonconfig-pruner.yaml) |
+| `cloudevents-sink` base added to Sepia overlay (ordered before the TektonConfig so the Service resolves before the flag flips) | [`kustomize/overlays/sepia/kustomization.yaml`](../kustomize/overlays/sepia/kustomization.yaml) |
+| e2e assertion driving a synthetic CloudEvent against the sink and verifying the JSONL lands in zgw-posix | [`hack/e2e/assert-cloudevents-sink.sh`](../hack/e2e/assert-cloudevents-sink.sh) |
+
+### Out of scope for the current slice
 
 The acceptance-criteria list in
 [#63](https://github.com/mmgaggle/ceph-tekton/issues/63) is broader
-than what's shipped here. The phase-1 line was drawn at "Tekton
-emits events → a stateless service catches them → S3 holds the
-JSON-Lines". What is **not** in this slice:
+than what's shipped to date. What is **not** in this slice and is
+tracked in #63's open acceptance criteria for a future PR:
 
-- The TektonConfig overlay change that actually points the
-  controller at the new Service URL (see
-  [§"Enabling Tekton CloudEvents"](#enabling-tekton-cloudevents)
-  below for the manual command + the TektonConfig snippet — a
-  patches/ overlay is follow-up work).
 - The Parquet-row analytics columns described in
   [#63](https://github.com/mmgaggle/ceph-tekton/issues/63) §"Parquet
   schema". The sink stores raw JSON-Lines; Parquet promotion (with
@@ -116,8 +121,12 @@ JSON-Lines". What is **not** in this slice:
   — same gap [`README.md`](../README.md) §"Repo layout" already
   flags. **Open question**: deploying to Sepia requires this module
   to exist; for now, dev-rgw + dev paths use static creds via Secret.
-- DuckDB recipe page, replay-from-archive procedure, and e2e
-  assertion. Tracked in #63's open acceptance criteria.
+- DuckDB recipe page (long pole task by distro, queue-time trend,
+  signed-Rekor latency, build success rate by branch) and the
+  replay-from-archive procedure. The minimum query that confirms
+  the sink is landing data is in
+  [§"Reading the JSONL with DuckDB"](#reading-the-jsonl-with-duckdb)
+  below; the recipe page is queued.
 
 ## Enabling Tekton CloudEvents
 
@@ -145,7 +154,8 @@ kubectl -n tekton-pipelines patch configmap feature-flags --type=merge \
 
 The `TektonConfig` CR carries the same settings under
 `spec.pipeline`. The operator reconciles them into the
-`feature-flags` ConfigMap:
+`feature-flags` ConfigMap. Shipped in
+[`kustomize/overlays/sepia/tektonconfig-pruner.yaml`](../kustomize/overlays/sepia/tektonconfig-pruner.yaml):
 
 ```yaml
 apiVersion: operator.tekton.dev/v1alpha1
@@ -158,11 +168,12 @@ spec:
     default-cloud-events-sink: "http://cloudevents-sink.cloudevents-sink.svc.cluster.local"
 ```
 
-A patches/ overlay landing this against the Sepia TektonConfig is the
-natural next slice. **Caution**: enabling `send-cloudevents-for-runs`
-on a cluster where the sink Service does not resolve will pile up
-retries in the controller's log; deploy the sink BEFORE flipping the
-flag.
+**Caution**: enabling `send-cloudevents-for-runs` on a cluster where
+the sink Service does not resolve will pile up retries in the
+controller's log; the Sepia overlay's `resources:` list orders
+`kustomize/base/cloudevents-sink` before this TektonConfig
+specifically to make `kubectl apply -k` create the Service before
+the operator reconciles the feature-flags flip.
 
 ## Event payload shape
 
