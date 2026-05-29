@@ -50,6 +50,14 @@ source "${SCRIPT_DIR}/lib.sh"
 # build-builder-image is the first to bring it up; running the verify
 # smoke after means the registry image is already pulled and the
 # verify script's idempotent re-apply is a no-op.
+#
+# verify-image-signature-keyless-smoke runs late in the list because
+# it's the cheapest of the signature-verification smokes (no in-cluster
+# registry, no host-side signing) but exercises the slowest external
+# dependency (Rekor public-good instance, occasional 5xx). Putting it
+# after the build-builder-image smoke means failures are unambiguously
+# attributable to the keyless / Rekor path rather than to cluster
+# bring-up.
 ASSERTIONS=(
   hello-world
   chains-smoke
@@ -62,6 +70,7 @@ ASSERTIONS=(
   vuln-scan-smoke
   build-builder-image
   verify-image-signature-smoke
+  verify-image-signature-keyless-smoke
 )
 
 SKIP="${E2E_SKIP:-}"
