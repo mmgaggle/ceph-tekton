@@ -693,6 +693,97 @@ That gives the third-party verifier a binding: "I trust this attestation
 because Fulcio asserted it came from the `ceph-pipeline-sa` ServiceAccount
 in the `sepia-pipelines` namespace of the Sepia OpenShift cluster."
 
+## End-to-end verifier — `hack/verify-build.sh` (#28)
+
+For the external-consumer flow ("I have a published Ceph artifact URL;
+prove to me, using only public Sigstore infra, that Sepia signed it") the
+project ships a single bash script:
+
+```sh
+hack/verify-build.sh \
+  --certificate-identity \
+    'https://kubernetes.default.svc.cluster.local/namespaces/sepia-pipelines/serviceaccounts/ceph-pipeline-sa' \
+  --certificate-oidc-issuer \
+    'https://kubernetes.default.svc' \
+  <artifact-url>
+```
+
+`<artifact-url>` is either an OCI image reference (preferably by digest
+— `quay.io/ceph/ceph@sha256:...`) or an HTTPS URL to a `.deb` / `.rpm`
+package on the artifacts mirror. The script auto-detects which mode to
+run from the URL suffix (`*.deb` / `*.rpm` → package, otherwise OCI);
+the `--type IMAGE|PACKAGE` flag forces a choice when the suffix is
+ambiguous.
+
+### What it checks
+
+Both modes assert the same chain — only the cosign sub-command
+differs:
+
+| Mode | cosign invocation | What it proves |
+|---|---|---|
+| IMAGE | `cosign verify` + `cosign verify-attestation --type slsaprovenance1` | The image carries (a) a Sigstore signature, (b) a SLSA Provenance v1.0 in-toto attestation; both signed by a Fulcio cert with the expected identity + OIDC issuer, with Rekor inclusion proof. |
+| PACKAGE | `cosign verify-blob-attestation --type slsaprovenance1 --bundle <pkg>.intoto.jsonl <pkg>` | The package's sibling `.intoto.jsonl` (under `<prefix>/attestations/<basename>.intoto.jsonl`, the layout the "Per-package SLSA attestations as S3 siblings" section above documents) is a SLSA v1.0 in-toto Statement, signed by a Fulcio cert with the expected identity + OIDC issuer, with Rekor inclusion proof. |
+
+Both modes additionally run `rekor-cli search --sha sha256:<hex>`
+against the same Rekor instance to surface the transparency-log entry
+to the operator log — the explicit "I can find this in Rekor"
+demonstration the [#28](https://github.com/mmgaggle/ceph-tekton/issues/28)
+AC calls out by name. cosign's own verify path already requires the
+Rekor inclusion proof; the extra `rekor-cli search` step is
+independent evidence using a different tool.
+
+The `--type slsaprovenance1` alias is what cosign 2.x calls the SLSA
+Provenance v1.0 predicate. The unsuffixed `slsaprovenance` alias is
+SLSA v0.2 and would be rejected by cosign against a v1 payload — the
+same predicate-type pin the in-cluster `verify-image-signature` Task
+and `hack/e2e/lib.sh` use.
+
+### External-consumer posture
+
+The script's invariant is "runs on a machine with no Sepia network
+access". Concretely:
+
+- No `kubectl`. Cluster signing identity is supplied as a CLI flag (or
+  env var `CEPH_VERIFY_BUILD_CERT_IDENTITY` /
+  `CEPH_VERIFY_BUILD_CERT_OIDC_ISSUER`); the script never asks any
+  cluster what it claims to be.
+- No `aws s3` / no Sepia AWS creds. Artifacts must be reachable over
+  HTTPS via the public artifacts mirror; `s3://` URLs are rejected
+  with a helpful pointer to the HTTPS equivalent.
+- Pure public Sigstore. `cosign verify` reaches Fulcio's
+  TUF-distributed root + Rekor public-good
+  (`https://rekor.sigstore.dev` by default; override with `--rekor-url`
+  for a future in-Sepia Rekor instance).
+
+### Prerequisites
+
+```sh
+brew install cosign rekor jq    # macOS
+# or per-distro packages on Linux; curl is preinstalled everywhere.
+```
+
+That's the entire dependency surface — no Go toolchain, no kubectl,
+no aws-cli.
+
+### Why an "any-identity" mode is refused
+
+The script hard-errors if neither `--certificate-identity` nor
+`--certificate-identity-regexp` is set. Keyless verification's whole
+point is binding the signature to a specific signer; an unconstrained
+verify would accept any Fulcio-issued cert — including one for an
+attacker's GitHub Actions workflow that ran `cosign sign` against the
+same image. Forcing the operator to name the expected identity is the
+explicit design choice that keeps "verified" meaningful.
+
+### Verifying older / non-keyless artifacts
+
+`hack/verify-build.sh` only handles the **keyless** path — it is the
+end-to-end demonstration of the Sepia Fulcio+Rekor chain. For artifacts
+produced by the **dev** install (keyed cosign signing, `signing-secrets`
+Secret), use the in-cluster `verify-image-signature` Task or the
+`cosign verify --key`-based snippet in the "Verify" section above.
+
 ## What's not in the dev install
 
 The dev install intentionally cuts these corners — Sepia gets them via
@@ -707,10 +798,11 @@ overlays as their issues land:
   v1.0 attestation per `build-package` PipelineRun, Fulcio keyless,
   public Rekor) ships on Sepia in `kustomize/overlays/sepia/tektonconfig-pruner.yaml`
   `spec.chain.*` — see the "Per-package SLSA attestations as S3
-  siblings" section below. The S3 sibling `.intoto.jsonl` upload
+  siblings" section above. The S3 sibling `.intoto.jsonl` upload
   itself is part of the `publish-repo` Task and lands when that Task
   does (alongside `build-package`, #16-adjacent). Verification with
-  `cosign verify-blob-attestation` is the sister slice #28.
+  `cosign verify-blob-attestation` ships as `hack/verify-build.sh`
+  (#28); see the "End-to-end verifier" section above.
 - **Fulcio keyless** — see the previous section.
 
 ## Troubleshooting
