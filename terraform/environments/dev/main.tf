@@ -37,9 +37,17 @@
 # ---------------------------------------------------------------------------
 
 provider "aws" {
-  region     = var.rgw_region
-  access_key = var.rgw_access_key
-  secret_key = var.rgw_secret_key
+  region = var.rgw_region
+
+  # Auth via a standard AWS credentials file (`~/.aws/credentials` by
+  # default) keyed by a named profile. Keeps long-lived keys out of
+  # shell env / history, and lines up with how every other AWS-CLI
+  # tool already reads creds. Per-cluster profiles let an operator
+  # switch between Ceph endpoints with a single var flip.
+  # pathexpand() so the `~/.aws/credentials` default resolves the
+  # tilde — Terraform doesn't expand it on its own.
+  shared_credentials_files = [pathexpand(var.credentials_path)]
+  profile                  = var.credentials_profile
 
   # RGW STS / IAM endpoints differ from AWS — skip the validations
   # the provider would otherwise run against unsupported endpoints.

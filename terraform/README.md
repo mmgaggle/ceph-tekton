@@ -79,6 +79,17 @@ docker run -d --name ceph-tekton-zgw-posix \
   -e RGW_SECRET_KEY=cephtekton \
   quay.io/dparkes/zgw-posix:latest
 
+# One-time: add a [zgw-posix] profile to your AWS credentials file
+# (terraform reads this; the AWS CLI calls below can use --profile
+# zgw-posix too):
+mkdir -p ~/.aws
+cat >> ~/.aws/credentials <<'EOF'
+[zgw-posix]
+aws_access_key_id = cephtekton
+aws_secret_access_key = cephtekton
+EOF
+export TF_VAR_credentials_profile="zgw-posix"
+
 # Apply:
 cd terraform/environments/dev
 terraform init
@@ -87,6 +98,7 @@ terraform apply -auto-approve
 # Inspect:
 aws --endpoint-url http://127.0.0.1:8000 \
     --region default \
+    --profile zgw-posix \
     s3api list-buckets
 
 # Tear down:
@@ -94,10 +106,12 @@ terraform destroy -auto-approve
 docker rm -f ceph-tekton-zgw-posix
 ```
 
-Defaults match what `hack/verify-s3-module.sh` uses
-(`AWS_ACCESS_KEY_ID=cephtekton`, `AWS_SECRET_ACCESS_KEY=cephtekton`),
-so the `aws` CLI calls above pick them up from
-`~/.aws/credentials` or `AWS_*` env vars.
+If you prefer not to touch `~/.aws/credentials`, the AWS provider also
+honors `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env vars (they
+take precedence over `shared_credentials_files`), which is the path
+`hack/verify-s3-module.sh` takes — it exports those before invoking
+terraform, so the credentials-file step isn't needed for the one-shot
+script.
 
 ## Running the dev-rgw env
 
@@ -110,8 +124,10 @@ exercise.
 See [`environments/dev-rgw/README.md`](environments/dev-rgw/README.md)
 for the apply runbook. Short version: provision a test user on a
 real RGW (vstart on a build host works; any production-like RGW works
-better), export `TF_VAR_rgw_endpoint` / `rgw_access_key` /
-`rgw_secret_key` / `bucket_prefix`, then `terraform apply`.
+better), add the user's access/secret pair as a named profile in
+`~/.aws/credentials`, export `TF_VAR_rgw_endpoint` +
+`TF_VAR_credentials_profile` + `TF_VAR_bucket_prefix`, then
+`terraform apply`.
 
 ## Running the Sepia env
 

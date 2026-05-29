@@ -61,12 +61,29 @@ higher-fidelity validation layer.
 
 ## Apply runbook
 
+Auth is via a standard AWS credentials file — the same one `aws` CLI
+reads (`~/.aws/credentials` by default). Add a profile section for
+your test RGW:
+
+```sh
+# One-time: add a profile for this RGW (or edit ~/.aws/credentials manually).
+mkdir -p ~/.aws
+cat >> ~/.aws/credentials <<'EOF'
+[my-test-rgw]
+aws_access_key_id = <admin-issued key>
+aws_secret_access_key = <admin-issued secret>
+EOF
+```
+
+Then apply:
+
 ```sh
 cd terraform/environments/dev-rgw
 
 export TF_VAR_rgw_endpoint="https://s3.your-test-cluster.example.com"
-export TF_VAR_rgw_access_key="..."
-export TF_VAR_rgw_secret_key="..."
+export TF_VAR_credentials_profile="my-test-rgw"
+# Optional: override credentials_path if the file isn't at ~/.aws/credentials
+# export TF_VAR_credentials_path="/path/to/my/aws-credentials"
 # Optional: namespace your buckets (default `devtest-`)
 export TF_VAR_bucket_prefix="kyle-"
 
@@ -91,11 +108,14 @@ destroy. Either wait for retention to expire (`release_object_lock_years`,
 default 1y) or override with governance bypass:
 
 ```sh
-aws --endpoint-url "$TF_VAR_rgw_endpoint" \
+# The aws CLI reads the SAME credentials file terraform does — pass
+# the same profile via --profile so terraform and the cleanup speak
+# to RGW with the same identity.
+aws --endpoint-url "$TF_VAR_rgw_endpoint" --profile "$TF_VAR_credentials_profile" \
     s3api list-object-versions --bucket "${TF_VAR_bucket_prefix}ceph-artifacts-release" \
   | jq -r '.Versions[] | "\(.Key) \(.VersionId)"' \
   | while read k v; do
-      aws --endpoint-url "$TF_VAR_rgw_endpoint" \
+      aws --endpoint-url "$TF_VAR_rgw_endpoint" --profile "$TF_VAR_credentials_profile" \
           s3api delete-object \
           --bucket "${TF_VAR_bucket_prefix}ceph-artifacts-release" \
           --key "$k" --version-id "$v" --bypass-governance-retention

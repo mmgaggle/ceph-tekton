@@ -14,9 +14,16 @@
 # ---------------------------------------------------------------------------
 
 provider "aws" {
-  region     = var.rgw_region
-  access_key = var.rgw_access_key
-  secret_key = var.rgw_secret_key
+  region = var.rgw_region
+
+  # Auth via a standard AWS credentials file (`~/.aws/credentials` by
+  # default) keyed by a named profile. Once the RGW OIDC trust + role
+  # from issue #7 lands, this is replaced by `AssumeRoleWithWebIdentity`
+  # from a CI SA token and the long-lived bootstrap profile goes away.
+  # pathexpand() so the `~/.aws/credentials` default resolves the
+  # tilde.
+  shared_credentials_files = [pathexpand(var.credentials_path)]
+  profile                  = var.credentials_profile
 
   skip_credentials_validation = true # RGW STS surface differs from AWS
   skip_metadata_api_check     = true
