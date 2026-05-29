@@ -43,8 +43,15 @@ kind: Kustomization
 # in `kubectl apply -k` mirrors the `resources:` list order, so
 # sequencing the sink base first means the Service exists by the
 # time the operator reconciles the feature-flags ConfigMap.
+#
+# servicemonitor-tekton-pipelines.yaml (issue #41) is in the same
+# boat as tektonconfig-pruner.yaml: the ServiceMonitor CR is owned
+# by the Prometheus Operator, which is part of OpenShift's built-in
+# monitoring stack and is NOT present on the k3s/kind dev overlays —
+# see the per-file comment for the full rationale.
 resources:
   - ../../base/tekton-pipelines
   - ../../base/build-grype-db
   - ../../base/cloudevents-sink
   - tektonconfig-pruner.yaml
+  - servicemonitor-tekton-pipelines.yaml
