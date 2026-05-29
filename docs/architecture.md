@@ -292,6 +292,79 @@ updates `<branch>/latest/manifest.json` for build outputs and
 `grype-db/<schema>/latest.json` for DB snapshots, with the new sha,
 timestamp, and a pointer to its provenance attestation.
 
+### Latest pointer manifest schema
+
+The `<branch>/latest/manifest.json` pointer is written by the
+`publish-repo` Task's `manifest-write` step
+([#21](https://github.com/mmgaggle/ceph-tekton/issues/21)). The same
+JSON shape is also written one level deeper at
+`<branch>/<sha>/manifest.json` — the per-sha copy is the durable
+record of the build and serves as the concurrency mutex (see
+[§"Atomic staging→live swap"](#atomic-stagingrarrlive-swap-21) below
+or `tasks/publish-repo/task.yaml`); the latest copy is the moving
+pointer consumers read first.
+
+```json
+{
+  "schema_version": 1,
+  "sha": "<git commit sha of the build>",
+  "branch": "<git branch name>",
+  "timestamp": "<RFC-3339 UTC, e.g. 2026-05-29T12:34:56Z>",
+  "attestation_url": "<URL of the SLSA v1.0 attestation, or empty>",
+  "repo_url": "s3://<bucket>/<branch>/<sha>/<distro>/<arch>/...",
+  "release_digest": "sha256:<hex of canonical metadata file>",
+  "mode": "deb" | "rpm"
+}
+```
+
+Field semantics:
+
+- **`schema_version`** — integer. Currently `1`. Adding, removing,
+  or changing the meaning of a field bumps this.
+- **`sha`** — git commit sha of the build that produced this
+  manifest. Always the bare sha, never `<sha>-staging`.
+- **`branch`** — git branch name (`main`, `wip-*`, `release-*`).
+- **`timestamp`** — RFC-3339 UTC of when the swap step wrote the
+  per-sha manifest. Use this rather than the S3 LastModified of the
+  pointer object — overwrites on the latest pointer are last-writer-
+  wins, so its LastModified does not necessarily match the build's
+  publish time.
+- **`attestation_url`** — URL of the SLSA v1.0 provenance attestation
+  for this build, or the empty string if one was not produced (smoke
+  runs without Chains, dev overlays). The field is always present so
+  consumers can rely on its presence even when its value is empty.
+- **`repo_url`** — the `s3://` URL of the published signed-metadata
+  directory at the live (post-swap) prefix — `dists/<codename>/` for
+  DEB, `repodata/` for RPM.
+- **`release_digest`** — `sha256:<hex>` of the canonical metadata
+  file the publish-repo sign step asked Vault to sign — `Release`
+  for DEB, `repodata/repomd.xml` for RPM. Cross-references the Vault
+  audit-log entry for the transit/sign call.
+- **`mode`** — `"deb"` or `"rpm"`.
+
+### Atomic staging→live swap (#21)
+
+`publish-repo` uploads to a `<branch>/<sha>-staging/` prefix, then
+runs a `swap` step that server-side copies it to `<branch>/<sha>/`,
+PUTs the per-sha manifest as a single conditional write
+(`If-None-Match: *`) as a single-writer-per-sha mutex, then writes
+`<branch>/latest/manifest.json` and deletes the staging prefix. A
+consumer reading `<branch>/<sha>/` therefore never sees a partial
+repository: the prefix exists only after the server-side copy
+completes and the manifest PUT succeeds.
+
+Concurrency: two PipelineRuns publishing the same `(branch, sha)`
+collide on the per-sha manifest PUT — the second one's
+`PutObject` returns `412 PreconditionFailed` and exits non-zero,
+leaving the first publisher's live tree intact. Two PipelineRuns
+publishing different shas to the same branch both succeed in
+publishing their respective `<sha>/` prefixes; the
+`<branch>/latest/manifest.json` pointer is last-writer-wins
+(intentional — most-recently-published wins). The conditional-PUT
+mutex is on the per-sha manifest, not the latest pointer, because
+S3 only supports `If-None-Match: *` (create-if-not-exists), not
+CAS on a previous ETag.
+
 ---
 
 ## Component map
