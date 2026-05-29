@@ -51,10 +51,9 @@ kube_ctx apply -f "${E2E_REPO_ROOT}/pipelines/pipelines/compute-matrix-smoke-tes
 # own emptyDir, so the seed Task's matrix.yaml vanishes before the
 # compute-matrix Task can read it. Without this the matrix step quietly
 # falls back to the "documented default matrix" (centos10 + rocky10 +
-# ubuntu-noble x amd64/arm64, 6 cells) and the assert step rejects the
-# cell count.
-# No bytes to extract after the PipelineRun completes; cleanup is just
-# the PVC delete in the trap.
+# ubuntu-jammy + ubuntu-noble x amd64/arm64, 8 cells) and the assert
+# step rejects the cell count. No bytes to extract after the PipelineRun
+# completes; cleanup is just the PVC delete in the trap.
 SRC_PVC_NAME="e2e-matrix-source-pvc-$(date +%s)"
 kube_ctx -n "${NS}" apply -f - <<EOF >/dev/null
 apiVersion: v1
@@ -154,15 +153,28 @@ if [[ "${JQ_GATING}" != "${GATING_COUNT}" ]]; then
   FAIL=1
 fi
 
-# ---- seeded values: 3 cells, 2 gating ----
-if [[ "${CELL_COUNT}" != "3" ]]; then
-  log::fail "expected 3 cells from synthetic seed, got ${CELL_COUNT}"
+# ---- seeded values: 4 cells, 3 gating ----
+if [[ "${CELL_COUNT}" != "4" ]]; then
+  log::fail "expected 4 cells from synthetic seed, got ${CELL_COUNT}"
   FAIL=1
 fi
-if [[ "${GATING_COUNT}" != "2" ]]; then
-  log::fail "expected 2 gating cells from synthetic seed, got ${GATING_COUNT}"
+if [[ "${GATING_COUNT}" != "3" ]]; then
+  log::fail "expected 3 gating cells from synthetic seed, got ${GATING_COUNT}"
   FAIL=1
 fi
+
+# ---- every seeded distro appears at least once ----
+# Defensive double-check from the test host that compute-matrix
+# didn't silently drop a distro and replace it with a duplicate
+# (a regression the count check alone wouldn't catch).
+for expected in centos10 fedora-rawhide ubuntu-jammy ubuntu-noble; do
+  HITS="$(printf '%s' "${MATRIX}" \
+    | jq --arg d "${expected}" '[.[] | select(.distro == $d)] | length')"
+  if [[ "${HITS}" -lt 1 ]]; then
+    log::fail "expected distro '${expected}' missing from matrix Result"
+    FAIL=1
+  fi
+done
 
 if [[ "${FAIL}" -ne 0 ]]; then
   capture_pipelinerun_artifacts "${NS}" "${PR}"

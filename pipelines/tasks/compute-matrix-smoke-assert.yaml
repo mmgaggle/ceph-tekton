@@ -39,16 +39,25 @@ spec:
         whose .gating == "true", and must be <= cell-count.
     - name: expected-cell-count
       type: string
-      default: "3"
+      default: "4"
       description: |
         Cell count the smoke seed wrote. Lets the assert step catch a
         regression where compute-matrix silently dropped a cell.
     - name: expected-gating-count
       type: string
-      default: "2"
+      default: "3"
       description: |
-        Gating-count the smoke seed implies (two cells with gating:true,
-        one with gating:false).
+        Gating-count the smoke seed implies (three cells with
+        gating:true, one with gating:false).
+    - name: expected-distros
+      type: string
+      default: "centos10 fedora-rawhide ubuntu-jammy ubuntu-noble"
+      description: |
+        Whitespace-separated list of distro slugs the assert step
+        expects to find in the matrix Result. Each must appear at
+        least once. Catches a regression where compute-matrix drops a
+        cell without changing the count (e.g. it duplicates one distro
+        and silently omits another).
     - name: tools-image
       type: string
       default: docker.io/mikefarah/yq:4.40.7
@@ -69,6 +78,8 @@ spec:
           value: $(params.expected-cell-count)
         - name: EXPECTED_GATING_COUNT
           value: $(params.expected-gating-count)
+        - name: EXPECTED_DISTROS
+          value: $(params.expected-distros)
       script: |
         #!/bin/sh
         set -eu
@@ -79,6 +90,7 @@ spec:
         echo "[assert] gating-count=${GATING_COUNT}"
         echo "[assert] expected-cell-count=${EXPECTED_CELL_COUNT}"
         echo "[assert] expected-gating-count=${EXPECTED_GATING_COUNT}"
+        echo "[assert] expected-distros=${EXPECTED_DISTROS}"
         echo
 
         # ---- matrix parses as JSON array ----
@@ -159,7 +171,7 @@ spec:
             ;;
         esac
 
-        # ---- seeded values: 3 cells, 2 gating ----
+        # ---- seeded values: cell + gating counts match ----
         if [ "${CELL_COUNT}" != "${EXPECTED_CELL_COUNT}" ]; then
           echo "[assert] FAIL: cell-count=${CELL_COUNT} != expected ${EXPECTED_CELL_COUNT}" >&2
           FAIL=1
@@ -168,6 +180,23 @@ spec:
           echo "[assert] FAIL: gating-count=${GATING_COUNT} != expected ${EXPECTED_GATING_COUNT}" >&2
           FAIL=1
         fi
+
+        # ---- each expected distro appears at least once ----
+        # Catches a regression where compute-matrix drops a cell
+        # without changing the count (e.g. duplicates one distro and
+        # silently omits another). EXPECTED_DISTROS is whitespace-
+        # separated; iterate and yq-grep for each.
+        for expected in ${EXPECTED_DISTROS}; do
+          HITS="$(
+            printf '%s' "${MATRIX}" \
+              | yq -p=json "[.[] | select(.distro == \"${expected}\")] | length" 2>/dev/null \
+              || echo 0
+          )"
+          if [ "${HITS}" -lt 1 ]; then
+            echo "[assert] FAIL: distro '${expected}' missing from matrix Result" >&2
+            FAIL=1
+          fi
+        done
 
         if [ "${FAIL}" -ne 0 ]; then
           echo "[assert] one or more assertions failed" >&2
