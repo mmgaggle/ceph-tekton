@@ -96,3 +96,71 @@ spec:
     resources:
       - pipelinerun
       - taskrun
+  # ----------------------------------------------------------------
+  # CloudEvents wiring for the build-archive sink (issue #63).
+  #
+  # The operator reconciles `spec.pipeline.*` into the Tekton
+  # Pipelines `feature-flags` ConfigMap. Two flags together turn on
+  # PipelineRun + TaskRun lifecycle CloudEvents and point the
+  # controller at the in-cluster `cloudevents-sink` Service that
+  # batches them to s3://ceph-tekton-events as JSON-Lines.
+  #
+  #   send-cloudevents-for-runs   `true` enables emission. Default
+  #                               false; without this the controller
+  #                               does not POST CloudEvents at all.
+  #   default-cloud-events-sink   Absolute URL the controller POSTs
+  #                               to. Must resolve from the
+  #                               tekton-pipelines namespace; the
+  #                               .svc.cluster.local FQDN is the
+  #                               unambiguous absolute form (see
+  #                               kustomize/base/cloudevents-sink/
+  #                               service.yaml for why we use the
+  #                               long-form host).
+  #
+  # ORDERING SAFETY
+  # ---------------
+  # Enabling send-cloudevents-for-runs on a cluster where the sink
+  # Service does not resolve makes the controller log
+  # `dial tcp: lookup cloudevents-sink.cloudevents-sink.svc.cluster.local:
+  # no such host` once per PipelineRun lifecycle transition. Loud but
+  # harmless — pipelines still run. The deploy order documented in
+  # docs/build-archive.md §"Enabling Tekton CloudEvents" is:
+  #   1. terraform apply the events bucket
+  #   2. kubectl apply -k kustomize/base/cloudevents-sink/
+  #      (the sepia overlay pulls this in via resources: below)
+  #   3. land this TektonConfig change
+  # Following that order avoids the noisy-log window entirely.
+  #
+  # SCOPE OF THIS WIRING
+  # --------------------
+  # Sepia only. The dev-{local,kind} overlays install raw Tekton
+  # Pipelines via `release.yaml` (no operator in the loop), so this
+  # TektonConfig has no effect there — the kind feature-flags
+  # equivalent is the manual `kubectl patch configmap feature-flags`
+  # call documented in docs/build-archive.md, and the e2e assertion
+  # exercises the sink directly via curl rather than going through
+  # the Tekton controller. That keeps the kind smoke fast and
+  # independent of any operator-only API surface.
+  #
+  # SCHEMA REFERENCE
+  # ----------------
+  # OpenShift Pipelines TektonConfig.spec.pipeline pass-through for
+  # the upstream Tekton Pipelines `feature-flags` ConfigMap keys:
+  #   - https://tekton.dev/docs/pipelines/events/
+  #   - https://tekton.dev/docs/pipelines/install/#customizing-the-pipelines-controller-behavior
+  #   - https://github.com/tektoncd/operator/blob/main/pkg/apis/operator/v1alpha1/tektonconfig_types.go
+  pipeline:
+    # YAML string `"true"`, not boolean `true` — the upstream Tekton
+    # feature-flags ConfigMap stores every value as a string and the
+    # operator pass-through validates the shape against that schema.
+    # A bare `true` here is rejected at admission with
+    # `expected string, got bool`.
+    send-cloudevents-for-runs: "true"
+    # Absolute URL — Service `cloudevents-sink` in namespace
+    # `cloudevents-sink` (kustomize/base/cloudevents-sink/). The
+    # double-segment is intentional: first token is the Service
+    # name, second is the Namespace. CoreDNS resolves the short
+    # form from any namespace; the .svc.cluster.local suffix is the
+    # unambiguous absolute form, so resolution can't be redirected
+    # by tekton-pipelines's local search domain.
+    default-cloud-events-sink: "http://cloudevents-sink.cloudevents-sink.svc.cluster.local"

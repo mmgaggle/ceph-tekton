@@ -27,12 +27,24 @@ kind: Kustomization
 #
 # Resource ordering: Tekton first so its CRDs land before the
 # build-grype-db Role names them. The TektonConfig CR
-# (tektonconfig-pruner.yaml, issue #60) is reconciled by the
+# (tektonconfig-pruner.yaml, issue #60 + #63) is reconciled by the
 # OpenShift Pipelines operator — it's only meaningful on Sepia
 # (the operator is not installed in the dev-{local,kind}
 # overlays, which run raw Tekton Pipelines from release.yaml), so
 # it lives in this overlay rather than the shared base.
+#
+# cloudevents-sink (issue #63) MUST be in the resource list BEFORE
+# tektonconfig-pruner.yaml. The TektonConfig flips
+# `send-cloudevents-for-runs: true` and points the controller at
+# `http://cloudevents-sink.cloudevents-sink.svc.cluster.local`;
+# enabling that flag against a Service that does not yet resolve
+# makes the Tekton controller log a DNS-lookup error once per
+# PipelineRun lifecycle transition (harmless but loud). Apply order
+# in `kubectl apply -k` mirrors the `resources:` list order, so
+# sequencing the sink base first means the Service exists by the
+# time the operator reconciles the feature-flags ConfigMap.
 resources:
   - ../../base/tekton-pipelines
   - ../../base/build-grype-db
+  - ../../base/cloudevents-sink
   - tektonconfig-pruner.yaml

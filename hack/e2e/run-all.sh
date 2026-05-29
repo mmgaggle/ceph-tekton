@@ -58,6 +58,12 @@ source "${SCRIPT_DIR}/lib.sh"
 # after the build-builder-image smoke means failures are unambiguously
 # attributable to the keyless / Rekor path rather than to cluster
 # bring-up.
+#
+# cloudevents-sink runs immediately after zgw-posix-up because the
+# sink writes to a bucket on zgw-posix; failing fast on zgw-posix
+# already happened, and the sink readiness probe HEADs the bucket so
+# slotting cloudevents-sink right after zgw-posix-up keeps the
+# "S3-dependent" stripe of assertions contiguous in the log.
 ASSERTIONS=(
   hello-world
   chains-smoke
@@ -67,6 +73,7 @@ ASSERTIONS=(
   generate-sbom-smoke
   compute-matrix-smoke
   zgw-posix-up
+  cloudevents-sink
   vuln-scan-smoke
   build-builder-image
   verify-image-signature-smoke
