@@ -90,6 +90,12 @@ jobs:
       # in-cluster scan results; keeping the version within the same
       # minor avoids DB-format drift.
       GRYPE_VERSION:            v0.112.0
+      # crane (go-containerregistry) — used by
+      # hack/e2e/assert-verify-image-signature-smoke.sh to mirror a
+      # known image into the in-cluster registry so the signature
+      # verification path has a real artefact to chew on. 0.20.x is
+      # the current stable line; .2 is a known-good recent patch.
+      CRANE_VERSION:            v0.20.2
       # Helm chart versions — duplicated from the dev bootstrap
       # scripts so a chart bump in those scripts is also enforced
       # here (and vice versa).
@@ -165,6 +171,15 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
             | sh -s -- -b /usr/local/bin "${GRYPE_VERSION}"
           grype version
+
+      - name: Set up crane ${{ env.CRANE_VERSION }}
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" \
+            | tar -xz -C /tmp crane
+          install -m 0755 /tmp/crane /usr/local/bin/crane
+          crane version
 
       - name: Set up kind ${{ env.KIND_VERSION }}
         run: |
