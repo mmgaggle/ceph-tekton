@@ -73,7 +73,7 @@ FULL_BUILD="${E2E_BUILDER_IMAGE_FULL_BUILD:-false}"
 # script — unusual) or, more typically, a whitespace-separated string
 # env var. `read -r -a` normalizes both into the DISTRO_LIST array.
 # Default preserves pre-#98 behaviour (centos10 only).
-read -r -a DISTRO_LIST <<<"${DISTROS:-centos10}"
+read -r -a DISTRO_LIST <<<"${DISTROS:-centos10 ubuntu-noble}"
 if [[ "${#DISTRO_LIST[@]}" -eq 0 ]]; then
   log::fail "DISTROS resolved to an empty list — refusing to run"
   exit 2
